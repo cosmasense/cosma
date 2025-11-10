@@ -2,7 +2,7 @@
 
 <img align="right" src="./assets/logo.svg" height="150px" alt="Cosma Logo">
 
-Search your files with natural language!
+Search engine for your files!
 
 ### How It Works
 
@@ -11,7 +11,7 @@ in those directories into a search-optimized index. It'll also
 watch for for changes to keep the index updated.
 
 After files are indexed, you can search for them with natural language!
-Cosma uses vector-powered search to find files quickly and seamlessly.
+Cosma uses vector-powered search to find files quickly and easily.
 
 ## Get Started
 
