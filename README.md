@@ -13,6 +13,8 @@ watch for for changes to keep the index updated.
 After files are indexed, you can search for them with natural language!
 Cosma uses vector-powered search to find files quickly and easily.
 
+Cosma can run 100% locally or in the cloud.
+
 ## Get Started
 
 Currently, Cosma has only been tested on MacOS ARM.
