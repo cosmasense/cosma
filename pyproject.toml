@@ -1,11 +1,11 @@
 [project]
-name = "flow"
+name = "cosma"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = ["cli"]
 
 [project.scripts]
-flow = "flow:main"
+cosma = "cosma:main"
 
 [tool.uv.sources]
 cli = { workspace = true }

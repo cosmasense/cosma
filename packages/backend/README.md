@@ -1,9 +1,3 @@
-# v2
+# backend
 
-Solar Flow backend v2.
-
-## Running
-
-```sh
-uv run -m backend
-```
+Cosma backend
