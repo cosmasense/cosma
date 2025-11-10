@@ -1,0 +1,97 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-binary:
+    runs-on: macos-latest  # Use Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: "pyproject.toml"
+      
+      - name: Install CMake
+        run: brew install cmake
+      
+      - name: Build binary with PyInstaller
+        run: uv run pyinstaller cosma.spec
+      
+      - name: Create archive
+        run: |
+          cd dist
+          tar -czf cosma-macos-arm64.tar.gz cosma/
+      
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binary
+          path: dist/cosma-macos-arm64.tar.gz
+
+  build-python-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      
+      - name: Build all packages
+        run: uv build --all-packages
+      
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-packages
+          path: dist/*
+
+  publish-to-pypi:
+    runs-on: ubuntu-latest
+    needs: build-python-packages
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cosma
+    permissions:
+      id-token: write  # Required for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-packages
+          path: dist
+      
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: [build-macos-binary, publish-to-pypi]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-binary
+          path: artifacts
+      
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "Release ${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/cosma-macos-arm64.tar.gz
