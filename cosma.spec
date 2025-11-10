@@ -51,7 +51,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='backend',
+    name='cosma',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
