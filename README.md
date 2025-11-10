@@ -1,16 +1,16 @@
-# flow
+# cosma
 
-Core packages for flow.
+Core packages for cosma.
 
 ## Running
 
 To start the backend:
 
 ```py
-uv run flow serve
+uvx cosma serve
 ```
 
 To start the TUI:
 ```py
-uv run flow
+uvx cosma
 ```
