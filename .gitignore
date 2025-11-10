@@ -1,8 +1,6 @@
 # Project
 *.db*
 .env
-models/
-.models/
 
 # Python-generated files
 __pycache__/
