@@ -1,0 +1,25 @@
+[project]
+name = "cli"
+version = "0.1.0"
+description = "Flow CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "tui",
+    "backend",
+    "rich>=14.2.0",
+    "click>=8.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright<=1.31.7",
+]
+
+[tool.uv.sources]
+backend = { workspace = true }
+tui = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"
