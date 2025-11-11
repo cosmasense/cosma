@@ -4,6 +4,10 @@
 
 Search engine for your files!
 
+> [!CAUTION]
+> This software is in early alpha! There will be lots of bugs.
+> If you encounter any, please report them to the issue tracker.
+
 ### How It Works
 
 Choose which directories to index, and Cosma will process all files
@@ -49,3 +53,9 @@ uvx cosma /path/to/directory/to/search
 
 We're also working on a Mac app! If this seems like a useful project,
 give us a star!
+
+## Contributing
+
+Cosma is open source, and we'd love to have you contribute!
+Please feel free to open an issue or pull request with code changes.
+We'll have documentation for how best to contribute soon!
