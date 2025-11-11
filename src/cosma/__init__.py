@@ -1,14 +1,20 @@
 import click
+from click_help_colors import HelpColorsGroup
 
-@click.group(invoke_without_command=True)
-@click.pass_context
-def cli(ctx: click.Context):
-    # Store whether we should check for directory argument
-    ctx.ensure_object(dict)
-    
+
+@click.group(
+    cls=HelpColorsGroup,
+    help_headers_color='cyan',
+    help_options_color='green',
+)
+def cli():
+    """Search engine for your files!"""
+    pass
+
 @cli.command()
 @click.argument('directory', default='.')
-def tui(directory: str):
+def search(directory: str):
+    """Search through files in a directory using the TUI interface"""
     from cosma_tui import start_tui
     result = start_tui(directory)
     if result:
@@ -16,13 +22,6 @@ def tui(directory: str):
 
 @cli.command()
 def serve():
+    """Start the Cosma backend server"""
     from cosma_backend import serve as serve_backend
     serve_backend()
-
-# Make tui the default command
-@cli.result_callback()
-@click.pass_context
-def process_result(ctx: click.Context, result, **kwargs):
-    if ctx.invoked_subcommand is None:
-        # If no subcommand was given, invoke tui with remaining args
-        ctx.invoke(tui, directory='.')
