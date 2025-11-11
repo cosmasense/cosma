@@ -122,7 +122,7 @@ class EZFApp(App):
         Binding("down", "cursor_down", "Down"),
     ]
 
-    def __init__(self, directory: str = "./test2", base_url: str = "http://127.0.0.1:8080"):
+    def __init__(self, directory: str = "./test2", base_url: str = "http://127.0.0.1:60534"):
         super().__init__()
         self.directory = str(Path(directory).resolve())
         self.base_url = base_url
@@ -368,7 +368,7 @@ class EZFApp(App):
         await self.client.close()
 
 
-def run_tui(directory: str = ".", base_url: str = "http://127.0.0.1:8080") -> Optional[str]:
+def run_tui(directory: str = ".", base_url: str = "http://127.0.0.1:60534") -> Optional[str]:
     """Run the TUI and return the selected item"""
     app = EZFApp(directory=directory, base_url=base_url)
     

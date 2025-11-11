@@ -58,7 +58,7 @@ class App(Quart):
 
         # add new config variable defaults here (if there should be a default)
         self.config.setdefault("HOST", '127.0.0.1')
-        self.config.setdefault("PORT", 8080)
+        self.config.setdefault("PORT", 60534)
         self.config.setdefault("DATABASE_PATH", Path(self.dirs.user_data_dir) / "app.db")
         
         # ===== Embedder Configuration =====

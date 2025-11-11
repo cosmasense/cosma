@@ -238,7 +238,7 @@ def mocked_env_vars(monkeypatch):
     """Set up mocked environment variables for testing."""
     monkeypatch.setenv("BACKEND_DATABASE_PATH", ":memory:")
     monkeypatch.setenv("BACKEND_HOST", "127.0.0.1")
-    monkeypatch.setenv("BACKEND_PORT", "8080")
+    monkeypatch.setenv("BACKEND_PORT", "60534")
     # Mock any LLM API keys to avoid real calls
     monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-key")
@@ -375,7 +375,7 @@ def temp_env_vars(monkeypatch):
     """Set temporary environment variables for testing."""
     monkeypatch.setenv("BACKEND_DATABASE_PATH", ":memory:")
     monkeypatch.setenv("BACKEND_HOST", "127.0.0.1")
-    monkeypatch.setenv("BACKEND_PORT", "8080")
+    monkeypatch.setenv("BACKEND_PORT", "60534")
 
 
 # Factory for creating test File objects

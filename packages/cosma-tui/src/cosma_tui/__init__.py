@@ -2,7 +2,7 @@ from .config import get_config
 from .onboarding import run_onboarding
 from .tui import run_tui
 
-def start_tui(directory: str = '.', base_url: str = 'http://localhost:8080'):
+def start_tui(directory: str = '.', base_url: str = 'http://localhost:60534'):
     # Check if this is first run and show onboarding
     config = get_config()
     if config.is_first_run():
