@@ -2,6 +2,7 @@
 name = "cosma"
 version = "0.2.0"
 requires-python = ">=3.12"
+description="Search engine for your files!"
 readme = "README.md"
 dependencies = ["cosma-backend", "cosma-tui"]
 
