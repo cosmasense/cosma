@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import logging
 import mimetypes
 import os
 from pathlib import Path
+from typing import Optional, Dict, Any
 
 from markitdown import MarkItDown
 
@@ -48,14 +50,15 @@ class FileParser:
         ".zip", ".epub"
     }
 
-    def __init__(self) -> None:
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         """Initialize the parser with MarkItDown."""
+        self.config = config or {}
         try:
             self.markitdown = MarkItDown()
             
             # Phase 2: Extraction strategy configuration
-            self.extraction_strategy = os.getenv("EXTRACTION_STRATEGY", "spotlight_first")
-            self.spotlight_enabled = os.getenv("SPOTLIGHT_ENABLED", "true").lower() == "true"
+            self.extraction_strategy = self.config.get("EXTRACTION_STRATEGY", "spotlight_first")
+            self.spotlight_enabled = self.config.get("SPOTLIGHT_ENABLED", True)
             
             # Statistics tracking
             self.extraction_stats = {
@@ -162,7 +165,7 @@ class FileParser:
             if (self.spotlight_enabled and 
                 self.extraction_strategy in ["spotlight_first"]):
                 
-                extracted_content = self._try_spotlight_extraction(path)
+                extracted_content = await self._try_spotlight_extraction(path)
                 if extracted_content:
                     extraction_method = "spotlight"
                     self.extraction_stats["spotlight_success"] += 1
@@ -178,9 +181,9 @@ class FileParser:
 
             # Strategy 2: Try media processing for audio/video/image files
             if not extracted_content:
-                is_media, media_type = is_supported_media_file(path)
+                is_media, media_type = await is_supported_media_file(path)
                 if is_media:
-                    extracted_content = self._try_media_extraction(path, media_type)
+                    extracted_content = await self._try_media_extraction(path, media_type)
                     if extracted_content:
                         extraction_method = f"media_{media_type}"
                         self.extraction_stats["media_success"] += 1
@@ -198,7 +201,7 @@ class FileParser:
 
             # Strategy 3: Fallback to MarkItDown
             if not extracted_content and self.extraction_strategy != "spotlight_only":
-                extracted_content = self._try_markitdown_extraction(path)
+                extracted_content = await self._try_markitdown_extraction(path)
                 if extracted_content:
                     extraction_method = "markitdown"
                     self.extraction_stats["markitdown_success"] += 1
@@ -243,7 +246,7 @@ class FileParser:
 
             raise e
 
-    def _try_spotlight_extraction(self, path: Path) -> str | None:
+    async def _try_spotlight_extraction(self, path: Path) -> str | None:
         """
         Try extracting text using macOS Spotlight.
         
@@ -254,7 +257,7 @@ class FileParser:
             Extracted text or None if failed
         """
         try:
-            content = spotlight_to_text(path)
+            content = await spotlight_to_text(path, self.config)
             if content and len(content.strip()) > 50:  # Minimum content threshold
                 logger.debug(sm("Spotlight extraction successful", 
                                 path=str(path), 
@@ -270,7 +273,7 @@ class FileParser:
                             error=str(e)))
             return None
 
-    def _try_media_extraction(self, path: Path, media_type: str) -> str | None:
+    async def _try_media_extraction(self, path: Path, media_type: str) -> str | None:
         """
         Try extracting content from media files.
         
@@ -283,13 +286,13 @@ class FileParser:
         """
         try:
             if media_type == "audio":
-                content = extract_audio_transcript(path)
+                content = await extract_audio_transcript(path, self.config)
             elif media_type == "video":
-                content = extract_video_transcript(path)
+                content = await extract_video_transcript(path)
             elif media_type == "image":
                 # For images, we'll let the summarization process handle vision analysis
                 # Just extract basic image info here
-                image_info = extract_image_info(path)
+                image_info = await extract_image_info(path)
                 if image_info:
                     dimensions_str = ""
                     if image_info.get("dimensions"):
@@ -322,7 +325,7 @@ class FileParser:
                             error=str(e)))
             return None
 
-    def _try_markitdown_extraction(self, path: Path) -> str | None:
+    async def _try_markitdown_extraction(self, path: Path) -> str | None:
         """
         Try extracting content using MarkItDown.
         
@@ -335,7 +338,7 @@ class FileParser:
         try:
             logger.debug(sm("Trying MarkItDown extraction", path=str(path)))
             
-            result = self.markitdown.convert(str(path))
+            result = await asyncio.to_thread(self.markitdown.convert, str(path))
             
             if result and result.text_content:
                 content = result.text_content.strip()

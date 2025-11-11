@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import os
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional, Dict
 
 # Import AI libraries
 import litellm
@@ -101,18 +101,20 @@ class BaseEmbedder(ABC):
 class OnlineEmbedder(BaseEmbedder):
     """Embedder using online models via LiteLLM (OpenAI API)."""
 
-    def __init__(self, model: str | None = None, api_key: str | None = None, dimensions: int | None = None) -> None:
+    def __init__(self, config: Optional[Dict[str, Any]] = None, model: str | None = None, api_key: str | None = None, dimensions: int | None = None) -> None:
         """
         Initialize online embedder.
 
         Args:
+            config: Application configuration dictionary
             model: Model name (default: text-embedding-3-small)
             api_key: API key (default from env)
             dimensions: Embedding dimensions (default: 512 for efficiency)
         """
+        self.config = config or {}
         # Default to text-embedding-3-small with 512 dimensions for efficiency
-        self.model = model or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-        self.configured_dimensions = dimensions or int(os.getenv("EMBEDDING_DIMENSIONS", "512"))
+        self.model = model or self.config.get("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.configured_dimensions = dimensions or self.config.get("EMBEDDING_DIMENSIONS", 512)
 
         # Initialize base class
         super().__init__(model_name=self.model, dimensions=self.configured_dimensions)
@@ -215,14 +217,16 @@ class OnlineEmbedder(BaseEmbedder):
 class LocalEmbedder(BaseEmbedder):
     """Embedder using local models via sentence-transformers."""
 
-    def __init__(self, model_name: str | None = None, dimensions: int | None = None) -> None:
+    def __init__(self, config: Optional[Dict[str, Any]] = None, model_name: str | None = None, dimensions: int | None = None) -> None:
         """
         Initialize local embedder.
 
         Args:
-            model_name: Model name (default: Qwen/Qwen3-Embedding-0.6B)
+            config: Application configuration dictionary
+            model_name: Model name (default: intfloat/e5-base-v2)
             dimensions: Embedding dimensions (default: 768 for efficiency)
         """
+        self.config = config or {}
         # Import sentence-transformers lazily
         try:
             from sentence_transformers import SentenceTransformer
@@ -231,9 +235,9 @@ class LocalEmbedder(BaseEmbedder):
             self.sentence_transformers_available = False
             logger.warning(sm("sentence-transformers not installed, local embeddings unavailable"))
 
-        # Default to Qwen model with 768 dimensions for efficiency
-        self.model_name = model_name or os.getenv("LOCAL_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
-        self.configured_dimensions = dimensions or int(os.getenv("LOCAL_EMBEDDING_DIMENSIONS", "768"))
+        # Default to intfloat/e5-base-v2 model with 768 dimensions for efficiency
+        self.model_name = model_name or self.config.get("LOCAL_EMBEDDING_MODEL", "intfloat/e5-base-v2")
+        self.configured_dimensions = dimensions or self.config.get("LOCAL_EMBEDDING_DIMENSIONS", 768)
 
         # Initialize base class
         super().__init__(model_name=self.model_name, dimensions=self.configured_dimensions)
@@ -305,6 +309,46 @@ class LocalEmbedder(BaseEmbedder):
             logger.exception(sm(error_msg, model=self.model_name))
             raise EmbeddingProviderError(error_msg)
 
+    async def _embed_text_async(self, text: str | list[str]) -> np.ndarray:
+        """Generate embeddings using local model with async support."""
+        if not self.is_available():
+            msg = "Local embedder not available"
+            raise EmbeddingProviderError(msg)
+
+        texts = self._validate_text(text)
+
+        logger.debug(sm("Generating local embeddings async",
+                    model=self.model_name,
+                    num_texts=len(texts),
+                    dimensions=self.configured_dimensions))
+
+        try:
+            # Generate embeddings asynchronously using asyncio.to_thread
+            embeddings = await asyncio.to_thread(
+                self.model.encode,
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False
+            )
+
+            # Truncate to configured dimensions if needed
+            if embeddings.shape[1] > self.configured_dimensions:
+                embeddings = embeddings[:, :self.configured_dimensions]
+
+            # Convert to float32
+            embeddings = embeddings.astype(np.float32)
+
+            # Return single vector if input was single text
+            if isinstance(text, str):
+                return embeddings[0]
+
+            return embeddings
+
+        except Exception as e:
+            error_msg = f"Async local embedding generation failed: {e!s}"
+            logger.exception(sm(error_msg, model=self.model_name))
+            raise EmbeddingProviderError(error_msg)
+
 
 class AutoEmbedder:
     """
@@ -316,14 +360,16 @@ class AutoEmbedder:
     3. Local models (fallback)
     """
 
-    def __init__(self, preferred_provider: str | None = None) -> None:
+    def __init__(self, config: Optional[Dict[str, Any]] = None, preferred_provider: str | None = None) -> None:
         """
         Initialize auto embedder.
 
         Args:
+            config: Application configuration dictionary
             preferred_provider: Preferred provider ('local', 'online')
         """
-        self.preferred_provider = preferred_provider or os.getenv("EMBEDDING_PROVIDER", "local")
+        self.config = config or {}
+        self.preferred_provider = preferred_provider or self.config.get("EMBEDDING_PROVIDER", "local")
         logger.debug(sm("Preferred provider", og=preferred_provider, provider=self.preferred_provider))
         self.embedders = {}
 
@@ -398,7 +444,7 @@ class AutoEmbedder:
         """Get or create online embedder if available."""
         if "online" not in self.embedders:
             try:
-                embedder = OnlineEmbedder()
+                embedder = OnlineEmbedder(config=self.config)
                 if embedder.is_available():
                     self.embedders["online"] = embedder
                     logger.info(sm("Online embedder available"))
@@ -415,7 +461,7 @@ class AutoEmbedder:
         """Get or create local embedder if available."""
         if "local" not in self.embedders:
             try:
-                embedder = LocalEmbedder()
+                embedder = LocalEmbedder(config=self.config)
                 if embedder.is_available():
                     self.embedders["local"] = embedder
                     logger.info(sm("Local embedder available"))

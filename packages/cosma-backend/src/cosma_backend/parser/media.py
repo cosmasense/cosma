@@ -7,12 +7,12 @@
 @Desc    :   Audio/video transcription and image captioning with multi-provider support
 """
 
+import asyncio
 import logging
 import os
-import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Dict
 
 from ..logging import sm
 
@@ -20,19 +20,23 @@ from ..logging import sm
 logger = logging.getLogger(__name__)
 
 
-def extract_audio_transcript(path: Path, backend: str | None = None) -> str | None:
+async def extract_audio_transcript(path: Path, config: Optional[Dict[str, Any]] = None, backend: str | None = None) -> str | None:
     """
     Extract transcript from audio file using configurable backends.
     
     Args:
         path: Path to audio file
+        config: Optional configuration dictionary
         backend: Backend to use ('openai' | 'local' | None for auto)
         
     Returns:
         Transcript text or None if extraction failed
     """
-    # Get provider from env (defaults to online)
-    provider = backend or os.getenv("WHISPER_PROVIDER", "online")
+    # Get provider from config or env (defaults to online)
+    if config:
+        provider = backend or config.get("WHISPER_PROVIDER", "online")
+    else:
+        provider = backend or os.getenv("WHISPER_PROVIDER", "online")
     
     # Map provider names to backend names
     backend_map = {"online": "openai", "local": "local", "openai": "openai"}
@@ -49,9 +53,9 @@ def extract_audio_transcript(path: Path, backend: str | None = None) -> str | No
     
     try:
         if backend == "openai":
-            return _transcribe_with_openai(path)
+            return await _transcribe_with_openai(path)
         elif backend == "local":
-            return _transcribe_with_local_whisper(path)
+            return await _transcribe_with_local_whisper(path)
         else:
             logger.error(sm("Unknown Whisper backend", backend=backend))
             return None
@@ -64,7 +68,7 @@ def extract_audio_transcript(path: Path, backend: str | None = None) -> str | No
         return None
 
 
-def extract_video_transcript(path: Path, backend: str | None = None) -> str | None:
+async def extract_video_transcript(path: Path, backend: str | None = None) -> str | None:
     """
     Extract transcript from video file by extracting audio first.
     
@@ -85,12 +89,12 @@ def extract_video_transcript(path: Path, backend: str | None = None) -> str | No
     
     try:
         # Extract audio from video using ffmpeg
-        audio_path = _extract_audio_from_video(path)
+        audio_path = await _extract_audio_from_video(path)
         if not audio_path:
             return None
             
         # Transcribe the extracted audio
-        transcript = extract_audio_transcript(audio_path, backend)
+        transcript = await extract_audio_transcript(audio_path, backend=backend)
         
         # Clean up temporary audio file
         audio_path.unlink(missing_ok=True)
@@ -104,7 +108,7 @@ def extract_video_transcript(path: Path, backend: str | None = None) -> str | No
         return None
 
 
-def extract_image_info(path: Path) -> dict[str, Any] | None:
+async def extract_image_info(path: Path) -> dict[str, Any] | None:
     """
     Extract basic information about an image file.
     Note: Image analysis is now integrated into the summarization process.
@@ -157,7 +161,7 @@ def extract_image_info(path: Path) -> dict[str, Any] | None:
 # OpenAI API Implementations
 # =============================================================================
 
-def _transcribe_with_openai(audio_path: Path) -> str | None:
+async def _transcribe_with_openai(audio_path: Path, config: Optional[Dict[str, Any]] = None) -> str | None:
     """Transcribe audio using OpenAI Whisper API."""
     try:
         import openai
@@ -184,7 +188,7 @@ def _transcribe_with_openai(audio_path: Path) -> str | None:
         # Get model from env
         model = os.getenv("ONLINE_WHISPER_MODEL", "whisper-1")
         
-        # Open file and transcribe
+        # Open file and transcribe (OpenAI client is synchronous but the overall function is async)
         with open(audio_path, 'rb') as audio_file:
             transcript = client.audio.transcriptions.create(
                 model=model,
@@ -214,51 +218,64 @@ def _transcribe_with_openai(audio_path: Path) -> str | None:
 # Local Model Implementations
 # =============================================================================
 
-def _transcribe_with_local_whisper(audio_path: Path) -> str | None:
+async def _transcribe_with_local_whisper(audio_path: Path) -> str | None:
     """Transcribe audio using local Whisper model."""
     try:
         # Try whisper-cpp first (faster), then whisper
-        if _check_whisper_cpp_available():
-            return _transcribe_with_whisper_cpp(audio_path)
+        if await _check_whisper_cpp_available():
+            return await _transcribe_with_whisper_cpp(audio_path)
         else:
-            return _transcribe_with_whisper_python(audio_path)
+            return await _transcribe_with_whisper_python(audio_path)
             
     except Exception as e:
         logger.exception(sm("Local Whisper transcription error", error=str(e)))
         return None
 
 
-def _transcribe_with_whisper_cpp(audio_path: Path) -> str | None:
+async def _transcribe_with_whisper_cpp(audio_path: Path) -> str | None:
     """Transcribe using whisper.cpp (faster native implementation)."""
     try:
         model_name = os.getenv("LOCAL_WHISPER_MODEL", "turbo")
         
         # Run whisper.cpp main command
-        result = subprocess.run([
+        process = await asyncio.create_subprocess_exec(
             "whisper", 
             str(audio_path),
             "-m", f"models/ggml-{model_name}.bin",
             "-t", "4",  # 4 threads
             "-np",      # no print
             "-nt",      # no timestamps
-        ], capture_output=True, text=True, timeout=300)  # 5 min timeout
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         
-        if result.returncode == 0:
-            transcript = result.stdout.strip()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)  # 5 min timeout
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.warning(sm("whisper.cpp transcription timed out"))
+            return None
+        
+        if process.returncode == 0:
+            transcript = stdout.decode().strip()
             logger.info(sm("whisper.cpp transcription completed", 
                        model=model_name,
                        length=len(transcript)))
             return transcript
         else:
-            logger.warning(sm("whisper.cpp failed", stderr=result.stderr))
+            logger.warning(sm("whisper.cpp failed", stderr=stderr.decode()))
             return None
             
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError) as e:
+    except FileNotFoundError:
+        logger.warning(sm("whisper.cpp not available or failed", error="Command not found"))
+        return None
+    except Exception as e:
         logger.warning(sm("whisper.cpp not available or failed", error=str(e)))
         return None
 
 
-def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
+async def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
     """Transcribe using OpenAI Whisper Python library."""
     try:
         import whisper
@@ -268,8 +285,9 @@ def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
         # Load model (cached after first use)
         model = whisper.load_model(model_name)
         
-        # Transcribe
-        result = model.transcribe(str(audio_path))
+        # Transcribe (run in thread pool since whisper is blocking)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, model.transcribe, str(audio_path))
         transcript = result["text"]
         
         logger.info(sm("Whisper Python transcription completed", 
@@ -294,11 +312,18 @@ def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
 # Utility Functions
 # =============================================================================
 
-def _extract_audio_from_video(video_path: Path) -> Path | None:
+async def _extract_audio_from_video(video_path: Path) -> Path | None:
     """Extract audio track from video file using ffmpeg."""
     try:
         # Check if ffmpeg is available
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, "ffmpeg")
         
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.error(sm("ffmpeg not available - required for video processing"))
@@ -309,7 +334,7 @@ def _extract_audio_from_video(video_path: Path) -> Path | None:
         temp_audio = Path(tempfile.mktemp(suffix='.wav'))
         
         # Extract audio with ffmpeg
-        result = subprocess.run([
+        process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-i", str(video_path),
             "-vn",  # No video
@@ -317,10 +342,20 @@ def _extract_audio_from_video(video_path: Path) -> Path | None:
             "-ar", "16000",  # 16kHz sample rate (good for speech)
             "-ac", "1",  # Mono
             "-y",  # Overwrite output
-            str(temp_audio)
-        ], capture_output=True, text=True, timeout=300)
+            str(temp_audio),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         
-        if result.returncode == 0 and temp_audio.exists():
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.warning(sm("ffmpeg audio extraction timed out"))
+            return None
+        
+        if process.returncode == 0 and temp_audio.exists():
             logger.info(sm("Audio extracted from video", 
                        video=str(video_path),
                        audio=str(temp_audio),
@@ -329,26 +364,29 @@ def _extract_audio_from_video(video_path: Path) -> Path | None:
         else:
             logger.warning(sm("Audio extraction failed", 
                           video=str(video_path),
-                          stderr=result.stderr))
+                          stderr=stderr.decode()))
             return None
             
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+    except Exception as e:
         logger.exception(sm("ffmpeg audio extraction error", error=str(e)))
         return None
 
 
-def _check_whisper_cpp_available() -> bool:
+async def _check_whisper_cpp_available() -> bool:
     """Check if whisper.cpp is available."""
     try:
-        result = subprocess.run(["whisper", "--help"], 
-                              capture_output=True, 
-                              timeout=5)
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, PermissionError):
+        process = await asyncio.create_subprocess_exec(
+            "whisper", "--help",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await asyncio.wait_for(process.communicate(), timeout=5)
+        return process.returncode == 0
+    except (asyncio.TimeoutError, FileNotFoundError, PermissionError):
         return False
 
 
-def get_supported_media_extensions() -> dict[str, list[str]]:
+async def get_supported_media_extensions() -> dict[str, list[str]]:
     """
     Get supported media file extensions by category.
     
@@ -362,7 +400,7 @@ def get_supported_media_extensions() -> dict[str, list[str]]:
     }
 
 
-def is_supported_media_file(path: Path) -> tuple[bool, str | None]:
+async def is_supported_media_file(path: Path) -> tuple[bool, str | None]:
     """
     Check if a file is a supported media type.
     
@@ -373,7 +411,7 @@ def is_supported_media_file(path: Path) -> tuple[bool, str | None]:
         Tuple of (is_supported, media_type)
     """
     extension = path.suffix.lower()
-    supported = get_supported_media_extensions()
+    supported = await get_supported_media_extensions()
     
     for media_type, extensions in supported.items():
         if extension in extensions:
@@ -383,7 +421,7 @@ def is_supported_media_file(path: Path) -> tuple[bool, str | None]:
 
 
 # Test/validation functions
-def validate_media_backends() -> dict[str, bool]:
+async def validate_media_backends() -> dict[str, bool]:
     """
     Validate which media processing backends are available.
     
@@ -405,12 +443,17 @@ def validate_media_backends() -> dict[str, bool]:
         results["whisper_python"] = False
     
     # Test whisper.cpp
-    results["whisper_cpp"] = _check_whisper_cpp_available()
+    results["whisper_cpp"] = await _check_whisper_cpp_available()
     
     # Test ffmpeg
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        results["ffmpeg"] = True
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        results["ffmpeg"] = process.returncode == 0
     except (subprocess.CalledProcessError, FileNotFoundError):
         results["ffmpeg"] = False
     

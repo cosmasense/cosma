@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
 
 # Import AI libraries
+from cosma_backend.utils.decorators import async_wrap
 import litellm
 import ollama
 import tiktoken
@@ -37,7 +38,7 @@ def get_encoding_for_model(model: str) -> tiktoken.Encoding:
     Get the tiktoken encoding for a given model name.
     
     Args:
-        model: Model name (e.g., "gpt-4", "gpt-3.5-turbo", "llama3.2")
+        model: Model name (e.g., "gpt-4", "gpt-3.5-turbo", "qwen3-vl:2b-instruct")
         
     Returns:
         tiktoken.Encoding object for the model
@@ -89,6 +90,7 @@ def estimate_tokens_fast(text: str, model: Optional[str] = None) -> int:
     return len(text) // 4
 
 
+@async_wrap  # slow and blocking
 def estimate_tokens(text: str, model: Optional[str] = None, use_fast: bool = False) -> int:
     """
     Estimate the number of tokens in a text string.
@@ -119,7 +121,7 @@ def estimate_tokens(text: str, model: Optional[str] = None, use_fast: bool = Fal
         return estimate_tokens_fast(text, model)
 
 
-def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50, model: Optional[str] = None) -> List[str]:
+async def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50, model: Optional[str] = None) -> List[str]:
     """
     Split content into chunks that fit within token limits.
     Uses fast token estimation for efficiency with accuracy validation.
@@ -134,9 +136,9 @@ def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50, model
         List of content chunks
     """
     # Fast initial check
-    if estimate_tokens(content, model, use_fast=True) <= max_tokens:
+    if await estimate_tokens(content, model, use_fast=True) <= max_tokens:
         # Verify with accurate tokenization if it's close to the limit
-        if estimate_tokens(content, model, use_fast=False) <= max_tokens:
+        if await estimate_tokens(content, model, use_fast=False) <= max_tokens:
             return [content]
     
     # Use sentence-based chunking with fast estimation for efficiency
@@ -147,7 +149,7 @@ def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50, model
     safety_buffer = int(max_tokens * 0.1)  # 10% safety buffer
     
     for sentence in sentences:
-        sentence_tokens = estimate_tokens(sentence, model, use_fast=True)
+        sentence_tokens = await estimate_tokens(sentence, model, use_fast=True)
         
         if sentence_tokens > (max_tokens - safety_buffer):
             logger.info(sm("Sentence too big", sentence_tokens=sentence_tokens, current_tokens=current_tokens, max=max_tokens - safety_buffer))
@@ -159,10 +161,10 @@ def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50, model
             chunk_text = '. '.join(current_chunk) + '.'
             
             # Safety check: verify the chunk doesn't exceed the limit with accurate tokenization
-            accurate_tokens = estimate_tokens(chunk_text, model, use_fast=False)
+            accurate_tokens = await estimate_tokens(chunk_text, model, use_fast=False)
             if accurate_tokens > max_tokens:
                 # Chunk is too large, split it further
-                chunk_text = _oversized_chunk_fix(chunk_text, max_tokens, model)
+                chunk_text = await _oversized_chunk_fix(chunk_text, max_tokens, model)
             
             chunks.append(chunk_text)
             
@@ -170,7 +172,7 @@ def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50, model
             overlap_sentences = max(1, overlap_tokens // 50)  # Rough overlap in sentences
             overlap_content = '. '.join(current_chunk[-overlap_sentences:])
             current_chunk = [overlap_content, sentence] if overlap_content else [sentence]
-            current_tokens = estimate_tokens('. '.join(current_chunk), model, use_fast=True)
+            current_tokens = await estimate_tokens('. '.join(current_chunk), model, use_fast=True)
         else:
             current_chunk.append(sentence)
             current_tokens += sentence_tokens
@@ -178,15 +180,15 @@ def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50, model
     # Add final chunk with safety check
     if current_chunk:
         chunk_text = '. '.join(current_chunk) + '.'
-        accurate_tokens = estimate_tokens(chunk_text, model, use_fast=False)
+        accurate_tokens = await estimate_tokens(chunk_text, model, use_fast=False)
         if accurate_tokens > max_tokens:
-            chunk_text = _oversized_chunk_fix(chunk_text, max_tokens, model)
+            chunk_text = await _oversized_chunk_fix(chunk_text, max_tokens, model)
         chunks.append(chunk_text)
     
     return chunks
 
 
-def _oversized_chunk_fix(chunk_text: str, max_tokens: int, model: Optional[str] = None) -> str:
+async def _oversized_chunk_fix(chunk_text: str, max_tokens: int, model: Optional[str] = None) -> str:
     """
     Fix an oversized chunk by splitting it more aggressively.
     Uses accurate tokenization for this critical operation.
@@ -208,7 +210,7 @@ def _oversized_chunk_fix(chunk_text: str, max_tokens: int, model: Optional[str] 
         
         for paragraph in paragraphs:
             test_chunk = current_chunk + ("\n\n" if current_chunk else "") + paragraph
-            if estimate_tokens(test_chunk, model, use_fast=False) <= max_tokens:
+            if await estimate_tokens(test_chunk, model, use_fast=False) <= max_tokens:
                 current_chunk = test_chunk
             else:
                 if current_chunk:
@@ -264,16 +266,18 @@ class BaseSummarizer(ABC):
     """Abstract base class for file summarizers."""
     
     
-    def __init__(self, max_tokens: Optional[int] = None, model: Optional[str] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, max_tokens: Optional[int] = None, model: Optional[str] = None):
         """
         Initialize summarizer with context length limit.
         
         Args:
+            config: Application configuration dictionary
             max_tokens: Maximum tokens for the model context
             model: Model name for accurate tokenization (optional)
         """
-        self.max_tokens = max_tokens or int(os.getenv("MAX_TOKENS_PER_REQUEST", "100000"))
-        self.chunk_overlap = int(os.getenv("CHUNK_OVERLAP_TOKENS", "1000"))
+        self.config = config or {}
+        self.max_tokens = max_tokens or self.config.get("MAX_TOKENS_PER_REQUEST", 100000)
+        self.chunk_overlap = self.config.get("CHUNK_OVERLAP_TOKENS", 1000)
         self.model = model
     
     @abstractmethod
@@ -306,6 +310,7 @@ class BaseSummarizer(ABC):
         
         return True
         
+    @async_wrap
     def _prepare_images(self, file_metadata: File) -> list[str]:
         images = []
         
@@ -315,7 +320,7 @@ class BaseSummarizer(ABC):
                 
         return images
     
-    def _prepare_content(self, content: str) -> List[str]:
+    async def _prepare_content(self, content: str) -> List[str]:
         """
         Prepare content for summarization, chunking if necessary.
         Uses fast token estimation for efficiency.
@@ -327,7 +332,7 @@ class BaseSummarizer(ABC):
             List of content chunks ready for processing
         """
         # Use fast estimation for initial analysis
-        estimated_tokens = estimate_tokens(content, self.model)
+        estimated_tokens = await estimate_tokens(content, self.model)
         
         # If within limits using fast estimation, do a quick accurate check
         if estimated_tokens <= self.max_tokens:
@@ -341,13 +346,13 @@ class BaseSummarizer(ABC):
         logger.info(sm("Content exceeds token limit, chunking required", estimated_tokens=estimated_tokens, max_tokens=self.max_tokens))
         
         # Use optimized chunking
-        chunks = chunk_content(content, self.max_tokens, self.chunk_overlap, self.model)
+        chunks = await chunk_content(content, self.max_tokens, self.chunk_overlap, self.model)
         logger.info(sm("Content chunked (noverify)", num_chunks=len(chunks)))
         
         # Use fast estimation for chunk statistics (sample a few chunks for accurate check)
         if len(chunks) <= 5:
             # For small number of chunks, verify all with accurate tokenization
-            accurate_chunk_tokens = [estimate_tokens(chunk, self.model, use_fast=False) for chunk in chunks]
+            accurate_chunk_tokens = [await estimate_tokens(chunk, self.model, use_fast=False) for chunk in chunks]
             avg_chunk_tokens = sum(accurate_chunk_tokens) // len(chunks)
             max_chunk_tokens = max(accurate_chunk_tokens)
             logger.info(sm("Content chunked and verified", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_tokens=max_chunk_tokens))
@@ -355,8 +360,8 @@ class BaseSummarizer(ABC):
             # For many chunks, sample a few for accurate verification and use fast for rest
             sample_size = min(3, len(chunks))
             sample_chunks = chunks[:sample_size]
-            accurate_sample_tokens = [estimate_tokens(chunk, self.model, use_fast=False) for chunk in sample_chunks]
-            fast_chunk_tokens = [estimate_tokens(chunk, self.model, use_fast=True) for chunk in chunks]
+            accurate_sample_tokens = [await estimate_tokens(chunk, self.model, use_fast=False) for chunk in sample_chunks]
+            fast_chunk_tokens = [await estimate_tokens(chunk, self.model, use_fast=True) for chunk in chunks]
             avg_chunk_tokens = sum(fast_chunk_tokens) // len(chunks)
             max_chunk_tokens = max(accurate_sample_tokens)
             logger.info(sm("Content chunked", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_sample=max_chunk_tokens))
@@ -472,21 +477,24 @@ class BaseSummarizer(ABC):
 class OllamaSummarizer(BaseSummarizer):
     """Summarizer using local Ollama models."""
     
-    def __init__(self, host: Optional[str] = None, model: Optional[str] = None, max_tokens: Optional[int] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, host: Optional[str] = None, model: Optional[str] = None, max_tokens: Optional[int] = None):
         """
         Initialize Ollama summarizer.
         
         Args:
-            host: Ollama host URL (default from env)
-            model: Model name (default from env)
-            max_tokens: Maximum context tokens (default from env)
+            config: Application configuration dictionary
+            host: Ollama host URL (default from config)
+            model: Model name (default from config)
+            max_tokens: Maximum context tokens (default from config)
         """
+        self.config = config or {}
+        
         # Get model name before initializing base class
-        model_name = model or os.getenv("OLLAMA_MODEL", "llama3.2")
+        model_name = model or self.config.get("OLLAMA_MODEL", "qwen3-vl:2b-instruct")
         
         # Initialize base class with context length and model
-        context_length = max_tokens or int(os.getenv("OLLAMA_MODEL_CONTEXT_LENGTH", "128000"))
-        super().__init__(max_tokens=context_length, model=model_name)
+        context_length = max_tokens or self.config.get("OLLAMA_MODEL_CONTEXT_LENGTH", 10000)
+        super().__init__(config=config, max_tokens=context_length, model=model_name)
         
         try:
             import ollama
@@ -495,7 +503,7 @@ class OllamaSummarizer(BaseSummarizer):
             self.ollama_available = False
             raise ImportError("ollama package is not installed")
         
-        self.host = host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self.host = host or self.config.get("OLLAMA_HOST", "http://localhost:11434")
         
         try:
             self.client = ollama.AsyncClient(host=self.host)
@@ -508,7 +516,10 @@ class OllamaSummarizer(BaseSummarizer):
         """Check if Ollama is available."""
         try:
             # Try to list models to check if Ollama is running
-            await self.client.list()
+            list = await self.client.list()
+            if self.model and self.model not in (m.model for m in list.models):
+                logger.info(sm("Ollama model not found, pulling", model=self.model))
+                await self.client.pull(self.model)
             return True
         except Exception as e:
             logger.debug(f"Ollama not available - error: {str(e)}")
@@ -523,11 +534,11 @@ class OllamaSummarizer(BaseSummarizer):
         
         try:
             # Prepare content chunks
-            content_chunks = self._prepare_content(file_metadata.content)
+            content_chunks = await self._prepare_content(file_metadata.content)
             chunk_summaries = []
             resolved_title = None
             
-            images = self._prepare_images(file_metadata)
+            images = await self._prepare_images(file_metadata)
             
             # Process each chunk
             for i, chunk in enumerate(content_chunks):
@@ -596,21 +607,24 @@ class OllamaSummarizer(BaseSummarizer):
 class OnlineSummarizer(BaseSummarizer):
     """Summarizer using online AI models via LiteLLM."""
     
-    def __init__(self, model: Optional[str] = None, api_key: Optional[str] = None, max_tokens: Optional[int] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, model: Optional[str] = None, api_key: Optional[str] = None, max_tokens: Optional[int] = None):
         """
         Initialize online summarizer.
         
         Args:
-            model: Model name (default from env)
-            api_key: API key (default from env)
-            max_tokens: Maximum context tokens (default from env)
+            config: Application configuration dictionary
+            model: Model name (default from config)
+            api_key: API key (default from config)
+            max_tokens: Maximum context tokens (default from config)
         """
+        self.config = config or {}
+        
         # Get model name before initializing base class
-        model_name = model or os.getenv("ONLINE_MODEL", "gpt-4o")
+        model_name = model or self.config.get("ONLINE_MODEL", "openai/gpt-4.1-nano-2025-04-14")
         
         # Initialize base class with context length and model
-        context_length = max_tokens or int(os.getenv("ONLINE_MODEL_CONTEXT_LENGTH", "128000"))
-        super().__init__(max_tokens=context_length, model=model_name)
+        context_length = max_tokens or self.config.get("ONLINE_MODEL_CONTEXT_LENGTH", 128000)
+        super().__init__(config=config, max_tokens=context_length, model=model_name)
         
         try:
             import litellm
@@ -649,11 +663,11 @@ class OnlineSummarizer(BaseSummarizer):
             import litellm
             
             # Prepare content chunks
-            content_chunks = self._prepare_content(file_metadata.content)
+            content_chunks = await self._prepare_content(file_metadata.content)
             chunk_summaries = []
             resolved_title = None
             
-            images = self._prepare_images(file_metadata)
+            images = await self._prepare_images(file_metadata)
             
             # Process each chunk
             for i, chunk in enumerate(content_chunks):
@@ -721,27 +735,30 @@ class OnlineSummarizer(BaseSummarizer):
 class LlamaCppSummarizer(BaseSummarizer):
     """Summarizer using local llama.cpp models."""
     
-    def __init__(self, model_path: Optional[str] = None, max_tokens: Optional[int] = None, n_ctx: Optional[int] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, model_path: Optional[str] = None, max_tokens: Optional[int] = None, n_ctx: Optional[int] = None):
         """
         Initialize llama.cpp summarizer.
         
         Args:
-            model_path: Path to GGUF model file (default from env: LLAMACPP_MODEL_PATH)
-            max_tokens: Maximum context tokens (default from env: LLAMACPP_MODEL_CONTEXT_LENGTH)
-            n_ctx: Context window size for the model (default from env: LLAMACPP_N_CTX)
+            config: Application configuration dictionary
+            model_path: Path to GGUF model file (default from config: LLAMACPP_MODEL_PATH)
+            max_tokens: Maximum context tokens (default from config: LLAMACPP_MODEL_CONTEXT_LENGTH)
+            n_ctx: Context window size for the model (default from config: LLAMACPP_N_CTX)
         """
-        # Get model path from env if not provided
-        self.model_path = model_path or os.getenv("LLAMACPP_MODEL_PATH")
-        self.repo_id = os.getenv("LLAMACPP_REPO_ID")
-        self.filename = os.getenv("LLAMACPP_FILENAME")
+        self.config = config or {}
+        
+        # Get model path from config if not provided
+        self.model_path = model_path or self.config.get("LLAMACPP_MODEL_PATH")
+        self.repo_id = self.config.get("LLAMACPP_REPO_ID")
+        self.filename = self.config.get("LLAMACPP_FILENAME")
         if not (self.model_path or all((self.repo_id, self.filename))):
             raise ValueError("LLAMACPP_MODEL_PATH environment variable must be set or model_path must be provided")
         
         # Initialize base class with context length
-        context_length = max_tokens or int(os.getenv("LLAMACPP_MODEL_CONTEXT_LENGTH", "8192"))
-        super().__init__(max_tokens=context_length, model="llama.cpp")
+        context_length = max_tokens or self.config.get("LLAMACPP_MODEL_CONTEXT_LENGTH", 8192)
+        super().__init__(config=config, max_tokens=context_length, model="llama.cpp")
         
-        self.n_ctx = n_ctx or int(os.getenv("LLAMACPP_N_CTX", "8192"))
+        self.n_ctx = n_ctx or self.config.get("LLAMACPP_N_CTX", 8192)
         
         try:
             from llama_cpp import Llama
@@ -757,9 +774,9 @@ class LlamaCppSummarizer(BaseSummarizer):
                     repo_id=self.repo_id,
                     filename=self.filename,
                     n_ctx=self.n_ctx,
-                    n_threads=int(os.getenv("LLAMACPP_N_THREADS", "4")),
-                    n_gpu_layers=int(os.getenv("LLAMACPP_N_GPU_LAYERS", "0")),  # 0 = CPU only, -1 = all layers on GPU
-                    verbose=os.getenv("LLAMACPP_VERBOSE", "false").lower() == "true",
+                    n_threads=self.config.get("LLAMACPP_N_THREADS", 4),
+                    n_gpu_layers=self.config.get("LLAMACPP_N_GPU_LAYERS", 0),  # 0 = CPU only, -1 = all layers on GPU
+                    verbose=self.config.get("LLAMACPP_VERBOSE", False),
                 )
                 logger.info(sm("llama.cpp summarizer initialized", 
                             repo_id=self.repo_id,
@@ -771,9 +788,9 @@ class LlamaCppSummarizer(BaseSummarizer):
                     repo_id=self.repo_id,
                     model_path=self.model_path,
                     n_ctx=self.n_ctx,
-                    n_threads=int(os.getenv("LLAMACPP_N_THREADS", "4")),
-                    n_gpu_layers=int(os.getenv("LLAMACPP_N_GPU_LAYERS", "0")),  # 0 = CPU only, -1 = all layers on GPU
-                    verbose=os.getenv("LLAMACPP_VERBOSE", "false").lower() == "true",
+                    n_threads=self.config.get("LLAMACPP_N_THREADS", 4),
+                    n_gpu_layers=self.config.get("LLAMACPP_N_GPU_LAYERS", 0),  # 0 = CPU only, -1 = all layers on GPU
+                    verbose=self.config.get("LLAMACPP_VERBOSE", False),
                 )
                 logger.info(sm("llama.cpp summarizer initialized", 
                             model_path=self.model_path, 
@@ -806,13 +823,13 @@ class LlamaCppSummarizer(BaseSummarizer):
         
         try:
             # Prepare content chunks
-            content_chunks = self._prepare_content(file_metadata.content)
+            content_chunks = await self._prepare_content(file_metadata.content)
             chunk_summaries = []
             resolved_title = None
             
             # Note: llama.cpp doesn't natively support image processing in the same way as Ollama
             # Images would need to be handled by a multimodal GGUF model if available
-            images = self._prepare_images(file_metadata)
+            images = await self._prepare_images(file_metadata)
             if images:
                 logger.warning("Image support in llama.cpp requires multimodal GGUF models and is not fully implemented")
             
@@ -888,14 +905,16 @@ class AutoSummarizer:
     4. Online models (fallback)
     """
     
-    def __init__(self, preferred_provider: Optional[str] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, preferred_provider: Optional[str] = None):
         """
         Initialize auto summarizer.
         
         Args:
+            config: Application configuration dictionary
             preferred_provider: Preferred provider ('llamacpp', 'ollama', 'online', 'auto')
         """
-        self.preferred_provider = preferred_provider or os.getenv("AI_PROVIDER", "auto")
+        self.config = config or {}
+        self.preferred_provider = preferred_provider or self.config.get("AI_PROVIDER", "auto")
         self.summarizers = {}
         
         logger.info(sm("AutoSummarizer initialized", preferred_provider=self.preferred_provider))
@@ -905,7 +924,7 @@ class AutoSummarizer:
         if "llamacpp" not in self.summarizers:
             try:
                 logger.info(sm("llama.cpp summarizer initalizing"))
-                summarizer = LlamaCppSummarizer()
+                summarizer = LlamaCppSummarizer(config=self.config)
                 if await summarizer.is_available():
                     self.summarizers["llamacpp"] = summarizer
                     logger.info(sm("llama.cpp summarizer available"))
@@ -922,7 +941,7 @@ class AutoSummarizer:
         """Get or create Ollama summarizer if available."""
         if "ollama" not in self.summarizers:
             try:
-                summarizer = OllamaSummarizer()
+                summarizer = OllamaSummarizer(config=self.config)
                 if await summarizer.is_available():
                     self.summarizers["ollama"] = summarizer
                     logger.info(sm("Ollama summarizer available"))
@@ -939,7 +958,7 @@ class AutoSummarizer:
         """Get or create online summarizer if available."""
         if "online" not in self.summarizers:
             try:
-                summarizer = OnlineSummarizer()
+                summarizer = OnlineSummarizer(config=self.config)
                 if await summarizer.is_available():
                     self.summarizers["online"] = summarizer
                     logger.info(sm("Online summarizer available"))

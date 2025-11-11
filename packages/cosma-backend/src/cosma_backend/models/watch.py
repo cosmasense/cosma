@@ -114,7 +114,7 @@ class WatchedDirectory:
         Returns:
             A JobResponse instance with the relevant fields from this WatchedDirectory
         """
-        from backend.api.models import JobResponse
+        from cosma_backend.api.models import JobResponse
         
         return JobResponse(
             id=self.id,

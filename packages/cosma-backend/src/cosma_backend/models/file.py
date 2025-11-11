@@ -155,7 +155,7 @@ class File:
         Returns:
             A FileResponse instance with the relevant fields from this File
         """
-        from backend.api.models import FileResponse
+        from cosma_backend.api.models import FileResponse
         
         return FileResponse(
             file_path=self.file_path,
