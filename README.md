@@ -1,5 +1,7 @@
 # Cosma
 
+[![Version](https://img.shields.io/pypi/v/cosma)](https://pypi.org/project/cosma/)
+
 <img align="right" src="./assets/logo.svg" height="150px" alt="Cosma Logo">
 
 Search engine for your files!
@@ -24,6 +26,23 @@ Cosma can run 100% locally or in the cloud.
 Currently, Cosma has only been tested on MacOS ARM.
 Windows and Linux support is coming soon!
 
+### Installing
+
+Cosma can be downloaded from PyPI.
+We highly recommend you do this with [uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+```sh
+uv tool install comsa
+```
+
+### Upgrading
+
+To upgrade to the latest version:
+
+```sh
+uv tool upgrade cosma --no-cache
+```
+
 ### Setup
 
 Make sure you have [Ollama](https://ollama.com/) installed.
@@ -31,19 +50,19 @@ Make sure you have [Ollama](https://ollama.com/) installed.
 Cosma has a backend to serve search queries, so it must be started first.
 This needs to always be running to watch for file changes and process files in the background.
 
-```py
-uvx cosma serve
+```sh
+cosma serve
 ```
 
 ### Running
 
-To start the terminal UI and start searching, run the TUI.
+To start the terminal UI and start searching, run search.
 
 > [!IMPORTANT]  
 > The backend must be running for this command to work (see above).
 
-```py
-uvx cosma /path/to/directory/to/search
+```sh
+cosma search /path/to/directory/to/search
 ```
 > [!WARNING]  
 > This will begin processing all files in the directory specified,
