@@ -281,19 +281,6 @@ class BaseSummarizer(ABC):
         self.model = model
     
     @abstractmethod
-    async def summarize(self, file_metadata: File) -> File:
-        """
-        Summarize the content of a file metadata object.
-        
-        Args:
-            file_metadata: The file metadata object to summarize
-            
-        Returns:
-            Enhanced file metadata with summary and keywords
-        """
-        pass
-    
-    @abstractmethod
     async def is_available(self) -> bool:
         """Check if this summarizer is available for use."""
         pass
@@ -472,6 +459,68 @@ class BaseSummarizer(ABC):
                 "Keywords should be 5-12 relevant nouns or noun-phrases that describe the content."
                 "Example: {{'summary': 'A concise summary of the file content', 'keywords': ['keyword1', 'keyword2', 'keyword3']}}"
             )
+    
+    @abstractmethod
+    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
+        raise NotImplementedError
+            
+    async def summarize(self, file_metadata: File) -> File:
+        """Summarize using Ollama with chunking support."""
+        if not self._validate_content(file_metadata):
+            return file_metadata
+        
+        logger.info(sm("Summarizing with Ollama", filename=file_metadata.filename, model=self.model))
+        
+        try:
+            # Prepare content chunks
+            content_chunks = await self._prepare_content(file_metadata.content)
+            chunk_summaries = []
+            resolved_title = None
+            
+            images = await self._prepare_images(file_metadata)
+            
+            # Process each chunk
+            for i, chunk in enumerate(content_chunks):
+                logger.info(sm(f"Processing chunk {i+1}/{len(content_chunks)}", length=len(chunk), images=len(images)))                
+                response = await self._get_ai_response(chunk, i, images)
+                
+                if not response:
+                    logger.warning(sm("Empty response for chunk", chunk_num=i+1))
+                    continue
+                
+                try:
+                    title, summary, keywords = self._parse_ai_response(response)
+                    chunk_summaries.append({"summary": summary, "keywords": keywords})
+                    if i == 0 and title:
+                        resolved_title = title
+                except ValueError as e:
+                    logger.warning(sm("Failed to parse chunk response", chunk_num=i+1, error=str(e)))
+                    continue
+            
+            if not chunk_summaries:
+                raise AIProviderError(f"No valid responses from {self.__class__.__name__}")
+            
+            # Combine chunk summaries
+            final_summary, final_keywords = self._combine_chunk_summaries(chunk_summaries)
+            
+            # Update file metadata
+            file_metadata.title = resolved_title
+            file_metadata.summary = final_summary
+            file_metadata.keywords = final_keywords
+            file_metadata.status = ProcessingStatus.SUMMARIZED
+            
+            logger.info(sm("Successfully summarized", filename=file_metadata.filename, 
+                          summarizer=self.__class__.__name__,
+                          title=resolved_title,
+                          summary_length=len(final_summary), keyword_count=len(final_keywords), 
+                          chunks_processed=len(chunk_summaries)))
+            
+            return file_metadata
+            
+        except Exception as e:
+            error_msg = f"{self.__class__.__name__} summarization failed: {str(e)}"
+            logger.error(sm("Summarization failed", summarizer=self.__class__.__name__, filename=file_metadata.filename, model=self.model, error=str(e)))
+            raise AIProviderError(error_msg)
 
 
 class OllamaSummarizer(BaseSummarizer):
@@ -524,84 +573,29 @@ class OllamaSummarizer(BaseSummarizer):
         except Exception as e:
             logger.debug(f"Ollama not available - error: {str(e)}")
             return False
-    
-    async def summarize(self, file_metadata: File) -> File:
-        """Summarize using Ollama with chunking support."""
-        if not self._validate_content(file_metadata):
-            return file_metadata
+            
+    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
+        user_message: dict[str, Any] = {"role": "user", "content": chunk}
+        if images:
+            user_message["images"] = images
         
-        logger.info(sm("Summarizing with Ollama", filename=file_metadata.filename, model=self.model))
+        raw_response = await self.client.chat(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
+                user_message,
+            ],
+            think=False,
+            # format="json",
+            options=ollama.Options(
+                num_predict=500,
+                # temperature=0.3,
+                num_ctx=16_000,
+            )
+        )
         
-        try:
-            # Prepare content chunks
-            content_chunks = await self._prepare_content(file_metadata.content)
-            chunk_summaries = []
-            resolved_title = None
-            
-            images = await self._prepare_images(file_metadata)
-            
-            # Process each chunk
-            for i, chunk in enumerate(content_chunks):
-                logger.info(sm(f"Processing chunk {i+1}/{len(content_chunks)}", length=len(chunk), images=len(images)))
-                
-                # Prepare message - only include images if we have any
-                user_message = {"role": "user", "content": chunk}
-                if images:
-                    user_message["images"] = images
-                
-                response = await self.client.chat(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self._get_system_prompt(include_title=(i == 0))},
-                        user_message,
-                    ],
-                    think=False,
-                    # format="json",
-                    options=ollama.Options(
-                        num_predict=500,
-                        # temperature=0.3,
-                        num_ctx=16_000,
-                    )
-                )
-                
-                logger.info(sm("Ollama response", response=response))
-                response_content = extract_json_from_response(response['message']['content'])
-                if not response_content:
-                    logger.warning(sm("Empty response for chunk", chunk_num=i+1))
-                    continue
-                
-                try:
-                    title, summary, keywords = self._parse_ai_response(response_content)
-                    chunk_summaries.append({"summary": summary, "keywords": keywords})
-                    if i == 0 and title:
-                        resolved_title = title
-                except ValueError as e:
-                    logger.warning(sm("Failed to parse chunk response", chunk_num=i+1, error=str(e)))
-                    continue
-            
-            if not chunk_summaries:
-                raise AIProviderError("No valid responses from Ollama")
-            
-            # Combine chunk summaries
-            final_summary, final_keywords = self._combine_chunk_summaries(chunk_summaries)
-            
-            # Update file metadata
-            file_metadata.title = resolved_title
-            file_metadata.summary = final_summary
-            file_metadata.keywords = final_keywords
-            file_metadata.status = ProcessingStatus.SUMMARIZED
-            
-            logger.info(sm("Successfully summarized with Ollama", filename=file_metadata.filename, 
-                          title=resolved_title,
-                          summary_length=len(final_summary), keyword_count=len(final_keywords), 
-                          chunks_processed=len(chunk_summaries)))
-            
-            return file_metadata
-            
-        except Exception as e:
-            error_msg = f"Ollama summarization failed: {str(e)}"
-            logger.error(sm("Ollama summarization failed", filename=file_metadata.filename, model=self.model, error=str(e)))
-            raise AIProviderError(error_msg)
+        logger.info(sm("AI response", summarizer=self.__class__.__name__, response=raw_response))
+        return extract_json_from_response(raw_response['message']['content'])
 
 
 class OnlineSummarizer(BaseSummarizer):
@@ -651,85 +645,29 @@ class OnlineSummarizer(BaseSummarizer):
         else:
             # Assume OpenAI by default
             return bool(os.getenv("OPENAI_API_KEY"))
-    
-    async def summarize(self, file_metadata: File) -> File:
-        """Summarize using online AI models with chunking support."""
-        if not self._validate_content(file_metadata):
-            return file_metadata
+            
+    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
+        user_message = {"role": "user", "content": chunk}
+        if images:
+            user_message["images"] = images
         
-        logger.info(sm("Summarizing with online model", filename=file_metadata.filename, model=self.model))
+        response = litellm.completion(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
+                user_message,
+            ],
+            temperature=0.1,
+            max_tokens=300,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0,
+            response_format={"type": "json_object"},
+            timeout=120,
+            max_retries=2,
+        )
         
-        try:
-            import litellm
-            
-            # Prepare content chunks
-            content_chunks = await self._prepare_content(file_metadata.content)
-            chunk_summaries = []
-            resolved_title = None
-            
-            images = await self._prepare_images(file_metadata)
-            
-            # Process each chunk
-            for i, chunk in enumerate(content_chunks):
-                logger.info(sm(f"Processing chunk {i+1}/{len(content_chunks)}", length=len(chunk), images=len(images)))
-                
-                user_message = {"role": "user", "content": chunk}
-                if images:
-                    user_message["images"] = images
-                
-                response = litellm.completion(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self._get_system_prompt(include_title=(i == 0))},
-                        user_message,
-                    ],
-                    temperature=0.1,
-                    max_tokens=300,
-                    top_p=1,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                    response_format={"type": "json_object"},
-                    timeout=120,
-                    max_retries=2,
-                )
-                
-                response_content = response.choices[0].message.content
-                if not response_content:
-                    logger.warning(sm("Empty response for chunk", chunk_num=i+1))
-                    continue
-                
-                try:
-                    title, summary, keywords = self._parse_ai_response(response_content)
-                    chunk_summaries.append({"summary": summary, "keywords": keywords})
-                    if i == 0 and title:
-                        resolved_title = title
-                except ValueError as e:
-                    logger.warning(sm("Failed to parse chunk response", chunk_num=i+1, error=str(e)))
-                    continue
-            
-            if not chunk_summaries:
-                raise AIProviderError("No valid responses from online model")
-            
-            # Combine chunk summaries
-            final_summary, final_keywords = self._combine_chunk_summaries(chunk_summaries)
-            
-            # Update file metadata
-            file_metadata.title = resolved_title
-            file_metadata.summary = final_summary
-            file_metadata.keywords = final_keywords
-            file_metadata.status = ProcessingStatus.SUMMARIZED
-            
-            logger.info(sm("Successfully summarized with online model", filename=file_metadata.filename, 
-                          title=resolved_title,
-                          model=self.model, summary_length=len(final_summary), 
-                          keyword_count=len(final_keywords), chunks_processed=len(chunk_summaries)))
-            
-            return file_metadata
-            
-        except Exception as e:
-            error_msg = f"Online summarization failed: {str(e)}"
-            logger.error(sm("Online summarization failed", filename=file_metadata.filename, model=self.model, error=str(e)))
-            raise AIProviderError(error_msg)
+        return response.choices[0].message.content
 
 
 class LlamaCppSummarizer(BaseSummarizer):
@@ -811,87 +749,24 @@ class LlamaCppSummarizer(BaseSummarizer):
             # Check if llm is initialized
             return hasattr(self, 'llm') and self.llm is not None
         except Exception as e:
-            logger.error(f"llama.cpp not available - error: {str(e)}")
+            logger.debug(f"llama.cpp not available - error: {str(e)}")
             return False
-    
-    async def summarize(self, file_metadata: File) -> File:
-        """Summarize using llama.cpp with chunking support."""
-        if not self._validate_content(file_metadata):
-            return file_metadata
+            
+    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
+        response = self.llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
+                {"role": "user", "content": chunk},
+            ],
+            max_tokens=500,
+            temperature=0.1,
+            top_p=0.95,
+            stream=False,
+        )
         
-        logger.info(sm("Summarizing with llama.cpp", filename=file_metadata.filename, model_path=self.model_path))
-        
-        try:
-            # Prepare content chunks
-            content_chunks = await self._prepare_content(file_metadata.content)
-            chunk_summaries = []
-            resolved_title = None
-            
-            # Note: llama.cpp doesn't natively support image processing in the same way as Ollama
-            # Images would need to be handled by a multimodal GGUF model if available
-            images = await self._prepare_images(file_metadata)
-            if images:
-                logger.warning("Image support in llama.cpp requires multimodal GGUF models and is not fully implemented")
-            
-            # Process each chunk
-            for i, chunk in enumerate(content_chunks):
-                logger.info(sm(f"Processing chunk {i+1}/{len(content_chunks)}", length=len(chunk)))
-                
-                # Use create_chat_completion to properly format the prompt with the model's chat template
-                response = self.llm.create_chat_completion(
-                    messages=[
-                        {"role": "system", "content": self._get_system_prompt(include_title=(i == 0))},
-                        {"role": "user", "content": chunk},
-                    ],
-                    max_tokens=500,
-                    temperature=0.1,
-                    top_p=0.95,
-                    stream=False,
-                )
-                
-                response_content = response['choices'][0]['message']['content'].strip()
-                logger.info(sm("llama.cpp raw response", response=response_content))
-                
-                if not response_content:
-                    logger.warning(sm("Empty response for chunk", chunk_num=i+1))
-                    continue
-                
-                # Try to extract JSON from response
-                json_str = extract_json_from_response(response_content)
-                
-                try:
-                    title, summary, keywords = self._parse_ai_response(json_str)
-                    chunk_summaries.append({"summary": summary, "keywords": keywords})
-                    if i == 0 and title:
-                        resolved_title = title
-                except ValueError as e:
-                    logger.warning(sm("Failed to parse chunk response", chunk_num=i+1, error=str(e), response=json_str))
-                    continue
-            
-            if not chunk_summaries:
-                raise AIProviderError("No valid responses from llama.cpp")
-            
-            # Combine chunk summaries
-            final_summary, final_keywords = self._combine_chunk_summaries(chunk_summaries)
-            
-            # Update file metadata
-            file_metadata.title = resolved_title
-            file_metadata.summary = final_summary
-            file_metadata.keywords = final_keywords
-            file_metadata.status = ProcessingStatus.SUMMARIZED
-            
-            logger.info(sm("Successfully summarized with llama.cpp", filename=file_metadata.filename,
-                          title=resolved_title,
-                          summary_length=len(final_summary), keyword_count=len(final_keywords), 
-                          chunks_processed=len(chunk_summaries)))
-            
-            return file_metadata
-            
-        except Exception as e:
-            error_msg = f"llama.cpp summarization failed: {str(e)}"
-            logger.error(sm("llama.cpp summarization failed", filename=file_metadata.filename, 
-                          model_path=self.model_path, error=str(e)))
-            raise AIProviderError(error_msg)
+        response_content = response['choices'][0]['message']['content'].strip()
+        logger.info(sm("llama.cpp raw response", response=response_content))
+        return extract_json_from_response(response_content)
 
 
 class AutoSummarizer:
@@ -929,10 +804,12 @@ class AutoSummarizer:
                     self.summarizers["llamacpp"] = summarizer
                     logger.info(sm("llama.cpp summarizer available"))
                 else:
-                    logger.info("llama.cpp summarizer not available")
+                    self.summarizers["llamacpp"] = None
+                    logger.debug("llama.cpp summarizer not available")
                     return None
             except Exception as e:
-                logger.error(sm("Failed to create llama.cpp summarizer)", error=str(e)))
+                logger.warning(sm("Failed to create llama.cpp summarizer)", error=str(e)))
+                self.summarizers["llamacpp"] = None
                 return None
         
         return self.summarizers.get("llamacpp")
@@ -947,9 +824,11 @@ class AutoSummarizer:
                     logger.info(sm("Ollama summarizer available"))
                 else:
                     logger.debug("Ollama summarizer not available")
+                    self.summarizers["ollama"] = None
                     return None
             except Exception as e:
                 logger.debug(f"Failed to create Ollama summarizer - error: {str(e)}")
+                self.summarizers["ollama"] = None
                 return None
         
         return self.summarizers.get("ollama")
@@ -964,41 +843,14 @@ class AutoSummarizer:
                     logger.info(sm("Online summarizer available"))
                 else:
                     logger.debug("Online summarizer not available")
+                    self.summarizers["online"] = None
                     return None
             except Exception as e:
                 logger.debug(f"Failed to create online summarizer - error: {str(e)}")
+                self.summarizers["online"] = None
                 return None
         
         return self.summarizers.get("online")
-    
-    async def _select_summarizer(self) -> Optional[BaseSummarizer]:
-        """
-        Select the best available summarizer based on preference.
-        
-        Returns:
-            An available summarizer instance or None
-        """
-        # Prioritize preferred provider if available
-        if self.preferred_provider == "llamacpp" and await self._get_llamacpp_summarizer():
-            return await self._get_llamacpp_summarizer()
-        
-        if self.preferred_provider == "ollama" and await self._get_ollama_summarizer():
-            return await self._get_ollama_summarizer()
-        
-        if self.preferred_provider == "online" and await self._get_online_summarizer():
-            return await self._get_online_summarizer()
-        
-        # Auto-selection logic (prefer local models first)
-        if await self._get_llamacpp_summarizer():
-            return await self._get_llamacpp_summarizer()
-        
-        if await self._get_ollama_summarizer():
-            return await self._get_ollama_summarizer()
-        
-        if await self._get_online_summarizer():
-            return await self._get_online_summarizer()
-            
-        return None
     
     async def summarize(self, file_metadata: File) -> File:
         """
