@@ -9,6 +9,7 @@ import asyncio
 from typing import List, Optional
 from pathlib import Path
 
+from cosma_tui.error_modal import ConnectionErrorModal
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Input, Static, ListView, ListItem, Label
@@ -205,7 +206,7 @@ class CosmaApp(App):
             yield Static(self.status_message, classes="status", id="status")
             yield Input(placeholder="Type to search...", id="search")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         """Initialize the app when mounted"""
         # Show onboarding screen if this is first run
         if self.show_onboarding:
@@ -218,26 +219,39 @@ class CosmaApp(App):
         # Focus the input initially
         self.query_one("#search", Input).focus()
         
-        # Start indexing in the background
-        self.update_status(f"Indexing {self.directory}...")
-        self.run_worker(self.index_directory(), exclusive=True, group="indexing")
-        
         # Initialize the app (focus, indexing, SSE)
-        self._initialize_app()
+        await self._initialize_app()
+        
+    async def handle_connection_error_screen(self, quit: bool | None) -> None:
+        """Called when ConnectionErrorScreen is dismissed."""
+        if quit:
+            self.exit()
+        else:
+            await self._initialize_app()
 
-    def _initialize_app(self) -> None:
+    async def _initialize_app(self) -> None:
         """Initialize the app with focus, indexing, and SSE updates"""
         # Focus the search input
         self.query_one("#search", Input).focus()
         
-        # Start indexing in the background
-        self.update_status(f"Indexing {self.directory}...")
-        self.run_worker(self.index_directory(), exclusive=True, group="indexing")
-        
+        # Test backend connection
+        self.update_status("Connecting...")
+        try:
+            await self.client.status()
+        except Exception as e:
+            self.log(f"Connection error: {e}")
+            self.update_status(f"Can't connect: {str(e)}")
+            self.push_screen(ConnectionErrorModal(), callback=self.handle_connection_error_screen)
+            return
+
         # Start SSE listener as a worker
         self.run_worker(self.listen_to_updates(), exclusive=False, group="sse")
 
-    def _on_theme_selected(self, theme: str) -> None:
+        # Start indexing in the background
+        self.run_worker(self.index_directory(), exclusive=True, group="indexing")
+        
+
+    async def _on_theme_selected(self, theme: str) -> None:
         """Handle theme selection from onboarding screen"""
         if theme:
             # Apply the selected theme to the current app instance
@@ -246,17 +260,13 @@ class CosmaApp(App):
             self.log(f"Applied theme: {theme}")
         
         # Continue with the normal initialization that was skipped in on_mount
-        self._initialize_app()
+        await self._initialize_app()
 
     async def listen_to_updates(self) -> None:
         """Listen to server-sent events and update status bar"""
         try:
             self.log("Starting SSE listener...")
-            stream = self.client.stream_updates()
-            self.log(f"Got stream object: {stream}")
-            self.log("About to enter async for loop...")
-            async for update in stream:
-                self.log(f"Inside async for loop, got update: {update}")
+            async for update in self.client.stream_updates():                    
                 if not self.running:
                     break
                 # Update is now an Update instance, use its display message
@@ -267,7 +277,8 @@ class CosmaApp(App):
                     self.update_status(str(update))
         except Exception as e:
             self.log(f"SSE Exception: {e}")
-            self.update_status(f"SSE Error: {str(e)}")
+            self.update_status(f"Can't connect: {str(e)}")
+            self.push_screen(ConnectionErrorModal())
 
     def update_status(self, message: str) -> None:
         """Update the status bar from any thread"""

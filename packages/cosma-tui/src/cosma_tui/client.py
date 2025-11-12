@@ -42,6 +42,11 @@ class Client:
         """Get the current status of indexing operations"""
         response = await self.session.get(self._url("/api/index/status"))
         return self._handle_response(response)
+        
+    async def status(self) -> Dict[str, Any]:
+        """Get the current status of the backend"""
+        response = await self.session.get(self._url("/api/status"))
+        return self._handle_response(response)
 
     # Search API (from APIDoc.md)
     async def search(self, query: str, filters: Optional[Dict[str, Any]] = None,
