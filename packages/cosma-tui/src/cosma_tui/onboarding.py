@@ -1,9 +1,9 @@
 """
-Onboarding screen for EZF first-time setup
+Onboarding screen for Cosma first-time setup
 """
 
 from typing import Optional, List
-from textual.app import App, ComposeResult
+from textual.app import ComposeResult, App
 from textual.containers import Vertical, Horizontal, Center
 from textual.widgets import Label, Button, ListView, ListItem, Static
 from textual.binding import Binding
@@ -55,7 +55,7 @@ class ThemeSelectionScreen(Screen):
         """Create the onboarding UI"""
         with Center():
             with Vertical(id="onboarding-container"):
-                yield Label("Welcome to EZF!", id="welcome-title")
+                yield Label("Welcome to Cosma!", id="welcome-title")
                 yield Label(
                     "Let's set up your preferences to get started.\n"
                     "Choose a theme for the interface:",
@@ -119,8 +119,8 @@ class ThemeSelectionScreen(Screen):
             config = get_config()
             config.set_theme(self.selected_theme)
             
-            # Return the selected theme
-            self.app.exit(self.selected_theme)
+            # Return the selected theme and dismiss the screen
+            self.dismiss(self.selected_theme)
 
     def action_cursor_up(self) -> None:
         """Move cursor up in the theme list"""
@@ -149,81 +149,3 @@ class ThemeSelectionScreen(Screen):
         self.app.exit()
 
 
-class OnboardingApp(App):
-    """Simple app for onboarding flow"""
-    
-    CSS = """
-    Screen {
-        background: $surface;
-        overflow: hidden;
-    }
-
-    #onboarding-container {
-        width: 60;
-        height: 22;
-        padding: 2;
-        border: solid $primary;
-        background: $surface;
-    }
-
-    #welcome-title {
-        text-align: center;
-        text-style: bold;
-        color: $primary;
-        margin: 0 0 1 0;
-        height: 1;
-    }
-
-    #welcome-subtitle {
-        text-align: center;
-        margin: 0 0 1 0;
-        height: 2;
-    }
-
-    #theme-list {
-        height: 1fr;
-        border: solid $primary;
-        overflow-y: scroll;
-        margin-bottom: 1;
-    }
-
-    #button-container {
-        align: center middle;
-        height: 3;
-    }
-
-    Button {
-        margin: 0 1;
-    }
-
-    ListItem {
-        padding: 0 1;
-        height: 1;
-    }
-
-    ListItem:hover {
-        background: $primary-lighten-1;
-    }
-
-    ListView:focus ListItem.--highlight {
-        background: $primary;
-    }
-
-    /* Ensure proper scrolling */
-    ListView {
-        scrollbar-background: $surface;
-        scrollbar-color: $primary;
-    }
-    """
-
-    def on_mount(self) -> None:
-        """Show the theme selection screen"""
-        # Get all available themes dynamically
-        themes = get_available_themes()
-        self.push_screen(ThemeSelectionScreen(themes))
-
-
-def run_onboarding() -> Optional[str]:
-    """Run the onboarding flow and return the selected theme"""
-    app = OnboardingApp()
-    return app.run()

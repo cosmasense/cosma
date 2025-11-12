@@ -76,48 +76,25 @@ class Client:
 
     async def stream_updates(self) -> AsyncIterator[Update]:
         """Stream server-sent events from /api/updates"""
-        import time
-        def log(msg):
-            with open('/tmp/ezf_client_debug.log', 'a') as f:
-                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-                f.flush()
-        
-        # Try regular HTTP with stream=True first
         url = self._url("/api/updates")
-        log(f"[CLIENT] Connecting to SSE (regular HTTP): {url}")
         try:
             response = await self.session.get(url, stream=True, timeout=30)
-            log(f"[CLIENT] Got response: {response.status_code}")
-            log(f"[CLIENT] Response headers: {dict(response.headers)}")
             response.raise_for_status()
             
-            # Check if it's actually SSE
-            content_type = response.headers.get('content-type', '')
-            log(f"[CLIENT] Content-Type: {content_type}")
-            
-            # Read lines from the stream
-            log(f"[CLIENT] Starting to read stream...")
             async for line in response.iter_lines():
-                log(f"[CLIENT] Got line: {line}")
                 if line:
                     line_str = line.decode('utf-8') if isinstance(line, bytes) else line
                     # SSE format: "data: {...}"
                     if line_str.startswith('data: '):
                         data_str = line_str[6:]  # Remove "data: " prefix
-                        log(f"[CLIENT] Parsing data: {data_str}")
                         try:
                             # Parse and create Update instance
                             update = Update.from_sse_data(data_str)
-                            log(f"[CLIENT] Created Update: {update}")
                             yield update
                         except Exception as e:
-                            log(f"[CLIENT] Failed to create Update: {e}")
                             # Fallback: create a generic INFO update
                             yield Update.create(UpdateOpcode.INFO, message=data_str)
         except Exception as e:
-            log(f"[CLIENT] Connection failed: {type(e).__name__}: {e}")
-            import traceback
-            log(f"[CLIENT] Traceback: {traceback.format_exc()}")
             raise
 
     async def close(self):

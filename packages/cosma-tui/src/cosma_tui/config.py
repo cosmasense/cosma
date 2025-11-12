@@ -1,5 +1,5 @@
 """
-Configuration management for EZF using platformdirs
+Configuration management for Cosma using platformdirs
 """
 
 import json
@@ -11,11 +11,11 @@ from platformdirs import user_config_dir
 
 
 class Config:
-    """Configuration manager for EZF"""
+    """Configuration manager for Cosma"""
     
     def __init__(self):
-        self.config_dir = Path(user_config_dir("ezf", ensure_exists=True))
-        self.config_file = self.config_dir / "config.json"
+        self.config_dir = Path(user_config_dir("cosma", ensure_exists=True))
+        self.config_file = self.config_dir / "tui.json"
         self._config: Dict[str, Any] = {}
         self._load_config()
     

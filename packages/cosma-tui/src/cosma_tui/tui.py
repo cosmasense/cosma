@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EZF TUI - A fuzzy finder interface using Textual
+Cosma TUI - A file search interface using Textual
 """
 
 import json
@@ -18,6 +18,7 @@ from textual.worker import Worker, WorkerState
 from .client import Client
 from .models import Update
 from .config import get_config
+from .onboarding import ThemeSelectionScreen, get_available_themes
 
 
 class SearchListView(ListView):
@@ -73,8 +74,8 @@ class SearchListView(ListView):
             return None
 
 
-class EZFApp(App):
-    """EZF Fuzzy Finder Application"""
+class CosmaApp(App):
+    """Cosma Search Application"""
 
     CSS = """
     Screen {
@@ -113,6 +114,59 @@ class EZFApp(App):
     ListItem {
         padding: 0 1;
     }
+
+    /* Onboarding styles */
+    #onboarding-container {
+        width: 60;
+        height: 22;
+        padding: 2;
+        border: solid $primary;
+        background: $surface;
+    }
+
+    #welcome-title {
+        text-align: center;
+        text-style: bold;
+        color: $primary;
+        margin: 0 0 1 0;
+        height: 1;
+    }
+
+    #welcome-subtitle {
+        text-align: center;
+        margin: 0 0 1 0;
+        height: 2;
+    }
+
+    #theme-list {
+        height: 1fr;
+        border: solid $primary;
+        overflow-y: scroll;
+        margin-bottom: 1;
+    }
+
+    #button-container {
+        align: center middle;
+        height: 3;
+    }
+
+    Button {
+        margin: 0 1;
+    }
+
+    ListItem:hover {
+        background: $primary-lighten-1;
+    }
+
+    ListView:focus ListItem.--highlight {
+        background: $primary;
+    }
+
+    /* Ensure proper scrolling */
+    ListView {
+        scrollbar-background: $surface;
+        scrollbar-color: $primary;
+    }
     """
 
     BINDINGS = [
@@ -122,7 +176,7 @@ class EZFApp(App):
         Binding("down", "cursor_down", "Down"),
     ]
 
-    def __init__(self, directory: str = "./test2", base_url: str = "http://127.0.0.1:60534"):
+    def __init__(self, directory: str = "./test2", base_url: str = "http://127.0.0.1:60534", show_onboarding: bool = False):
         super().__init__()
         self.directory = str(Path(directory).resolve())
         self.base_url = base_url
@@ -134,6 +188,7 @@ class EZFApp(App):
         self.is_searching: bool = False
         self.pending_query: Optional[str] = None
         self.last_search_time: float = 0.0
+        self.show_onboarding = show_onboarding
         
         # Load and apply theme from config
         config = get_config()
@@ -152,7 +207,27 @@ class EZFApp(App):
 
     def on_mount(self) -> None:
         """Initialize the app when mounted"""
+        # Show onboarding screen if this is first run
+        if self.show_onboarding:
+            config = get_config()
+            if config.is_first_run():
+                themes = get_available_themes()
+                self.push_screen(ThemeSelectionScreen(themes), self._on_theme_selected)
+                return
+        
         # Focus the input initially
+        self.query_one("#search", Input).focus()
+        
+        # Start indexing in the background
+        self.update_status(f"Indexing {self.directory}...")
+        self.run_worker(self.index_directory(), exclusive=True, group="indexing")
+        
+        # Initialize the app (focus, indexing, SSE)
+        self._initialize_app()
+
+    def _initialize_app(self) -> None:
+        """Initialize the app with focus, indexing, and SSE updates"""
+        # Focus the search input
         self.query_one("#search", Input).focus()
         
         # Start indexing in the background
@@ -161,6 +236,17 @@ class EZFApp(App):
         
         # Start SSE listener as a worker
         self.run_worker(self.listen_to_updates(), exclusive=False, group="sse")
+
+    def _on_theme_selected(self, theme: str) -> None:
+        """Handle theme selection from onboarding screen"""
+        if theme:
+            # Apply the selected theme to the current app instance
+            self.theme = theme
+            # Log the theme selection for debugging
+            self.log(f"Applied theme: {theme}")
+        
+        # Continue with the normal initialization that was skipped in on_mount
+        self._initialize_app()
 
     async def listen_to_updates(self) -> None:
         """Listen to server-sent events and update status bar"""
@@ -368,9 +454,9 @@ class EZFApp(App):
         await self.client.close()
 
 
-def run_tui(directory: str = ".", base_url: str = "http://127.0.0.1:60534") -> Optional[str]:
+def run_tui(directory: str = ".", base_url: str = "http://127.0.0.1:60534", show_onboarding: bool = False) -> Optional[str]:
     """Run the TUI and return the selected item"""
-    app = EZFApp(directory=directory, base_url=base_url)
+    app = CosmaApp(directory=directory, base_url=base_url, show_onboarding=show_onboarding)
     
     # Apply theme from config
     config = get_config()
