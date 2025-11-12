@@ -1,6 +1,6 @@
 [project]
 name = "cosma"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.12"
 description="Search engine for your files!"
 readme = "README.md"
@@ -9,6 +9,12 @@ dependencies = [
     "cosma-backend",
     "cosma-tui",
 ]
+license = "MIT"
+
+[project.urls]
+Homepage = "https://github.com/cosmasense/cosma"
+Repository = "https://github.com/cosmasense/cosma"
+Issues = "https://github.com/cosmasense/cosma/issues"
 
 [project.scripts]
 cosma = "cosma:cli"
