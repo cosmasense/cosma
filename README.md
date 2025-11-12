@@ -1,6 +1,7 @@
 # Cosma
 
 [![Version](https://img.shields.io/pypi/v/cosma)](https://pypi.org/project/cosma/)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/Zs6vUt4t5e)
 
 <img align="right" src="./assets/logo.svg" height="150px" alt="Cosma Logo">
 
@@ -76,5 +77,6 @@ give us a star!
 ## Contributing
 
 Cosma is open source, and we'd love to have you contribute!
-Please feel free to open an issue or pull request with code changes.
+Please feel free to open an issue or pull request with code changes,
+or join our [Discord](https://discord.gg/Zs6vUt4t5e).
 We'll have documentation for how best to contribute soon!
