@@ -15,7 +15,7 @@ Search engine for your files!
 
 Choose which directories to index, and Cosma will process all files
 in those directories into a search-optimized index. It'll also
-watch for for changes to keep the index updated.
+watch for changes to keep the index updated.
 
 After files are indexed, you can search for them with natural language!
 Cosma uses vector-powered search to find files quickly and easily.
@@ -33,7 +33,7 @@ Cosma can be downloaded from PyPI.
 We highly recommend you do this with [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```sh
-uv tool install comsa
+uv tool install cosma
 ```
 
 ### Upgrading
