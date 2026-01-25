@@ -551,7 +551,7 @@ class Database:
             
             return watched_dir
 
-    async def keyword_search(self, query: str, limit: int = 20, directory: str | None = None) -> list[tuple[File, float]]:
+    async def keyword_search(self, query: str, limit: int = 20, directory: str | None = None, allow_operators: bool = False) -> list[tuple[File, float]]:
         """
         Perform keyword search using FTS5 with BM25 ranking.
 
@@ -559,12 +559,18 @@ class Database:
             query: Search query
             limit: Maximum number of results
             directory: Optional directory path to limit search scope
+            allow_operators: If True, preserve AND/OR/NOT operators
 
         Returns:
             List of tuples (File, relevance_score)
         """
-        
-        sanitized_query = f'"{query.replace('"', '""')}"'
+        # Import here to avoid circular import
+        from cosma_backend.searcher.fts5_query import parse_fts5_query
+
+        sanitized_query = parse_fts5_query(query, allow_operators=allow_operators)
+        if not sanitized_query:
+            return []
+
         logger.debug(sm("Performing keyword search", query=sanitized_query, limit=limit, directory=directory))
 
         # FTS5 query with BM25 ranking
@@ -610,6 +616,67 @@ class Database:
 
             logger.info(sm("Keyword search completed", count=len(results)))
             return results
+
+    async def get_fts5_suggestions(self, prefix: str, limit: int = 10) -> list[str]:
+        """
+        Get autocomplete suggestions using FTS5 prefix matching.
+
+        Args:
+            prefix: Search prefix
+            limit: Maximum number of suggestions
+
+        Returns:
+            List of suggested terms (filenames and titles matching the prefix)
+        """
+        # Import here to avoid circular import
+        from cosma_backend.searcher.fts5_query import build_prefix_query
+
+        fts5_query = build_prefix_query(prefix)
+        if not fts5_query:
+            return []
+
+        logger.debug(sm("Getting FTS5 suggestions", prefix=prefix, fts5_query=fts5_query))
+
+        SQL = """
+        SELECT DISTINCT f.filename, f.title
+        FROM files_fts fts
+        JOIN files f ON f.id = fts.rowid
+        WHERE files_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+        """
+
+        async with self.acquire() as conn:
+            try:
+                rows = await conn.fetchall(SQL, (fts5_query, limit * 2))
+            except Exception as e:
+                logger.warning(sm("FTS5 suggestions query failed", error=str(e), prefix=prefix))
+                return []
+
+            suggestions = []
+            prefix_lower = prefix.lower()
+
+            for row in rows:
+                # Add filename if it matches prefix
+                filename = row["filename"]
+                if filename and filename.lower().startswith(prefix_lower):
+                    suggestions.append(filename)
+
+                # Add title words that match prefix
+                title = row["title"]
+                if title:
+                    for word in title.split():
+                        if word.lower().startswith(prefix_lower) and len(word) > 2:
+                            suggestions.append(word)
+
+                if len(suggestions) >= limit:
+                    break
+
+            # Deduplicate and limit
+            unique_suggestions = list(dict.fromkeys(suggestions))[:limit]
+
+            logger.debug(sm("Generated FTS5 suggestions", count=len(unique_suggestions)))
+            return unique_suggestions
 
     async def update_file_timestamp(self, file_path: str) -> bool:
         """

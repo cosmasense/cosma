@@ -169,24 +169,15 @@ class TestDatabaseOperations:
 
     async def test_keyword_search(self, temp_db: Database, sample_file_data):
         """Test keyword search functionality."""
-        # Insert file with specific content - FTS indexes title, summary, and keywords
+        # Insert file with searchable content
+        # FTS indexes: file_path, title, summary, keywords (via triggers)
         file_obj = File(**sample_file_data)
-        file_obj.title = "Artificial Intelligence Research"
-        file_obj.summary = "This is a document about artificial intelligence and machine learning"
+        file_obj.title = "Artificial Intelligence and Machine Learning Guide"
+        file_obj.summary = "A document about artificial intelligence and machine learning concepts"
         file_obj.keywords = ["AI", "ML", "technology", "research"]
         await temp_db.upsert_file(file_obj)
 
-        # Manually insert into FTS table since the trigger relies on file_keywords table
-        # and the FTS table only indexes: file_path, title, summary, keywords
-        async with temp_db.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO files_fts (rowid, file_path, title, summary, keywords)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (file_obj.id, file_obj.file_path, file_obj.title,
-                 file_obj.summary or "", " ".join(file_obj.keywords or []))
-            )
-
-        # Search for "artificial intelligence" - this should match title and summary
+        # Search for terms in title/summary (FTS triggers auto-populate)
         results = await temp_db.keyword_search("artificial intelligence", limit=10)
 
         # Should find our file
@@ -195,7 +186,7 @@ class TestDatabaseOperations:
         found_file, relevance_score = results[0]
         assert isinstance(found_file, File)
         assert isinstance(relevance_score, (int, float))
-        assert "artificial" in found_file.title.lower() or "intelligence" in found_file.summary.lower()
+        assert found_file.id == file_obj.id
 
     async def test_add_watched_directory(self, temp_db: Database):
         """Test adding a watched directory."""

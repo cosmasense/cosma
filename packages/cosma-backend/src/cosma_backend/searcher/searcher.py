@@ -17,6 +17,7 @@ from cosma_backend.db.database import Database
 from cosma_backend.embedder.embedder import AutoEmbedder
 from cosma_backend.logging import sm
 from cosma_backend.models import File
+from cosma_backend.searcher.rrf import merge_with_rrf
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -30,29 +31,15 @@ class SearchError(Exception):
 class SearchResult:
     """
     Represents a search result with metadata and scoring.
+
+    Scores are computed using Reciprocal Rank Fusion (RRF) which combines
+    rankings from multiple search methods without requiring score normalization.
     """
     file_metadata: File
-    semantic_score: float | None = None  # Distance from semantic search (lower is better)
-    keyword_score: float | None = None   # Keyword match score (higher is better)
-    combined_score: float = 0.0             # Combined weighted score
+    combined_score: float = 0.0             # RRF score (set by searcher)
     match_type: str = "unknown"             # Type of match: semantic, keyword, hybrid
-
-    def __post_init__(self):
-        """Calculate combined score after initialization."""
-        if self.semantic_score is not None and self.keyword_score is not None:
-            self.match_type = "hybrid"
-            # Normalize semantic score (convert distance to similarity)
-            semantic_similarity = max(0, 1 - self.semantic_score)
-            # Combine with weights (adjust as needed)
-            self.combined_score = (0.7 * semantic_similarity) + (0.3 * self.keyword_score)
-        elif self.semantic_score is not None:
-            self.match_type = "semantic"
-            self.combined_score = max(0, 1 - self.semantic_score)
-        elif self.keyword_score is not None:
-            self.match_type = "keyword"
-            self.combined_score = self.keyword_score
-        else:
-            self.combined_score = 0.0
+    semantic_rank: int | None = None        # Rank in semantic results (for debugging)
+    keyword_rank: int | None = None         # Rank in keyword results (for debugging)
     
     def to_json(self) -> dict:
         """
@@ -64,10 +51,10 @@ class SearchResult:
         return {
             "file_path": str(self.file_metadata.path),
             "filename": str(self.file_metadata.filename),
-            "semantic_score": self.semantic_score,
-            "keyword_score": self.keyword_score,
             "combined_score": self.combined_score,
-            "match_type": self.match_type
+            "match_type": self.match_type,
+            "semantic_rank": self.semantic_rank,
+            "keyword_rank": self.keyword_rank,
         }
 
 
@@ -88,136 +75,92 @@ class HybridSearcher:
         self.embedder = embedder or AutoEmbedder()
         logger.info(sm("HybridSearcher initialized"))
 
-    async def search(self,
-                    query: str,
-                    limit: int = 20,
-                    semantic_weight: float = 0.7,
-                    keyword_weight: float = 0.3,
-                    semantic_threshold: float = 2.0,
-                    include_metadata: bool = True,
-                    directory: str | None = None) -> list[SearchResult]:
+    async def search(
+        self,
+        query: str,
+        limit: int = 20,
+        semantic_weight: float = 0.7,  # Deprecated, kept for backward compatibility
+        keyword_weight: float = 0.3,   # Deprecated, kept for backward compatibility
+        semantic_threshold: float = 2.0,
+        include_metadata: bool = True,
+        directory: str | None = None,
+        rrf_k: int = 60,
+    ) -> list[SearchResult]:
         """
-        Perform hybrid search combining semantic and keyword matching.
+        Perform hybrid search combining semantic and keyword matching using RRF.
+
+        Uses Reciprocal Rank Fusion (RRF) to combine results from semantic and
+        keyword search. RRF is rank-based and doesn't require score normalization.
 
         Args:
             query: Search query
             limit: Maximum number of results
-            semantic_weight: Weight for semantic similarity (0-1)
-            keyword_weight: Weight for keyword matching (0-1)
+            semantic_weight: Deprecated, ignored (kept for backward compatibility)
+            keyword_weight: Deprecated, ignored (kept for backward compatibility)
             semantic_threshold: Maximum distance for semantic matches
             include_metadata: Include file metadata in results
             directory: Optional directory path to limit search scope
+            rrf_k: RRF smoothing constant (default 60)
 
         Returns:
-            List of SearchResult objects sorted by combined score
+            List of SearchResult objects sorted by RRF score
         """
-        logger.info(sm("Performing hybrid search",
+        logger.info(sm("Performing hybrid search with RRF",
                        query=query,
                        limit=limit,
-                       semantic_weight=semantic_weight,
-                       keyword_weight=keyword_weight,
+                       rrf_k=rrf_k,
                        directory=directory))
 
-        # Normalize weights
-        total_weight = semantic_weight + keyword_weight
-        if total_weight > 0:
-            semantic_weight /= total_weight
-            keyword_weight /= total_weight
+        # Fetch more results than needed - RRF benefits from larger candidate pools
+        fetch_limit = limit * 3
 
         # Collect results from both search methods
-        semantic_results = {}
-        keyword_results = {}
+        semantic_list: list[tuple[int, File, float]] = []
+        keyword_list: list[tuple[int, File, float]] = []
 
         # 1. Semantic search
         try:
-            semantic_matches = await self._semantic_search(query, limit * 2, semantic_threshold, directory)
+            semantic_matches = await self._semantic_search(query, fetch_limit, semantic_threshold, directory)
             for file_metadata, distance in semantic_matches:
                 file_id = file_metadata.id if hasattr(file_metadata, "id") else hash(file_metadata.file_path)
-                semantic_results[file_id] = (file_metadata, distance)
+                semantic_list.append((file_id, file_metadata, distance))
 
-            logger.debug(sm("Semantic search completed", results=len(semantic_results)))
+            logger.debug(sm("Semantic search completed", results=len(semantic_list)))
         except Exception as e:
             logger.warning(sm("Semantic search failed", error=str(e)))
 
         # 2. Keyword search
         try:
-            keyword_matches = await self._keyword_search(query, limit * 2, directory)
+            keyword_matches = await self._keyword_search(query, fetch_limit, directory)
             for file_metadata, score in keyword_matches:
                 file_id = file_metadata.id if hasattr(file_metadata, "id") else hash(file_metadata.file_path)
-                keyword_results[file_id] = (file_metadata, score)
+                keyword_list.append((file_id, file_metadata, score))
 
-            logger.debug(sm("Keyword search completed", results=len(keyword_results)))
+            logger.debug(sm("Keyword search completed", results=len(keyword_list)))
         except Exception as e:
             logger.warning(sm("Keyword search failed", error=str(e)))
 
-        # 3. Combine results
-        combined_results = []
-        all_file_ids = set(semantic_results.keys()) | set(keyword_results.keys())
+        # 3. Merge using RRF
+        merged = merge_with_rrf(semantic_list, keyword_list, k=rrf_k)
 
-        for file_id in all_file_ids:
-            semantic_data = semantic_results.get(file_id)
-            keyword_data = keyword_results.get(file_id)
-
-            # Get file metadata (prefer from semantic search for completeness)
-            if semantic_data:
-                file_metadata = semantic_data[0]
-                semantic_score = semantic_data[1]
-            else:
-                file_metadata = keyword_data[0]
-                semantic_score = None
-
-            keyword_score = keyword_data[1] if keyword_data else None
-
-            # Create search result
+        # 4. Build SearchResult objects
+        results = []
+        for file_id, file_metadata, rrf_score, match_type, sem_rank, kw_rank in merged[:limit]:
             result = SearchResult(
                 file_metadata=file_metadata,
-                semantic_score=semantic_score,
-                keyword_score=keyword_score
+                combined_score=rrf_score,
+                match_type=match_type,
+                semantic_rank=sem_rank,
+                keyword_rank=kw_rank,
             )
-
-            # Apply improved additive scoring algorithm
-            semantic_component = 0.0
-            keyword_component = 0.0
-            
-            # Semantic component: Convert distance to similarity and normalize
-            if result.semantic_score is not None:
-                # Convert distance (lower=better) to similarity (higher=better)
-                # Use exponential decay to emphasize closer matches
-                import math
-                semantic_similarity = math.exp(-result.semantic_score)  # Range: 0-1, closer=higher
-                semantic_component = semantic_similarity * 0.5  # Scale to 0-0.5 range
-                
-            # Keyword component: Direct score
-            if result.keyword_score is not None:
-                keyword_component = result.keyword_score * 0.5  # Scale to 0-0.5 range
-                
-            # Combined score: Sum of components (not weighted average)
-            result.combined_score = semantic_component + keyword_component
-            
-            # Determine match type based on components
-            if semantic_component > 0 and keyword_component > 0:
-                result.match_type = "hybrid"
-            elif keyword_component > 0:
-                result.match_type = "keyword"  
-            elif semantic_component > 0:
-                result.match_type = "semantic"
-            else:
-                result.match_type = "none"
-
-            combined_results.append(result)
-
-        # Sort by combined score (descending)
-        combined_results.sort(key=lambda x: x.combined_score, reverse=True)
-
-        # Limit results
-        final_results = combined_results[:limit]
+            results.append(result)
 
         logger.info(sm("Hybrid search completed",
-                       total_results=len(final_results),
-                       semantic_matches=len(semantic_results),
-                       keyword_matches=len(keyword_results)))
+                       total_results=len(results),
+                       semantic_matches=len(semantic_list),
+                       keyword_matches=len(keyword_list)))
 
-        return final_results
+        return results
 
     async def _semantic_search(self, query: str, limit: int, threshold: float, directory: str | None = None) -> list[tuple]:
         """Perform semantic search using embeddings."""
@@ -290,12 +233,14 @@ class HybridSearcher:
 
             # Convert to SearchResult objects, excluding the original file
             search_results = []
-            for file_metadata, distance in results:
+            for rank, (file_metadata, distance) in enumerate(results):
                 if hasattr(file_metadata, "id") and file_metadata.id != file_id:
+                    # For similar-to-file search, use simple rank-based scoring
                     result = SearchResult(
                         file_metadata=file_metadata,
-                        semantic_score=distance,
-                        match_type="semantic"
+                        combined_score=1.0 / (60 + rank),  # RRF-style score
+                        match_type="semantic",
+                        semantic_rank=rank,
                     )
                     search_results.append(result)
 
@@ -317,10 +262,10 @@ class HybridSearcher:
 
     async def get_search_suggestions(self, query: str, limit: int = 5) -> list[str]:
         """
-        Get search suggestions based on existing keywords and file titles.
+        Get search suggestions using FTS5 prefix matching.
 
         Args:
-            query: Partial query
+            query: Partial query (prefix)
             limit: Maximum number of suggestions
 
         Returns:
@@ -328,38 +273,18 @@ class HybridSearcher:
         """
         logger.debug(sm("Getting search suggestions", query=query))
 
+        if not query or not query.strip():
+            return []
+
         try:
-            # Get all files to extract keywords and titles
-            files = await self.db.get_files(limit=1000)  # Reasonable limit
-
-            suggestions = set()
-            query_lower = query.lower()
-
-            for file_metadata in files:
-                # Add matching keywords
-                if file_metadata.keywords:
-                    for keyword in file_metadata.keywords:
-                        if keyword.lower().startswith(query_lower):
-                            suggestions.add(keyword)
-
-                # Add matching title words
-                if file_metadata.title:
-                    for word in file_metadata.title.split():
-                        if word.lower().startswith(query_lower) and len(word) > 2:
-                            suggestions.add(word)
-
-                # Stop if we have enough suggestions
-                if len(suggestions) >= limit * 2:
-                    break
-
-            # Sort suggestions by relevance (simple alphabetical for now)
-            sorted_suggestions = sorted(suggestions)[:limit]
+            # Use FTS5 prefix search for efficient autocomplete
+            suggestions = await self.db.get_fts5_suggestions(query.strip(), limit)
 
             logger.debug(sm("Generated search suggestions",
                             query=query,
-                            suggestions=len(sorted_suggestions)))
+                            suggestions=len(suggestions)))
 
-            return sorted_suggestions
+            return suggestions
 
         except Exception as e:
             logger.exception(sm("Failed to get search suggestions",
