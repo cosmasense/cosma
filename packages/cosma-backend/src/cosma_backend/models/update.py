@@ -25,6 +25,10 @@ class UpdateOpcode(enum.Enum):
     FILE_MODIFIED = "file_modified"
     FILE_DELETED = "file_deleted"
     FILE_MOVED = "file_moved"
+
+    # Directory system events (from watcher)
+    DIRECTORY_DELETED = "directory_deleted"
+    DIRECTORY_MOVED = "directory_moved"
     
     # Watch directory updates
     WATCH_ADDED = "watch_added"
@@ -138,7 +142,17 @@ class Update:
     def file_moved(cls, src_path: str, dest_path: str, **kwargs) -> Self:
         """Convenience method for creating a FILE_MOVED update."""
         return cls.create(UpdateOpcode.FILE_MOVED, src_path=src_path, dest_path=dest_path, **kwargs)
-    
+
+    @classmethod
+    def directory_deleted(cls, path: str, **kwargs) -> Self:
+        """Convenience method for creating a DIRECTORY_DELETED update."""
+        return cls.create(UpdateOpcode.DIRECTORY_DELETED, path=path, **kwargs)
+
+    @classmethod
+    def directory_moved(cls, src_path: str, dest_path: str, **kwargs) -> Self:
+        """Convenience method for creating a DIRECTORY_MOVED update."""
+        return cls.create(UpdateOpcode.DIRECTORY_MOVED, src_path=src_path, dest_path=dest_path, **kwargs)
+
     @classmethod
     def directory_processing_started(cls, path: str, **kwargs) -> Self:
         """Convenience method for creating a DIRECTORY_PROCESSING_STARTED update."""

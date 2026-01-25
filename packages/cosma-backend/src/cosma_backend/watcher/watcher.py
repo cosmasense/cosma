@@ -81,15 +81,41 @@ class WatcherJob:
     async def consumer_task(self):
         while not self.closed:
             event = await self.queue.get()
-            
-            # Skip directory events - we only care about files
-            if isinstance(event, (DirCreatedEvent, DirModifiedEvent, DirDeletedEvent, DirMovedEvent)):
+
+            # Skip directory created and modified events - we only care about deletion/movement
+            if isinstance(event, (DirCreatedEvent, DirModifiedEvent)):
                 logger.debug(sm("Skipping directory event", event_type=type(event).__name__, path=event.src_path))
                 continue
-            
+
             try:
+                # Handle directory deletion
+                if isinstance(event, DirDeletedEvent):
+                    logger.info(sm("Directory deleted", path=event.src_path))
+                    path = Path(str(event.src_path)).resolve()
+
+                    self._publish_update(Update.directory_deleted(str(path)))
+                    deleted_files = await self.db.delete_files_in_directory(str(path))
+                    logger.info(sm("Deleted files from deleted directory", directory=str(path), count=len(deleted_files)))
+
+                # Handle directory movement
+                elif isinstance(event, DirMovedEvent):
+                    logger.info(sm("Directory moved", src=event.src_path, dest=event.dest_path))
+                    src_path = Path(str(event.src_path)).resolve()
+                    dest_path = Path(str(event.dest_path)).resolve()
+
+                    self._publish_update(Update.directory_moved(str(src_path), str(dest_path)))
+
+                    # Delete all files at the old location
+                    deleted_files = await self.db.delete_files_in_directory(str(src_path))
+                    logger.info(sm("Deleted files from moved directory", old_directory=str(src_path), count=len(deleted_files)))
+
+                    # Process the new directory location if it exists
+                    if dest_path.exists() and dest_path.is_dir():
+                        logger.info(sm("Processing files in new directory location", directory=str(dest_path)))
+                        await self.pipeline.process_directory(dest_path)
+
                 # Handle different event types
-                if isinstance(event, FileDeletedEvent):
+                elif isinstance(event, FileDeletedEvent):
                     logger.info(sm("File deleted", path=event.src_path))
                     path = Path(str(event.src_path)).resolve()
                     
