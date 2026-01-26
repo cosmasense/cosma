@@ -109,7 +109,7 @@ class FilterConfig:
     when switching modes. When mode changes, patterns switch to the
     appropriate list without semantic confusion.
     """
-    mode: FilterMode = FilterMode.BLACKLIST
+    mode: FilterMode = FilterMode.WHITELIST  # Default to whitelist for new users
 
     # Mode-specific pattern storage (NEW)
     blacklist_exclude: list[str] = field(default_factory=list)
@@ -535,7 +535,7 @@ class FilterConfig:
 
         config = cls(
             version=2,
-            mode=FilterMode.BLACKLIST,
+            mode=FilterMode.WHITELIST,  # Default to whitelist for new users
             blacklist_exclude=DEFAULT_EXCLUDE_PATTERNS.copy(),
             blacklist_include=DEFAULT_INCLUDE_PATTERNS.copy(),
             whitelist_include=default_whitelist_include,
@@ -588,12 +588,25 @@ class FilterConfig:
             if pattern not in merged_include:
                 merged_include.append(pattern)
 
-        merged = cls(
-            mode=global_config.mode,  # Mode always from global
-            exclude=merged_exclude,
-            include=merged_include,
-            config_path=folder_config_path,
-        )
+        # Create merged config with mode-specific fields set correctly
+        if global_config.mode == FilterMode.BLACKLIST:
+            merged = cls(
+                mode=global_config.mode,
+                blacklist_exclude=merged_exclude,
+                blacklist_include=merged_include,
+                whitelist_include=list(global_config.whitelist_include),
+                whitelist_exclude=list(global_config.whitelist_exclude),
+                config_path=folder_config_path,
+            )
+        else:  # WHITELIST
+            merged = cls(
+                mode=global_config.mode,
+                whitelist_exclude=merged_exclude,
+                whitelist_include=merged_include,
+                blacklist_exclude=list(global_config.blacklist_exclude),
+                blacklist_include=list(global_config.blacklist_include),
+                config_path=folder_config_path,
+            )
 
         logger.info(sm("Merged filter config for directory",
                       directory=str(directory),
