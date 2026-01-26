@@ -13,6 +13,7 @@ from .search import search_bp
 from .watch import watch_bp
 from .updates import updates_bp
 from .status import status_bp
+from .filters import filters_bp
 
 # Create the main API blueprint
 api_blueprint = Blueprint('api', __name__)
@@ -24,6 +25,7 @@ api_blueprint.register_blueprint(search_bp, url_prefix='/search')
 api_blueprint.register_blueprint(watch_bp, url_prefix='/watch')
 api_blueprint.register_blueprint(updates_bp, url_prefix='/updates')
 api_blueprint.register_blueprint(status_bp, url_prefix='/status')
+api_blueprint.register_blueprint(filters_bp, url_prefix='/filters')
 
 
 __all__ = ['api_blueprint']

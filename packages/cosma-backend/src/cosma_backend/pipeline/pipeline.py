@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 import logging
 
 from cosma_backend.db import Database
@@ -15,6 +15,9 @@ from cosma_backend.parser import FileParser
 from cosma_backend.summarizer import AutoSummarizer
 from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.utils.pubsub import Hub
+
+if TYPE_CHECKING:
+    from cosma_backend.filter import FilterConfig
 
 logger = logging.getLogger(__name__)
 
@@ -53,28 +56,34 @@ class Pipeline:
         self.summarizer = summarizer or AutoSummarizer()
         self.embedder = embedder or AutoEmbedder()
     
-    async def process_directory(self, path: str | Path):
+    async def process_directory(
+        self,
+        path: str | Path,
+        filter_config: Optional["FilterConfig"] = None
+    ):
         """
         Process all files in a directory through the full pipeline.
         After processing, deletes any files from the database that weren't seen
         (i.e., files that no longer exist in the filesystem).
-        
+
         Args:
             path: Root directory to process
-            
+            filter_config: Optional filter config to exclude files
+
         Returns:
             PipelineResult with statistics
         """
         # result = PipelineResult()
-        
+
         # Publish directory processing started
         self._publish_update(Update.directory_processing_started(str(path)))
-        
+
         started_processing = datetime.now(timezone.utc)
-        
-        # Stage 1: Discovery
-        logger.info(f"Discovering files in {path}")
-        for file in self.discoverer.files_in(path):
+
+        # Stage 1: Discovery (with filtering)
+        logger.info(sm("Discovering files", path=str(path),
+                      has_filter=filter_config is not None))
+        for file in self.discoverer.files_in(path, filter_config=filter_config):
             # result.discovered += 1
             
             try:
