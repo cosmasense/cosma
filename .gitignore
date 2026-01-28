@@ -1,6 +1,7 @@
 # Project
 *.db*
 .env
+*.local*
 
 # Python-generated files
 __pycache__/
