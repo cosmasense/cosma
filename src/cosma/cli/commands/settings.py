@@ -12,12 +12,10 @@ from .. import output_options, handle_client_errors, OutputFormatter, OutputMode
 SETTINGS_EPILOG = """
 \b
 Settings are persisted to a TOML file in your config directory and
-take effect immediately. Environment variables (COSMA_<KEY>) still
-override file values on server startup.
+take effect immediately.
 \b
-Keys can be specified as either:
-  - Flat config keys:  EMBEDDING_PROVIDER, AI_PROVIDER
-  - TOML paths:        embedder.provider, summarizer.provider
+Keys use dotted TOML paths:
+  embedder.provider, summarizer.provider, parser.spotlight_enabled
 \b
 Sections:
   embedder     Embedding model and provider configuration
@@ -25,22 +23,22 @@ Sections:
   parser       File extraction strategy, Spotlight, and Whisper
 \b
 Common keys:
-  AI_PROVIDER / summarizer.provider
+  summarizer.provider
       LLM provider: auto, ollama, online, llamacpp
-  EMBEDDING_PROVIDER / embedder.provider
+  embedder.provider
       Embedding provider: local, online
-  OLLAMA_MODEL / summarizer.ollama.model
+  summarizer.ollama.model
       Ollama model name for summarization
-  EMBEDDING_MODEL / embedder.model
+  embedder.model
       Online embedding model name
-  EXTRACTION_STRATEGY / parser.extraction_strategy
+  parser.extraction_strategy
       File parsing strategy: spotlight_first, auto
 \b
 Examples:
   cosma settings show
   cosma settings show -s embedder
-  cosma settings get AI_PROVIDER
-  cosma settings set AI_PROVIDER ollama
+  cosma settings get summarizer.provider
+  cosma settings set summarizer.provider ollama
   cosma settings set summarizer.ollama.model llama3
   cosma settings set parser.spotlight_enabled false
   cosma settings defaults
@@ -112,9 +110,8 @@ def _print_nested(formatter: OutputFormatter, data: dict, indent: int = 0):
 
 @settings_group.command("get", epilog="""\b
 Examples:
-  cosma settings get AI_PROVIDER
   cosma settings get summarizer.provider
-  cosma settings get EMBEDDING_DIMENSIONS
+  cosma settings get embedder.dimensions
   cosma settings get embedder.model --json
 """)
 @click.argument("key")
@@ -124,33 +121,34 @@ def settings_get(key: str, formatter: OutputFormatter):
     """Get the value of a specific setting.
 
     \b
-    KEY can be a flat config key or a TOML path:
-      cosma settings get AI_PROVIDER
+    KEY is a dotted TOML path:
       cosma settings get summarizer.provider
+      cosma settings get embedder.dimensions
     """
     client = SyncClient()
     with formatter.status("Fetching settings..."):
         result = client.get_settings()
 
     flat = _flatten(result)
+    value = flat.get(key)
 
-    # Try as TOML path first (e.g. parser.spotlight_enabled)
-    if key in flat:
-        found_key, value = key, flat[key]
-    # Try uppercased as TOML path
-    elif key.lower() in {k.lower(): k for k in flat}:
-        normalized = {k.lower(): k for k in flat}
-        real_key = normalized[key.lower()]
-        found_key, value = real_key, flat[real_key]
-    else:
+    # Try case-insensitive match
+    if value is None:
+        lower_map = {k.lower(): k for k in flat}
+        real_key = lower_map.get(key.lower())
+        if real_key:
+            key = real_key
+            value = flat[real_key]
+
+    if value is None:
         formatter.error(f"Unknown setting: {key}")
         formatter.hint("Use 'cosma settings show' to see all available settings")
         return
 
     if formatter.mode == OutputMode.JSON:
-        formatter.output_json({found_key: value})
+        formatter.output_json({key: value})
     else:
-        formatter.print(f"[bold]{found_key}[/bold] = {value}")
+        formatter.print(f"[bold]{key}[/bold] = {value}")
 
 
 def _flatten(data: dict, prefix: str = "") -> dict:
@@ -167,11 +165,10 @@ def _flatten(data: dict, prefix: str = "") -> dict:
 
 @settings_group.command("set", epilog="""\b
 Examples:
-  cosma settings set AI_PROVIDER ollama
+  cosma settings set summarizer.provider ollama
   cosma settings set summarizer.ollama.model llama3
-  cosma settings set EMBEDDING_DIMENSIONS 1024
+  cosma settings set embedder.dimensions 1024
   cosma settings set parser.spotlight_enabled false
-  cosma settings set WHISPER_PROVIDER local
 """)
 @click.argument("key")
 @click.argument("value")
@@ -181,9 +178,9 @@ def settings_set(key: str, value: str, formatter: OutputFormatter):
     """Set a configuration value.
 
     \b
-    KEY can be a flat config key or a TOML path:
-      cosma settings set AI_PROVIDER ollama
+    KEY is a dotted TOML path:
       cosma settings set summarizer.provider ollama
+      cosma settings set embedder.dimensions 1024
 
     Values are automatically coerced to the correct type
     (int, bool, string) based on the setting's schema.

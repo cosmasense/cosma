@@ -59,13 +59,9 @@ class App(Quart):
         self.config.setdefault("PORT", 60534)
         self.config.setdefault("DATABASE_PATH", Path(self.dirs.user_data_dir) / "app.db")
 
-        # Load persistent settings from TOML (with env var overlay)
+        # Load persistent settings from TOML
         self.settings_manager = SettingsManager(self.dirs)
-        settings = self.settings_manager.load()
-
-        # Apply all managed settings to app.config
-        for key, value in settings.items():
-            self.config[key] = value
+        self.settings_manager.load()
 
         logger.debug("Config loaded")
         
@@ -102,10 +98,11 @@ async def initialize_services():
                   config_path=str(global_config.config_path))
 
     logger.info("Initializing services")
+    settings = app.settings_manager.settings
     discoverer = Discoverer()
-    parser = FileParser(config=app.config)
-    summarizer = AutoSummarizer(config=app.config)
-    embedder = AutoEmbedder(config=app.config)
+    parser = FileParser(config=settings.parser)
+    summarizer = AutoSummarizer(config=settings.summarizer)
+    embedder = AutoEmbedder(config=settings.embedder)
 
     app.pipeline = Pipeline(
         db=app.db,

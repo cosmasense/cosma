@@ -11,12 +11,14 @@
 '''
 
 
+from __future__ import annotations
+
 import base64
 import json
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
 # Import AI libraries
 from cosma_backend.utils.decorators import async_wrap
@@ -27,6 +29,9 @@ import tiktoken
 from cosma_backend.models import ProcessingStatus
 from cosma_backend.models.file import File
 from cosma_backend.logging import get_logger
+
+if TYPE_CHECKING:
+    from cosma_backend.settings import SummarizerConfig
 
 # Configure standard logger
 logger = get_logger(__name__)
@@ -265,18 +270,19 @@ class BaseSummarizer(ABC):
     """Abstract base class for file summarizers."""
     
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None, max_tokens: Optional[int] = None, model: Optional[str] = None):
+    def __init__(self, config: SummarizerConfig | None = None, max_tokens: Optional[int] = None, model: Optional[str] = None):
         """
         Initialize summarizer with context length limit.
-        
+
         Args:
-            config: Application configuration dictionary
+            config: SummarizerConfig instance
             max_tokens: Maximum tokens for the model context
             model: Model name for accurate tokenization (optional)
         """
-        self.config = config or {}
-        self.max_tokens = max_tokens or self.config.get("MAX_TOKENS_PER_REQUEST", 100000)
-        self.chunk_overlap = self.config.get("CHUNK_OVERLAP_TOKENS", 1000)
+        from cosma_backend.settings import SummarizerConfig as _SummarizerConfig
+        self.config = config or _SummarizerConfig()
+        self.max_tokens = max_tokens or self.config.max_tokens_per_request
+        self.chunk_overlap = self.config.chunk_overlap_tokens
         self.model = model
     
     @abstractmethod
@@ -535,33 +541,34 @@ class BaseSummarizer(ABC):
 class OllamaSummarizer(BaseSummarizer):
     """Summarizer using local Ollama models."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None, host: Optional[str] = None, model: Optional[str] = None, max_tokens: Optional[int] = None):
+    def __init__(self, config: SummarizerConfig | None = None, host: Optional[str] = None, model: Optional[str] = None, max_tokens: Optional[int] = None):
         """
         Initialize Ollama summarizer.
-        
+
         Args:
-            config: Application configuration dictionary
-            host: Ollama host URL (default from config)
-            model: Model name (default from config)
-            max_tokens: Maximum context tokens (default from config)
+            config: SummarizerConfig instance
+            host: Ollama host URL override
+            model: Model name override
+            max_tokens: Maximum context tokens override
         """
-        self.config = config or {}
-        
+        from cosma_backend.settings import SummarizerConfig as _SummarizerConfig
+        self.config = config or _SummarizerConfig()
+
         # Get model name before initializing base class
-        model_name = model or self.config.get("OLLAMA_MODEL", "qwen3-vl:2b-instruct")
-        
+        model_name = model or self.config.ollama.model
+
         # Initialize base class with context length and model
-        context_length = max_tokens or self.config.get("OLLAMA_MODEL_CONTEXT_LENGTH", 10000)
-        super().__init__(config=config, max_tokens=context_length, model=model_name)
-        
+        context_length = max_tokens or self.config.ollama.context_length
+        super().__init__(config=self.config, max_tokens=context_length, model=model_name)
+
         try:
             import ollama
             self.ollama_available = True
         except ImportError:
             self.ollama_available = False
             raise ImportError("ollama package is not installed")
-        
-        self.host = host or self.config.get("OLLAMA_HOST", "http://localhost:11434")
+
+        self.host = host or self.config.ollama.host
         
         try:
             self.client = ollama.AsyncClient(host=self.host)
@@ -611,24 +618,25 @@ class OllamaSummarizer(BaseSummarizer):
 class OnlineSummarizer(BaseSummarizer):
     """Summarizer using online AI models via LiteLLM."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None, model: Optional[str] = None, api_key: Optional[str] = None, max_tokens: Optional[int] = None):
+    def __init__(self, config: SummarizerConfig | None = None, model: Optional[str] = None, api_key: Optional[str] = None, max_tokens: Optional[int] = None):
         """
         Initialize online summarizer.
-        
+
         Args:
-            config: Application configuration dictionary
-            model: Model name (default from config)
-            api_key: API key (default from config)
-            max_tokens: Maximum context tokens (default from config)
+            config: SummarizerConfig instance
+            model: Model name override
+            api_key: API key override
+            max_tokens: Maximum context tokens override
         """
-        self.config = config or {}
-        
+        from cosma_backend.settings import SummarizerConfig as _SummarizerConfig
+        self.config = config or _SummarizerConfig()
+
         # Get model name before initializing base class
-        model_name = model or self.config.get("ONLINE_MODEL", "openai/gpt-4.1-nano-2025-04-14")
-        
+        model_name = model or self.config.online.model
+
         # Initialize base class with context length and model
-        context_length = max_tokens or self.config.get("ONLINE_MODEL_CONTEXT_LENGTH", 128000)
-        super().__init__(config=config, max_tokens=context_length, model=model_name)
+        context_length = max_tokens or self.config.online.context_length
+        super().__init__(config=self.config, max_tokens=context_length, model=model_name)
         
         try:
             import litellm
@@ -684,38 +692,39 @@ class OnlineSummarizer(BaseSummarizer):
 class LlamaCppSummarizer(BaseSummarizer):
     """Summarizer using local llama.cpp models."""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None, model_path: Optional[str] = None, max_tokens: Optional[int] = None, n_ctx: Optional[int] = None):
+    def __init__(self, config: SummarizerConfig | None = None, model_path: Optional[str] = None, max_tokens: Optional[int] = None, n_ctx: Optional[int] = None):
         """
         Initialize llama.cpp summarizer.
-        
+
         Args:
-            config: Application configuration dictionary
-            model_path: Path to GGUF model file (default from config: LLAMACPP_MODEL_PATH)
-            max_tokens: Maximum context tokens (default from config: LLAMACPP_MODEL_CONTEXT_LENGTH)
-            n_ctx: Context window size for the model (default from config: LLAMACPP_N_CTX)
+            config: SummarizerConfig instance
+            model_path: Path to GGUF model file override
+            max_tokens: Maximum context tokens override
+            n_ctx: Context window size override
         """
-        self.config = config or {}
-        
+        from cosma_backend.settings import SummarizerConfig as _SummarizerConfig
+        self.config = config or _SummarizerConfig()
+
         # Get model path from config if not provided
-        self.model_path = model_path or self.config.get("LLAMACPP_MODEL_PATH")
-        self.repo_id = self.config.get("LLAMACPP_REPO_ID")
-        self.filename = self.config.get("LLAMACPP_FILENAME")
+        self.model_path = model_path or self.config.llamacpp.model_path
+        self.repo_id = self.config.llamacpp.repo_id
+        self.filename = self.config.llamacpp.filename
         if not (self.model_path or all((self.repo_id, self.filename))):
             raise ValueError("LLAMACPP_MODEL_PATH environment variable must be set or model_path must be provided")
-        
+
         # Initialize base class with context length
-        context_length = max_tokens or self.config.get("LLAMACPP_MODEL_CONTEXT_LENGTH", 8192)
-        super().__init__(config=config, max_tokens=context_length, model="llama.cpp")
-        
-        self.n_ctx = n_ctx or self.config.get("LLAMACPP_N_CTX", 8192)
-        
+        context_length = max_tokens or self.config.llamacpp.context_length
+        super().__init__(config=self.config, max_tokens=context_length, model="llama.cpp")
+
+        self.n_ctx = n_ctx or self.config.llamacpp.n_ctx
+
         try:
             from llama_cpp import Llama
             self.llamacpp_available = True
         except ImportError:
             self.llamacpp_available = False
             raise ImportError("llama-cpp-python package is not installed. Install with: pip install llama-cpp-python")
-                    
+
         try:
             # Initialize llama.cpp model
             if self.repo_id and self.filename:
@@ -723,27 +732,27 @@ class LlamaCppSummarizer(BaseSummarizer):
                     repo_id=self.repo_id,
                     filename=self.filename,
                     n_ctx=self.n_ctx,
-                    n_threads=self.config.get("LLAMACPP_N_THREADS", 4),
-                    n_gpu_layers=self.config.get("LLAMACPP_N_GPU_LAYERS", 0),  # 0 = CPU only, -1 = all layers on GPU
-                    verbose=self.config.get("LLAMACPP_VERBOSE", False),
+                    n_threads=self.config.llamacpp.n_threads,
+                    n_gpu_layers=self.config.llamacpp.n_gpu_layers,
+                    verbose=self.config.llamacpp.verbose,
                 )
-                logger.info("llama.cpp summarizer initialized", 
+                logger.info("llama.cpp summarizer initialized",
                             repo_id=self.repo_id,
                             filename=self.filename,
-                            n_ctx=self.n_ctx, 
+                            n_ctx=self.n_ctx,
                             max_tokens=self.max_tokens)
             else:
                 self.llm = Llama(
                     repo_id=self.repo_id,
                     model_path=self.model_path,
                     n_ctx=self.n_ctx,
-                    n_threads=self.config.get("LLAMACPP_N_THREADS", 4),
-                    n_gpu_layers=self.config.get("LLAMACPP_N_GPU_LAYERS", 0),  # 0 = CPU only, -1 = all layers on GPU
-                    verbose=self.config.get("LLAMACPP_VERBOSE", False),
+                    n_threads=self.config.llamacpp.n_threads,
+                    n_gpu_layers=self.config.llamacpp.n_gpu_layers,
+                    verbose=self.config.llamacpp.verbose,
                 )
-                logger.info("llama.cpp summarizer initialized", 
-                            model_path=self.model_path, 
-                            n_ctx=self.n_ctx, 
+                logger.info("llama.cpp summarizer initialized",
+                            model_path=self.model_path,
+                            n_ctx=self.n_ctx,
                             max_tokens=self.max_tokens)
         except Exception as e:
             logger.error("Failed to initialize llama.cpp model", model_path=self.model_path, error=str(e))
@@ -792,16 +801,17 @@ class AutoSummarizer:
     4. Online models (fallback)
     """
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None, preferred_provider: Optional[str] = None):
+    def __init__(self, config: SummarizerConfig | None = None, preferred_provider: Optional[str] = None):
         """
         Initialize auto summarizer.
-        
+
         Args:
-            config: Application configuration dictionary
+            config: SummarizerConfig instance
             preferred_provider: Preferred provider ('llamacpp', 'ollama', 'online', 'auto')
         """
-        self.config = config or {}
-        self.preferred_provider = preferred_provider or self.config.get("AI_PROVIDER", "auto")
+        from cosma_backend.settings import SummarizerConfig as _SummarizerConfig
+        self.config = config or _SummarizerConfig()
+        self.preferred_provider = preferred_provider or self.config.provider
         self.summarizers = {}
         
         logger.info("AutoSummarizer initialized", preferred_provider=self.preferred_provider)

@@ -32,23 +32,20 @@ class TestSettingsAPI:
             assert data["embedder"]["provider"] == "local"
 
     async def test_update_settings(self, test_client: App):
-        """PUT /api/settings should update settings."""
+        """PUT /api/settings should update settings using dotted paths."""
         async with test_client.test_client() as client:
             response = await client.put("/api/settings/", json={
-                "AI_PROVIDER": "ollama",
+                "summarizer.provider": "ollama",
             })
             assert response.status_code == 200
             data = await response.get_json()
             assert data["summarizer"]["provider"] == "ollama"
 
-            # Verify in-memory config was updated
-            assert test_client.config["AI_PROVIDER"] == "ollama"
-
     async def test_update_settings_invalid_key(self, test_client: App):
         """PUT /api/settings with unknown key should return 400."""
         async with test_client.test_client() as client:
             response = await client.put("/api/settings/", json={
-                "NONEXISTENT_KEY": "value",
+                "nonexistent.key": "value",
             })
             assert response.status_code == 400
             data = await response.get_json()
@@ -65,11 +62,11 @@ class TestSettingsAPI:
             assert response.status_code == 400
 
     async def test_update_multiple_settings(self, test_client: App):
-        """PUT /api/settings should handle multiple keys."""
+        """PUT /api/settings should handle multiple dotted-path keys."""
         async with test_client.test_client() as client:
             response = await client.put("/api/settings/", json={
-                "EMBEDDING_DIMENSIONS": 1024,
-                "OLLAMA_MODEL": "llama3",
+                "embedder.dimensions": 1024,
+                "summarizer.ollama.model": "llama3",
             })
             assert response.status_code == 200
             data = await response.get_json()
@@ -80,7 +77,7 @@ class TestSettingsAPI:
         """PUT /api/settings should coerce string values to correct types."""
         async with test_client.test_client() as client:
             response = await client.put("/api/settings/", json={
-                "EMBEDDING_DIMENSIONS": "256",
+                "embedder.dimensions": "256",
             })
             assert response.status_code == 200
             data = await response.get_json()
@@ -90,7 +87,7 @@ class TestSettingsAPI:
         """Settings should be readable after update."""
         async with test_client.test_client() as client:
             await client.put("/api/settings/", json={
-                "WHISPER_PROVIDER": "local",
+                "parser.whisper.provider": "local",
             })
 
             response = await client.get("/api/settings/")

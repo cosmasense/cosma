@@ -9,11 +9,13 @@
 @Desc    :   Embedding generation for semantic search
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 import os
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, TYPE_CHECKING
 
 # Import AI libraries
 import litellm
@@ -21,6 +23,9 @@ import numpy as np
 from cosma_backend.models import File
 from cosma_backend.logging import get_logger
 from cosma_backend.models.status import ProcessingStatus
+
+if TYPE_CHECKING:
+    from cosma_backend.settings import EmbedderConfig
 
 # Configure structured logger
 logger = get_logger(__name__)
@@ -100,20 +105,20 @@ class BaseEmbedder(ABC):
 class OnlineEmbedder(BaseEmbedder):
     """Embedder using online models via LiteLLM (OpenAI API)."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, model: str | None = None, api_key: str | None = None, dimensions: int | None = None) -> None:
+    def __init__(self, config: EmbedderConfig | None = None, model: str | None = None, api_key: str | None = None, dimensions: int | None = None) -> None:
         """
         Initialize online embedder.
 
         Args:
-            config: Application configuration dictionary
-            model: Model name (default: text-embedding-3-small)
+            config: EmbedderConfig instance
+            model: Model name override
             api_key: API key (default from env)
-            dimensions: Embedding dimensions (default: 512 for efficiency)
+            dimensions: Embedding dimensions override
         """
-        self.config = config or {}
-        # Default to text-embedding-3-small with 512 dimensions for efficiency
-        self.model = model or self.config.get("EMBEDDING_MODEL", "text-embedding-3-small")
-        self.configured_dimensions = dimensions or self.config.get("EMBEDDING_DIMENSIONS", 512)
+        from cosma_backend.settings import EmbedderConfig as _EmbedderConfig
+        self.config = config or _EmbedderConfig()
+        self.model = model or self.config.model
+        self.configured_dimensions = dimensions or self.config.dimensions
 
         # Initialize base class
         super().__init__(model_name=self.model, dimensions=self.configured_dimensions)
@@ -216,16 +221,17 @@ class OnlineEmbedder(BaseEmbedder):
 class LocalEmbedder(BaseEmbedder):
     """Embedder using local models via sentence-transformers."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, model_name: str | None = None, dimensions: int | None = None) -> None:
+    def __init__(self, config: EmbedderConfig | None = None, model_name: str | None = None, dimensions: int | None = None) -> None:
         """
         Initialize local embedder.
 
         Args:
-            config: Application configuration dictionary
-            model_name: Model name (default: intfloat/e5-base-v2)
-            dimensions: Embedding dimensions (default: 768 for efficiency)
+            config: EmbedderConfig instance
+            model_name: Model name override
+            dimensions: Embedding dimensions override
         """
-        self.config = config or {}
+        from cosma_backend.settings import EmbedderConfig as _EmbedderConfig
+        self.config = config or _EmbedderConfig()
         # Import sentence-transformers lazily
         try:
             from sentence_transformers import SentenceTransformer
@@ -234,9 +240,8 @@ class LocalEmbedder(BaseEmbedder):
             self.sentence_transformers_available = False
             logger.warning("sentence-transformers not installed, local embeddings unavailable")
 
-        # Default to intfloat/e5-base-v2 model with 768 dimensions for efficiency
-        self.model_name = model_name or self.config.get("LOCAL_EMBEDDING_MODEL", "intfloat/e5-base-v2")
-        self.configured_dimensions = dimensions or self.config.get("LOCAL_EMBEDDING_DIMENSIONS", 768)
+        self.model_name = model_name or self.config.local_model
+        self.configured_dimensions = dimensions or self.config.local_dimensions
 
         # Initialize base class
         super().__init__(model_name=self.model_name, dimensions=self.configured_dimensions)
@@ -359,16 +364,17 @@ class AutoEmbedder:
     3. Local models (fallback)
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, preferred_provider: str | None = None) -> None:
+    def __init__(self, config: EmbedderConfig | None = None, preferred_provider: str | None = None) -> None:
         """
         Initialize auto embedder.
 
         Args:
-            config: Application configuration dictionary
+            config: EmbedderConfig instance
             preferred_provider: Preferred provider ('local', 'online')
         """
-        self.config = config or {}
-        self.preferred_provider = preferred_provider or self.config.get("EMBEDDING_PROVIDER", "local")
+        from cosma_backend.settings import EmbedderConfig as _EmbedderConfig
+        self.config = config or _EmbedderConfig()
+        self.preferred_provider = preferred_provider or self.config.provider
         logger.debug("Preferred provider", og=preferred_provider, provider=self.preferred_provider)
         self.embedders = {}
 

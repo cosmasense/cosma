@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING
 
 from quart import Blueprint, current_app, request
 
-from cosma_backend.settings import resolve_key
-
 if TYPE_CHECKING:
     from cosma_backend.app import app as current_app
 
@@ -24,27 +22,15 @@ async def get_settings():
 
 @settings_bp.put("/")
 async def update_settings():
-    """Partial update of settings. Accepts flat config keys or TOML paths."""
+    """Partial update of settings. Accepts dotted TOML paths."""
     data = await request.get_json()
     if not data or not isinstance(data, dict):
         return {"error": "Request body must be a JSON object"}, 400
 
-    # Resolve all keys to canonical flat config keys
-    resolved: dict = {}
-    for key, value in data.items():
-        canonical = resolve_key(key)
-        if canonical is None:
-            return {"error": f"Unknown setting: {key}"}, 400
-        resolved[canonical] = value
-
     try:
-        updated = current_app.settings_manager.update(resolved)
+        updated = current_app.settings_manager.update(data)
     except KeyError as e:
         return {"error": str(e)}, 400
-
-    # Sync updated values into app.config so they take effect immediately
-    for key, value in updated.items():
-        current_app.config[key] = value
 
     return current_app.settings_manager.to_dict()
 

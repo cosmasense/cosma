@@ -1,14 +1,22 @@
 """Unit tests for SettingsManager."""
 
-import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from platformdirs import PlatformDirs
 
-from cosma_backend.settings import SettingsManager, SETTINGS_SCHEMA, _coerce
+from cosma_backend.settings import (
+    SettingsManager,
+    Settings,
+    EmbedderConfig,
+    SummarizerConfig,
+    ParserConfig,
+    _coerce,
+    _from_dict,
+    _get_by_path,
+    _set_by_path,
+)
 
 
 @pytest.mark.unit
@@ -39,6 +47,60 @@ class TestCoerce:
 
 
 @pytest.mark.unit
+class TestFromDict:
+    """Test recursive dict -> dataclass conversion."""
+
+    def test_partial_dict(self):
+        s = _from_dict(Settings, {"embedder": {"provider": "online"}})
+        assert s.embedder.provider == "online"
+        # Other fields keep defaults
+        assert s.embedder.model == "text-embedding-3-small"
+        assert s.summarizer.provider == "auto"
+
+    def test_nested_dict(self):
+        s = _from_dict(Settings, {
+            "summarizer": {"ollama": {"model": "llama3", "host": "http://myhost:11434"}}
+        })
+        assert s.summarizer.ollama.model == "llama3"
+        assert s.summarizer.ollama.host == "http://myhost:11434"
+
+    def test_empty_dict(self):
+        s = _from_dict(Settings, {})
+        assert s == Settings()
+
+
+@pytest.mark.unit
+class TestPathHelpers:
+    """Test dotted-path get/set on dataclass tree."""
+
+    def test_get_by_path(self):
+        s = Settings()
+        assert _get_by_path(s, "embedder.provider") == "local"
+        assert _get_by_path(s, "summarizer.ollama.model") == "qwen3-vl:2b-instruct"
+
+    def test_get_by_path_unknown_raises(self):
+        s = Settings()
+        with pytest.raises(KeyError):
+            _get_by_path(s, "embedder.nonexistent")
+
+    def test_set_by_path(self):
+        s = Settings()
+        _set_by_path(s, "embedder.provider", "online")
+        assert s.embedder.provider == "online"
+
+    def test_set_by_path_coerces_type(self):
+        s = Settings()
+        _set_by_path(s, "embedder.dimensions", "1024")
+        assert s.embedder.dimensions == 1024
+        assert isinstance(s.embedder.dimensions, int)
+
+    def test_set_by_path_unknown_raises(self):
+        s = Settings()
+        with pytest.raises(KeyError):
+            _set_by_path(s, "embedder.nonexistent", "value")
+
+
+@pytest.mark.unit
 class TestSettingsManager:
     """Test SettingsManager load/save/get/set."""
 
@@ -62,72 +124,72 @@ class TestSettingsManager:
         """Loading with no existing TOML should create one with defaults."""
         settings = manager.load()
         assert manager.toml_path.exists()
-        # Check some defaults
-        assert settings["EMBEDDING_PROVIDER"] == "local"
-        assert settings["AI_PROVIDER"] == "auto"
-        assert settings["EMBEDDING_DIMENSIONS"] == 512
+        assert settings.embedder.provider == "local"
+        assert settings.summarizer.provider == "auto"
+        assert settings.embedder.dimensions == 512
 
     def test_load_returns_defaults(self, manager):
-        """All schema keys should be present with their defaults."""
+        """All fields should match defaults on fresh load."""
         settings = manager.load()
-        for key, schema in SETTINGS_SCHEMA.items():
-            assert key in settings, f"Missing key: {key}"
-            assert settings[key] == schema["default"], f"Wrong default for {key}"
+        defaults = Settings()
+        assert settings.embedder.provider == defaults.embedder.provider
+        assert settings.summarizer.provider == defaults.summarizer.provider
+        assert settings.parser.spotlight_enabled == defaults.parser.spotlight_enabled
 
     def test_save_and_reload(self, manager):
         """Settings should round-trip through save/load."""
         manager.load()
-        manager.set("AI_PROVIDER", "ollama")
-        manager.set("EMBEDDING_DIMENSIONS", 1024)
+        manager.set_by_path("summarizer.provider", "ollama")
+        manager.set_by_path("embedder.dimensions", 1024)
 
         # Create a new manager pointing at the same file
         mgr2 = SettingsManager(manager._dirs)
         mgr2._toml_path = manager.toml_path
         settings = mgr2.load()
 
-        assert settings["AI_PROVIDER"] == "ollama"
-        assert settings["EMBEDDING_DIMENSIONS"] == 1024
+        assert settings.summarizer.provider == "ollama"
+        assert settings.embedder.dimensions == 1024
 
-    def test_get_known_key(self, manager):
+    def test_get_by_path_known_key(self, manager):
         manager.load()
-        assert manager.get("EMBEDDING_PROVIDER") == "local"
+        assert manager.get_by_path("embedder.provider") == "local"
 
-    def test_get_unknown_key_raises(self, manager):
-        manager.load()
-        with pytest.raises(KeyError):
-            manager.get("NONEXISTENT_KEY")
-
-    def test_set_unknown_key_raises(self, manager):
+    def test_get_by_path_unknown_key_raises(self, manager):
         manager.load()
         with pytest.raises(KeyError):
-            manager.set("NONEXISTENT_KEY", "value")
+            manager.get_by_path("embedder.nonexistent")
 
-    def test_set_coerces_type(self, manager):
+    def test_set_by_path_unknown_key_raises(self, manager):
         manager.load()
-        manager.set("EMBEDDING_DIMENSIONS", "256")
-        assert manager.get("EMBEDDING_DIMENSIONS") == 256
-        assert isinstance(manager.get("EMBEDDING_DIMENSIONS"), int)
+        with pytest.raises(KeyError):
+            manager.set_by_path("nonexistent.key", "value")
+
+    def test_set_by_path_coerces_type(self, manager):
+        manager.load()
+        manager.set_by_path("embedder.dimensions", "256")
+        assert manager.get_by_path("embedder.dimensions") == 256
+        assert isinstance(manager.get_by_path("embedder.dimensions"), int)
 
     def test_set_bool_coercion(self, manager):
         manager.load()
-        manager.set("LLAMACPP_VERBOSE", "true")
-        assert manager.get("LLAMACPP_VERBOSE") is True
+        manager.set_by_path("summarizer.llamacpp.verbose", "true")
+        assert manager.get_by_path("summarizer.llamacpp.verbose") is True
 
     def test_update_bulk(self, manager):
         manager.load()
         updated = manager.update({
-            "AI_PROVIDER": "ollama",
-            "OLLAMA_MODEL": "llama3",
-            "EMBEDDING_DIMENSIONS": 256,
+            "summarizer.provider": "ollama",
+            "summarizer.ollama.model": "llama3",
+            "embedder.dimensions": 256,
         })
-        assert updated["AI_PROVIDER"] == "ollama"
-        assert updated["OLLAMA_MODEL"] == "llama3"
-        assert updated["EMBEDDING_DIMENSIONS"] == 256
+        assert updated["summarizer"]["provider"] == "ollama"
+        assert updated["summarizer"]["ollama"]["model"] == "llama3"
+        assert updated["embedder"]["dimensions"] == 256
 
     def test_update_unknown_key_raises(self, manager):
         manager.load()
         with pytest.raises(KeyError):
-            manager.update({"BAD_KEY": "value"})
+            manager.update({"bad.key": "value"})
 
     def test_to_dict_grouped(self, manager):
         manager.load()
@@ -138,49 +200,15 @@ class TestSettingsManager:
         assert grouped["embedder"]["provider"] == "local"
         assert grouped["summarizer"]["provider"] == "auto"
 
-    def test_to_flat_dict(self, manager):
-        manager.load()
-        flat = manager.to_flat_dict()
-        for key in SETTINGS_SCHEMA:
-            assert key in flat
-
     def test_defaults_static(self):
         defaults = SettingsManager.defaults()
         assert "embedder" in defaults
         assert defaults["embedder"]["provider"] == "local"
 
-    def test_flat_defaults_static(self):
-        flat = SettingsManager.flat_defaults()
-        assert flat["EMBEDDING_PROVIDER"] == "local"
-        assert flat["AI_PROVIDER"] == "auto"
-
-    def test_env_var_overrides_toml(self, manager, monkeypatch):
-        """Env vars with COSMA_ prefix should override TOML values."""
-        # First load with defaults (creates TOML)
-        manager.load()
-
-        # Set env var and reload
-        monkeypatch.setenv("COSMA_AI_PROVIDER", "ollama")
-        settings = manager.load()
-        assert settings["AI_PROVIDER"] == "ollama"
-
-    def test_env_var_int_coercion(self, manager, monkeypatch):
-        """Env var strings should be coerced to the correct type."""
-        monkeypatch.setenv("COSMA_EMBEDDING_DIMENSIONS", "1024")
-        settings = manager.load()
-        assert settings["EMBEDDING_DIMENSIONS"] == 1024
-        assert isinstance(settings["EMBEDDING_DIMENSIONS"], int)
-
-    def test_env_var_bool_coercion(self, manager, monkeypatch):
-        """Env var boolean strings should be coerced correctly."""
-        monkeypatch.setenv("COSMA_LLAMACPP_VERBOSE", "true")
-        settings = manager.load()
-        assert settings["LLAMACPP_VERBOSE"] is True
-
     def test_toml_nested_structure(self, manager):
         """TOML file should have nested sections."""
         manager.load()
-        manager.set("OLLAMA_MODEL", "custom-model")
+        manager.set_by_path("summarizer.ollama.model", "custom-model")
 
         import tomllib
         with open(manager.toml_path, "rb") as f:
