@@ -308,6 +308,37 @@ class Client:
             raise ServerNotRunningError(self.base_url)
 
     # =========================================================================
+    # Settings API
+    # =========================================================================
+
+    async def get_settings(self) -> Dict[str, Any]:
+        """Get all application settings grouped by section"""
+        try:
+            response = await self.session.get(self._url("/api/settings/"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def update_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Update application settings (partial update with flat config keys)"""
+        try:
+            response = await self.session.put(
+                self._url("/api/settings/"),
+                data=json.dumps(settings)
+            )
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def get_settings_defaults(self) -> Dict[str, Any]:
+        """Get default values for all settings"""
+        try:
+            response = await self.session.get(self._url("/api/settings/defaults"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    # =========================================================================
     # Updates API (SSE)
     # =========================================================================
 
