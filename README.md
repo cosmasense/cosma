@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/pypi/v/cosma)](https://pypi.org/project/cosma/)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/Zs6vUt4t5e)
 
-<img align="right" src="./assets/logo.svg" height="150px" alt="Cosma Logo">
+<img align="right" src="./assets/logo.png" height="150px" alt="Cosma Logo">
 
 Search engine for your files!
 
