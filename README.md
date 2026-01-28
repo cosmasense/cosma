@@ -57,13 +57,15 @@ cosma serve
 
 ### Running
 
-To start the terminal UI and start searching, run search.
-
 > [!IMPORTANT]  
-> The backend must be running for this command to work (see above).
+> The backend must be running for these commands to work (see above).
+
+## TUI
+
+To start the terminal UI and start searching:
 
 ```sh
-cosma search /path/to/directory/to/search
+cosma tui /path/to/directory/to/search
 ```
 > [!WARNING]
 > This will begin processing all files in the directory specified,
