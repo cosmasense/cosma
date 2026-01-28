@@ -39,7 +39,7 @@ def settings_show(section: str | None, formatter: OutputFormatter):
         data = result.get(sect, {})
         if not data:
             continue
-        formatter.print(f"[bold cyan][{sect}][/bold cyan]")
+        formatter.print(f"[bold cyan]\\[{sect}][/bold cyan]")
         _print_nested(formatter, data, indent=2)
         formatter.print("")
 
@@ -49,8 +49,10 @@ def _print_nested(formatter: OutputFormatter, data: dict, indent: int = 0):
     prefix = " " * indent
     for key, value in data.items():
         if isinstance(value, dict):
-            formatter.print(f"{prefix}[bold][{key}][/bold]")
+            formatter.print(f"{prefix}[bold]\\[{key}][/bold]")
             _print_nested(formatter, value, indent + 2)
+        elif isinstance(value, str) and value == "":
+            continue
         else:
             formatter.print(f"{prefix}[bold]{key}[/bold] = {value}")
 
@@ -146,7 +148,7 @@ def settings_defaults(formatter: OutputFormatter):
         data = result.get(sect, {})
         if not data:
             continue
-        formatter.print(f"[bold cyan][{sect}][/bold cyan]")
+        formatter.print(f"[bold cyan]\\[{sect}][/bold cyan]")
         _print_nested(formatter, data, indent=2)
         formatter.print("")
 
