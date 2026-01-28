@@ -537,10 +537,10 @@ async def cleanup_excluded_files() -> int:
     Returns:
         Number of files removed
     """
-    from cosma_backend.logging import sm
+    from cosma_backend.logging import get_logger
     import logging
 
-    logger = logging.getLogger(__name__)
+    logger = get_logger(__name__)
 
     db = current_app.db
     filter_manager = current_app.filter_manager
@@ -573,8 +573,8 @@ async def cleanup_excluded_files() -> int:
                     # File should be excluded, delete it
                     await conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
                     removed_count += 1
-                    logger.info(sm("Removed excluded file from index",
-                                  file_path=str(file_path)))
+                    logger.info("Removed excluded file from index",
+                                  file_path=str(file_path))
 
-    logger.info(sm("Cleanup completed", removed_count=removed_count))
+    logger.info("Cleanup completed", removed_count=removed_count)
     return removed_count

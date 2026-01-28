@@ -1,16 +1,15 @@
 from collections.abc import Generator
 from datetime import datetime
-import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 
 if TYPE_CHECKING:
     from cosma_backend.filter import FilterConfig
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class Discoverer:
@@ -41,7 +40,7 @@ class Discoverer:
             # Single file - check filter
             if filter_config is not None:
                 if not filter_config.should_include(root, root.parent):
-                    logger.debug(sm("Skipping excluded file", file=str(root)))
+                    logger.debug("Skipping excluded file", file=str(root))
                     return
             yield File.from_path(root)
             return
@@ -57,14 +56,14 @@ class Discoverer:
                 if filter_config is not None:
                     if not filter_config.should_include(item, root):
                         filtered_count += 1
-                        logger.debug(sm("Skipping excluded file", file=str(item)))
+                        logger.debug("Skipping excluded file", file=str(item))
                         continue
 
                 discovered_count += 1
                 yield File.from_path(item)
 
         if filter_config is not None:
-            logger.info(sm("Discovery complete",
+            logger.info("Discovery complete",
                           path=str(root),
                           discovered=discovered_count,
-                          filtered=filtered_count))
+                          filtered=filtered_count)

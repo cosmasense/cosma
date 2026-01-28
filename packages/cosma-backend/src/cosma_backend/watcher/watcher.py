@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -18,7 +17,7 @@ from watchdog.events import (
 from watchdog.observers.api import BaseObserver
 
 from cosma_backend.db import Database
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.models.watch import WatchedDirectory
 from cosma_backend.models.update import Update
@@ -29,7 +28,7 @@ from cosma_backend.watcher.awatchdog import watch
 if TYPE_CHECKING:
     from cosma_backend.filter import FilterConfigManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Per-folder config file name to watch for changes
 LOCAL_CONFIG_FILENAME = ".cosmaconfig"
@@ -75,7 +74,7 @@ class WatcherJob:
         await self.pipeline.process_directory(self.watched_dir.path, filter_config=filter_config)
     
     async def start(self):
-        logger.info(sm("Starting watchdog observer", watched_dir=self.watched_dir))
+        logger.info("Starting watchdog observer", watched_dir=self.watched_dir)
         
         # Publish watch started update
         from cosma_backend.models.update import UpdateOpcode
@@ -116,9 +115,9 @@ class WatcherJob:
 
         # Check if this is the config file for our watched directory
         if file_path.parent == self.watched_dir.path:
-            logger.info(sm("Config file changed, reloading filter config",
+            logger.info("Config file changed, reloading filter config",
                           config_path=str(file_path),
-                          watched_dir=str(self.watched_dir.path)))
+                          watched_dir=str(self.watched_dir.path))
             self.filter_manager.reload_directory(self.watched_dir.path)
 
     async def consumer_task(self):
@@ -127,22 +126,22 @@ class WatcherJob:
 
             # Skip directory created and modified events - we only care about deletion/movement
             if isinstance(event, (DirCreatedEvent, DirModifiedEvent)):
-                logger.debug(sm("Skipping directory event", event_type=type(event).__name__, path=event.src_path))
+                logger.debug("Skipping directory event", event_type=type(event).__name__, path=event.src_path)
                 continue
 
             try:
                 # Handle directory deletion
                 if isinstance(event, DirDeletedEvent):
-                    logger.info(sm("Directory deleted", path=event.src_path))
+                    logger.info("Directory deleted", path=event.src_path)
                     path = Path(str(event.src_path)).resolve()
 
                     self._publish_update(Update.directory_deleted(str(path)))
                     deleted_files = await self.db.delete_files_in_directory(str(path))
-                    logger.info(sm("Deleted files from deleted directory", directory=str(path), count=len(deleted_files)))
+                    logger.info("Deleted files from deleted directory", directory=str(path), count=len(deleted_files))
 
                 # Handle directory movement
                 elif isinstance(event, DirMovedEvent):
-                    logger.info(sm("Directory moved", src=event.src_path, dest=event.dest_path))
+                    logger.info("Directory moved", src=event.src_path, dest=event.dest_path)
                     src_path = Path(str(event.src_path)).resolve()
                     dest_path = Path(str(event.dest_path)).resolve()
 
@@ -150,16 +149,16 @@ class WatcherJob:
 
                     # Delete all files at the old location
                     deleted_files = await self.db.delete_files_in_directory(str(src_path))
-                    logger.info(sm("Deleted files from moved directory", old_directory=str(src_path), count=len(deleted_files)))
+                    logger.info("Deleted files from moved directory", old_directory=str(src_path), count=len(deleted_files))
 
                     # Process the new directory location if it exists
                     if dest_path.exists() and dest_path.is_dir():
-                        logger.info(sm("Processing files in new directory location", directory=str(dest_path)))
+                        logger.info("Processing files in new directory location", directory=str(dest_path))
                         await self.pipeline.process_directory(dest_path)
 
                 # Handle different event types
                 elif isinstance(event, FileDeletedEvent):
-                    logger.info(sm("File deleted", path=event.src_path))
+                    logger.info("File deleted", path=event.src_path)
                     path = Path(str(event.src_path)).resolve()
 
                     # Check if config file was deleted
@@ -171,7 +170,7 @@ class WatcherJob:
 
                 elif isinstance(event, FileMovedEvent):
                     # Handle moved files as delete old + create new
-                    logger.info(sm("File moved", src=event.src_path, dest=event.dest_path))
+                    logger.info("File moved", src=event.src_path, dest=event.dest_path)
                     src_path = Path(str(event.src_path)).resolve()
                     dest_path = Path(str(event.dest_path)).resolve()
 
@@ -185,7 +184,7 @@ class WatcherJob:
 
                     # Check filter before processing destination
                     if not self._should_include_file(dest_path):
-                        logger.debug(sm("Skipping excluded file", path=str(dest_path)))
+                        logger.debug("Skipping excluded file", path=str(dest_path))
                         continue
 
                     # Check if destination file type is supported before processing
@@ -193,12 +192,12 @@ class WatcherJob:
                     if await self.pipeline.is_supported(dest_file):
                         await self.pipeline.process_file(dest_file)
                     else:
-                        logger.debug(sm("Skipping unsupported file type", path=str(dest_path)))
+                        logger.debug("Skipping unsupported file type", path=str(dest_path))
 
                 elif isinstance(event, (FileCreatedEvent, FileModifiedEvent)):
                     # Handle created and modified files the same way - process them
                     event_type = "created" if isinstance(event, FileCreatedEvent) else "modified"
-                    logger.info(sm(f"File {event_type}", path=event.src_path))
+                    logger.info(f"File {event_type}", path=event.src_path)
                     path = Path(str(event.src_path)).resolve()
 
                     # Check if config file changed
@@ -208,7 +207,7 @@ class WatcherJob:
 
                     # Check filter before processing
                     if not self._should_include_file(path):
-                        logger.debug(sm("Skipping excluded file", path=str(path)))
+                        logger.debug("Skipping excluded file", path=str(path))
                         continue
 
                     # Publish file system event update
@@ -222,13 +221,13 @@ class WatcherJob:
                     if await self.pipeline.is_supported(file):
                         await self.pipeline.process_file(file)
                     else:
-                        logger.debug(sm("Skipping unsupported file type", path=str(path)))
+                        logger.debug("Skipping unsupported file type", path=str(path))
 
                 else:
-                    logger.warning(sm("Unknown event type", event_type=type(event).__name__, path=event.src_path))
+                    logger.warning("Unknown event type", event_type=type(event).__name__, path=event.src_path)
 
             except Exception as e:
-                logger.error(sm("Error processing file system event", event_type=type(event).__name__, path=event.src_path, error=e))
+                logger.error("Error processing file system event", event_type=type(event).__name__, path=event.src_path, error=e)
     
 
 class Watcher:
@@ -280,14 +279,14 @@ class Watcher:
                 break
 
         if job_to_stop is None:
-            logger.warning(sm("No watcher job found for path", path=str(path)))
+            logger.warning("No watcher job found for path", path=str(path))
             return False
 
         # Stop the job
         await job_to_stop.stop()
         self.jobs.discard(job_to_stop)
 
-        logger.info(sm("Stopped watching directory", path=str(path)))
+        logger.info("Stopped watching directory", path=str(path))
         return True
 
     async def stop_watching_by_id(self, job_id: int) -> bool:
@@ -308,14 +307,14 @@ class Watcher:
                 break
 
         if job_to_stop is None:
-            logger.warning(sm("No watcher job found for ID", job_id=job_id))
+            logger.warning("No watcher job found for ID", job_id=job_id)
             return False
 
         # Stop the job
         await job_to_stop.stop()
         self.jobs.discard(job_to_stop)
 
-        logger.info(sm("Stopped watching directory by ID", job_id=job_id, path=str(job_to_stop.watched_dir.path)))
+        logger.info("Stopped watching directory by ID", job_id=job_id, path=str(job_to_stop.watched_dir.path))
         return True
 
     async def start_watching(self, path: str | Path, recursive: bool = True, file_pattern: Optional[str] = None):
@@ -339,7 +338,7 @@ class Watcher:
         for existing_dir in watched_dirs:
             # Check if exact path is already being watched
             if existing_dir.path == path:
-                logger.warning(sm("Directory already being watched", path=str(path)))
+                logger.warning("Directory already being watched", path=str(path))
                 raise ValueError(f"Directory '{path}' is already being watched")
             
             # Check if a parent directory is being watched with recursive=True
@@ -351,9 +350,9 @@ class Watcher:
                     # Use relative_to to check if path is a subdirectory of existing_dir.path
                     path.relative_to(existing_dir.path)
                     # If we get here, path is a subdirectory of existing_dir.path
-                    logger.warning(sm("Parent directory already being watched", 
+                    logger.warning("Parent directory already being watched", 
                                      path=str(path), 
-                                     parent=str(existing_dir.path)))
+                                     parent=str(existing_dir.path))
                     raise ValueError(f"Parent directory '{existing_dir.path}' is already watching '{path}' recursively")
                 except ValueError:
                     # relative_to raises ValueError if path is not relative to existing_dir.path
@@ -373,39 +372,39 @@ class Watcher:
         Create jobs for all active watched directories from the database.
         This should be called on startup to restore watching state.
         """
-        logger.info(sm("Initializing watcher from database"))
+        logger.info("Initializing watcher from database")
         
         # Get all active watched directories
         watched_dirs = await self.db.get_watched_directories(active_only=True)
         
         if not watched_dirs:
-            logger.info(sm("No watched directories found in database"))
+            logger.info("No watched directories found in database")
             return
         
-        logger.info(sm("Found watched directories", count=len(watched_dirs)))
+        logger.info("Found watched directories", count=len(watched_dirs))
         
         # Create jobs for each watched directory
         for watched_dir in watched_dirs:
             # Check if path still exists
             if not watched_dir.path.exists():
-                logger.warning(sm("Watched directory no longer exists", path=watched_dir.path_str, id=watched_dir.id))
+                logger.warning("Watched directory no longer exists", path=watched_dir.path_str, id=watched_dir.id)
                 continue
             
             if not watched_dir.path.is_dir():
-                logger.warning(sm("Watched path is not a directory", path=watched_dir.path_str, id=watched_dir.id))
+                logger.warning("Watched path is not a directory", path=watched_dir.path_str, id=watched_dir.id)
                 continue
             
-            logger.info(sm("Creating job for watched directory", 
+            logger.info("Creating job for watched directory", 
                           path=watched_dir.path_str, 
                           id=watched_dir.id,
                           recursive=watched_dir.recursive,
-                          file_pattern=watched_dir.file_pattern))
+                          file_pattern=watched_dir.file_pattern)
             try:
                 await self.create_job(watched_dir)
             except Exception as e:
-                logger.error(sm("Failed to create job for watched directory", 
+                logger.error("Failed to create job for watched directory", 
                                path=watched_dir.path_str, 
                                id=watched_dir.id,
-                               error=str(e)))
+                               error=str(e))
         
-        logger.info(sm("Watcher initialization complete", active_jobs=len(self.jobs)))
+        logger.info("Watcher initialization complete", active_jobs=len(self.jobs))

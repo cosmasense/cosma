@@ -3,10 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Optional
-import logging
 
 from cosma_backend.db import Database
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.models.status import ProcessingStatus
 from cosma_backend.models.update import Update
@@ -19,7 +18,7 @@ from cosma_backend.utils.pubsub import Hub
 if TYPE_CHECKING:
     from cosma_backend.filter import FilterConfig
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class PipelineResult:
@@ -81,8 +80,8 @@ class Pipeline:
         started_processing = datetime.now(timezone.utc)
 
         # Stage 1: Discovery (with filtering)
-        logger.info(sm("Discovering files", path=str(path),
-                      has_filter=filter_config is not None))
+        logger.info("Discovering files", path=str(path),
+                      has_filter=filter_config is not None)
         for file in self.discoverer.files_in(path, filter_config=filter_config):
             # result.discovered += 1
             
@@ -92,7 +91,7 @@ class Pipeline:
 
                 # Check if file needs processing
                 if await self._should_skip_file(file):
-                    logger.info(sm("Skipping processing file", file=file))
+                    logger.info("Skipping processing file", file=file)
                     self._publish_update(Update.file_skipped(
                         file.file_path, 
                         file.filename, 
@@ -108,13 +107,13 @@ class Pipeline:
                 continue
         
         try:
-            logger.info(sm("Deleting files no longer present in filesystem", started_processing=started_processing, path=str(path)))
+            logger.info("Deleting files no longer present in filesystem", started_processing=started_processing, path=str(path))
             rows = await self.db.delete_files_not_updated_since(started_processing, str(path))
-            logger.info(sm("Deleted unused files", count=len(rows)))
+            logger.info("Deleted unused files", count=len(rows))
         except Exception as e:
-            logger.error(sm("Error while deleting unused files", error=str(e)))
+            logger.error("Error while deleting unused files", error=str(e))
 
-        logger.info(sm("Completed processing directory", directory=str(path)))
+        logger.info("Completed processing directory", directory=str(path))
         self._publish_update(Update.directory_processing_completed(str(path)))
 
     
@@ -139,7 +138,7 @@ class Pipeline:
 
             # Check if file hash is different before proceeding
             if not await self._has_file_changed(file):
-                logger.info(sm("Skipping processing file, hashed not changed", file=file))
+                logger.info("Skipping processing file, hashed not changed", file=file)
                 self._publish_update(Update.file_skipped(
                     file.file_path, 
                     file.filename, 
@@ -166,7 +165,7 @@ class Pipeline:
         except Exception as e:
             # result.failed += 1
             # result.errors.append((str(file_path), str(e)))
-            logger.error(sm("Pipeline failed for file", file=file, error=e))
+            logger.error("Pipeline failed for file", file=file, error=e)
             
             # Publish failure update
             self._publish_update(Update.file_failed(
@@ -194,13 +193,13 @@ class Pipeline:
         saved_file = await self.db.get_file_by_path(file.file_path)
         
         if not saved_file or saved_file.status not in (ProcessingStatus.COMPLETE, ProcessingStatus.FAILED):
-            logger.info(sm("Should skip", file=file, status=saved_file.status if saved_file else "No saved file"))
+            logger.info("Should skip", file=file, status=saved_file.status if saved_file else "No saved file")
             return False
             
         saved_modified = saved_file.modified.replace(microsecond=0)
         current_modified = file.modified.replace(microsecond=0)
         
-        logger.info(sm("Should skip", file=file, saved_modified=saved_modified, current_modified=current_modified))
+        logger.info("Should skip", file=file, saved_modified=saved_modified, current_modified=current_modified)
             
         return saved_modified == current_modified
 
@@ -210,7 +209,7 @@ class Pipeline:
         """Check if file has been changed based on hash."""
         saved_file = await self.db.get_file_by_path(file.file_path)
         
-        logger.info(sm("Saved file", saved_file=saved_file, status=saved_file.status if saved_file else "N/A"))
+        logger.info("Saved file", saved_file=saved_file, status=saved_file.status if saved_file else "N/A")
         
         if not saved_file or saved_file.status is not ProcessingStatus.COMPLETE:
             return True

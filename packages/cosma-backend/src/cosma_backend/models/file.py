@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import sqlite3
 from typing import Any, Optional, List, Self, TYPE_CHECKING
-import logging
+from cosma_backend.logging import get_logger
 
 import numpy as np
 
@@ -12,7 +12,7 @@ from cosma_backend.models.status import ProcessingStatus
 if TYPE_CHECKING:
     from cosma_backend.api.models import FileResponse
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
