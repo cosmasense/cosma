@@ -7,9 +7,8 @@
 
 Search engine for your files!
 
-> [!CAUTION]
-> This software is in early alpha! There will be lots of bugs.
-> If you encounter any, please report them to the issue tracker.
+Use it yourself or plug it into your agents. Comes with a CLI, TUI,
+and [macOS app](https://github.com/cosmasense/macos).
 
 ### How It Works
 
@@ -25,7 +24,7 @@ Cosma can run 100% locally or in the cloud.
 ## Get Started
 
 Cosma has been tested on MacOS ARM and Windows.
-Linux support is coming soon!
+Linux support is in progress.
 
 ### Installing
 
@@ -90,11 +89,6 @@ cosma tui /path/to/directory/to/search
 > [!WARNING]
 > This will begin processing all files in the directory specified,
 > which will take some time if running locally.
-
-## MacOS App
-
-We're also working on a Mac app! If this seems like a useful project,
-give us a star!
 
 ## Contributing
 
