@@ -197,6 +197,22 @@ class SyncClient:
         return self._run_with_client(lambda c: c.reset_filters())
 
     # =========================================================================
+    # Settings API
+    # =========================================================================
+
+    def get_settings(self) -> Dict[str, Any]:
+        """Get all application settings grouped by section"""
+        return self._run_with_client(lambda c: c.get_settings())
+
+    def update_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Update application settings (partial update with flat config keys)"""
+        return self._run_with_client(lambda c: c.update_settings(settings))
+
+    def get_settings_defaults(self) -> Dict[str, Any]:
+        """Get default values for all settings"""
+        return self._run_with_client(lambda c: c.get_settings_defaults())
+
+    # =========================================================================
     # Updates API
     # =========================================================================
 

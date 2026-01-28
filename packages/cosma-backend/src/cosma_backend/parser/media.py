@@ -7,35 +7,38 @@
 @Desc    :   Audio/video transcription and image captioning with multi-provider support
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, TYPE_CHECKING
 
 from ..logging import get_logger
+
+if TYPE_CHECKING:
+    from cosma_backend.settings import ParserConfig
 
 # Configure structured logger
 logger = get_logger(__name__)
 
 
-async def extract_audio_transcript(path: Path, config: Optional[Dict[str, Any]] = None, backend: str | None = None) -> str | None:
+async def extract_audio_transcript(path: Path, config: ParserConfig | None = None, backend: str | None = None) -> str | None:
     """
     Extract transcript from audio file using configurable backends.
-    
+
     Args:
         path: Path to audio file
-        config: Optional configuration dictionary
+        config: ParserConfig instance
         backend: Backend to use ('openai' | 'local' | None for auto)
-        
+
     Returns:
         Transcript text or None if extraction failed
     """
-    # Get provider from config or env (defaults to online)
-    if config:
-        provider = backend or config.get("WHISPER_PROVIDER", "online")
-    else:
-        provider = backend or os.getenv("WHISPER_PROVIDER", "online")
+    from cosma_backend.settings import ParserConfig as _ParserConfig
+    cfg = config or _ParserConfig()
+    provider = backend or cfg.whisper.provider
     
     # Map provider names to backend names
     backend_map = {"online": "openai", "local": "local", "openai": "openai"}

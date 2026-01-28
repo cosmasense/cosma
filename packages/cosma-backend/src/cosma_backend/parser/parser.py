@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import mimetypes
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 
 from markitdown import MarkItDown
 
@@ -11,11 +13,14 @@ from cosma_backend.logging import get_logger
 from cosma_backend.models import File, ProcessingStatus
 from cosma_backend.parser.spotlight import spotlight_to_text
 from cosma_backend.parser.media import (
-    extract_audio_transcript, 
-    extract_video_transcript, 
+    extract_audio_transcript,
+    extract_video_transcript,
     extract_image_info,
     is_supported_media_file
 )
+
+if TYPE_CHECKING:
+    from cosma_backend.settings import ParserConfig
 
 # Configure structured logger
 logger = get_logger(__name__)
@@ -49,15 +54,16 @@ class FileParser:
         ".zip", ".epub"
     }
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, config: ParserConfig | None = None) -> None:
         """Initialize the parser with MarkItDown."""
-        self.config = config or {}
+        from cosma_backend.settings import ParserConfig as _ParserConfig
+        self.config = config or _ParserConfig()
         try:
             self.markitdown = MarkItDown()
-            
-            # Phase 2: Extraction strategy configuration
-            self.extraction_strategy = self.config.get("EXTRACTION_STRATEGY", "spotlight_first")
-            self.spotlight_enabled = self.config.get("SPOTLIGHT_ENABLED", True)
+
+            # Extraction strategy configuration
+            self.extraction_strategy = self.config.extraction_strategy
+            self.spotlight_enabled = self.config.spotlight_enabled
             
             # Statistics tracking
             self.extraction_stats = {

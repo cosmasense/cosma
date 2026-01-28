@@ -7,45 +7,45 @@
 @Desc    :   macOS Spotlight text extraction with CLI and PyObjC support
 """
 
+from __future__ import annotations
+
 import asyncio
-import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from ..logging import get_logger
+
+if TYPE_CHECKING:
+    from cosma_backend.settings import ParserConfig
 
 # Configure structured logger
 logger = get_logger(__name__)
 
 
-async def spotlight_to_text(path: Path, config: Optional[Dict[str, Any]] = None) -> str | None:
+async def spotlight_to_text(path: Path, config: ParserConfig | None = None) -> str | None:
     """
     Extract text content from a file using macOS Spotlight indexing.
-    
+
     Args:
         path: Path to the file to extract text from
-        config: Optional configuration dictionary
-        
+        config: ParserConfig instance
+
     Returns:
         Extracted text content or None if unavailable
-        
-    Raises:
-        OSError: If not running on macOS
     """
     if sys.platform != "darwin":
         logger.warning("Spotlight extraction only available on macOS", platform=sys.platform)
         return None
-        
+
     if not path.exists():
         logger.warning("File not found for Spotlight extraction", path=str(path))
         return None
-        
-    # Get timeout from config or environment
-    if config:
-        timeout = config.get("SPOTLIGHT_TIMEOUT_SECONDS", 5)
-    else:
-        timeout = int(os.getenv("SPOTLIGHT_TIMEOUT_SECONDS", "5"))
+
+    # Get timeout from config
+    from cosma_backend.settings import ParserConfig as _ParserConfig
+    cfg = config or _ParserConfig()
+    timeout = cfg.spotlight_timeout_seconds
     
     try:
         logger.debug("Extracting text via Spotlight", path=str(path))

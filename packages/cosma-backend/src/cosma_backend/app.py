@@ -14,6 +14,7 @@ from cosma_backend.api import api_blueprint
 from cosma_backend.db.database import Database
 from cosma_backend.logging import get_logger, configure_logging
 from cosma_backend.models.update import Update
+from cosma_backend.settings import SettingsManager
 from cosma_backend.utils.pubsub import Hub
 from cosma_backend.pipeline import Pipeline
 from cosma_backend.searcher import HybridSearcher
@@ -37,6 +38,7 @@ class App(Quart):
     searcher: HybridSearcher
     watcher: Watcher
     filter_manager: FilterConfigManager
+    settings_manager: SettingsManager
     dirs: PlatformDirs
 
     def __init__(self, *args, **kwargs):
@@ -50,65 +52,18 @@ class App(Quart):
         logger.info("Loading config")
         self.config.from_prefixed_env("COSMA")
 
+        # Bootstrap-only settings (env vars only, needed before app starts)
         self.config.setdefault("APP_NAME", "cosma")
         self.dirs = PlatformDirs(self.config["APP_NAME"], ensure_exists=True)
-
-        # add new config variable defaults here (if there should be a default)
         self.config.setdefault("HOST", '127.0.0.1')
         self.config.setdefault("PORT", 60534)
         self.config.setdefault("DATABASE_PATH", Path(self.dirs.user_data_dir) / "app.db")
-        
-        # ===== Embedder Configuration =====
-        self.config.setdefault("EMBEDDING_MODEL", "text-embedding-3-small")
-        self.config.setdefault("EMBEDDING_DIMENSIONS", 512)
-        self.config.setdefault("LOCAL_EMBEDDING_MODEL", "intfloat/e5-base-v2")
-        self.config.setdefault("LOCAL_EMBEDDING_DIMENSIONS", 768)
-        self.config.setdefault("EMBEDDING_PROVIDER", "local")
-        
-        # ===== Summarizer Configuration =====
-        self.config.setdefault("MAX_TOKENS_PER_REQUEST", 100000)
-        self.config.setdefault("CHUNK_OVERLAP_TOKENS", 1000)
-        self.config.setdefault("OLLAMA_MODEL", "qwen3-vl:2b-instruct")
-        self.config.setdefault("OLLAMA_HOST", "http://localhost:11434")
-        self.config.setdefault("OLLAMA_MODEL_CONTEXT_LENGTH", 10000)
-        self.config.setdefault("ONLINE_MODEL", "openai/gpt-4.1-nano-2025-04-14")
-        self.config.setdefault("ONLINE_MODEL_CONTEXT_LENGTH", 128000)
-        self.config.setdefault("LLAMACPP_MODEL_CONTEXT_LENGTH", 8192)
-        self.config.setdefault("LLAMACPP_N_CTX", 8192)
-        self.config.setdefault("LLAMACPP_N_THREADS", 4)
-        self.config.setdefault("LLAMACPP_N_GPU_LAYERS", 0)
-        self.config.setdefault("LLAMACPP_VERBOSE", False)
-        self.config.setdefault("AI_PROVIDER", "auto")
-        
-        # ===== Parser Configuration =====
-        self.config.setdefault("EXTRACTION_STRATEGY", "spotlight_first")
-        self.config.setdefault("SPOTLIGHT_ENABLED", True)
-        self.config.setdefault("SPOTLIGHT_TIMEOUT_SECONDS", 5)
-        self.config.setdefault("WHISPER_PROVIDER", "online")
-        self.config.setdefault("ONLINE_WHISPER_MODEL", "whisper-1")
-        self.config.setdefault("LOCAL_WHISPER_MODEL", "turbo")
-        
-        # Convert string boolean values to actual booleans
-        if isinstance(self.config.get("LLAMACPP_VERBOSE"), str):
-            self.config["LLAMACPP_VERBOSE"] = self.config["LLAMACPP_VERBOSE"].lower() == "true"
-        if isinstance(self.config.get("SPOTLIGHT_ENABLED"), str):
-            self.config["SPOTLIGHT_ENABLED"] = self.config["SPOTLIGHT_ENABLED"].lower() == "true"
-        
-        # Convert string numeric values to actual integers
-        for key in [
-            "EMBEDDING_DIMENSIONS", "LOCAL_EMBEDDING_DIMENSIONS", 
-            "MAX_TOKENS_PER_REQUEST", "CHUNK_OVERLAP_TOKENS",
-            "OLLAMA_MODEL_CONTEXT_LENGTH", "ONLINE_MODEL_CONTEXT_LENGTH",
-            "LLAMACPP_MODEL_CONTEXT_LENGTH", "LLAMACPP_N_CTX", 
-            "LLAMACPP_N_THREADS", "LLAMACPP_N_GPU_LAYERS", "SPOTLIGHT_TIMEOUT_SECONDS"
-        ]:
-            if isinstance(self.config.get(key), str):
-                try:
-                    self.config[key] = int(self.config[key])
-                except ValueError:
-                    pass  # Keep default if conversion fails
-        
-        logger.debug("Config loaded", config=self.config)
+
+        # Load persistent settings from TOML
+        self.settings_manager = SettingsManager(self.dirs)
+        self.settings_manager.load()
+
+        logger.debug("Config loaded")
         
     def submit_job(self, coro: Coroutine) -> asyncio.Task:
         def remove_task_callback(task: asyncio.Task):
@@ -143,10 +98,11 @@ async def initialize_services():
                   config_path=str(global_config.config_path))
 
     logger.info("Initializing services")
+    settings = app.settings_manager.settings
     discoverer = Discoverer()
-    parser = FileParser(config=app.config)
-    summarizer = AutoSummarizer(config=app.config)
-    embedder = AutoEmbedder(config=app.config)
+    parser = FileParser(config=settings.parser)
+    summarizer = AutoSummarizer(config=settings.summarizer)
+    embedder = AutoEmbedder(config=settings.embedder)
 
     app.pipeline = Pipeline(
         db=app.db,

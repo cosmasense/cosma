@@ -10,6 +10,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import shutil
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -479,12 +480,22 @@ class FilterConfig:
     def get_default_global_path(cls) -> Path:
         """Get the default path for global config.
 
-        Returns path in app data directory:
+        Returns path in app config directory:
         - macOS: ~/Library/Application Support/cosma/filter.json
-        - Linux: ~/.local/share/cosma/filter.json
+        - Linux: ~/.config/cosma/filter.json
         - Windows: C:/Users/<user>/AppData/Local/cosma/filter.json
         """
-        return Path(APP_DIRS.user_data_dir) / GLOBAL_CONFIG_FILENAME
+        return Path(APP_DIRS.user_config_dir) / GLOBAL_CONFIG_FILENAME
+
+    @classmethod
+    def _migrate_from_data_dir(cls) -> None:
+        """Migrate filter config from user_data_dir to user_config_dir if needed."""
+        old_path = Path(APP_DIRS.user_data_dir) / GLOBAL_CONFIG_FILENAME
+        new_path = cls.get_default_global_path()
+        if old_path.exists() and not new_path.exists():
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_path), str(new_path))
+            logger.info("Migrated filter config", old=str(old_path), new=str(new_path))
 
     @classmethod
     def load_global(cls) -> FilterConfig:
@@ -494,6 +505,7 @@ class FilterConfig:
         Returns:
             FilterConfig instance (default if file doesn't exist)
         """
+        cls._migrate_from_data_dir()
         global_path = cls.get_default_global_path()
 
         config = cls.load_from_file(global_path)
