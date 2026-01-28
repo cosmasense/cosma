@@ -44,34 +44,25 @@ To upgrade to the latest version:
 uv tool upgrade cosma --no-cache
 ```
 
-### Setup
+## Running
+
+### Backend
 
 Make sure you have [Ollama](https://ollama.com/) installed.
 
 Cosma has a backend to serve search queries, so it must be started first.
-This needs to always be running to watch for file changes and process files in the background.
+This needs to always be running to watch for file changes and process files in the
+background. For persistent use, consider running this as a background process or
+configure it as a system service.
 
 ```sh
 cosma serve
 ```
 
-### Running
-
 > [!IMPORTANT]  
-> The backend must be running for these commands to work (see above).
+> The backend must be running for the following commands to work (see above).
 
-## TUI
-
-To start the terminal UI and start searching:
-
-```sh
-cosma tui /path/to/directory/to/search
-```
-> [!WARNING]
-> This will begin processing all files in the directory specified,
-> which will take some time if running locally.
-
-## CLI
+### CLI
 
 Cosma includes a CLI with three output modes:
 
@@ -88,6 +79,17 @@ cosma files stats                     # Get file statistics
 ```
 
 Run `cosma --help` for all commands.
+
+### TUI
+
+Cosma also comes with a terminal UI (TUI).
+
+```sh
+cosma tui /path/to/directory/to/search
+```
+> [!WARNING]
+> This will begin processing all files in the directory specified,
+> which will take some time if running locally.
 
 ## MacOS App
 
