@@ -9,7 +9,10 @@ There are three codebases:
 - `cosma` (root)
 
 ## Testing
-- Run tests with `uv run pytest`
+- Run all tests: `uv run pytest`
+- For cosma-backend specifically: `cd packages/cosma-backend && uv run --group test pytest --no-cov`
+- Run unit tests only: `uv run --group test pytest tests/unit/ -m unit --no-cov`
+- Run integration tests only: `uv run --group test pytest tests/integration/ -m integration --no-cov`
 
 ## Development
 
