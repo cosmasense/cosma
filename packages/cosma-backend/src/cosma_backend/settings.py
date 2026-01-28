@@ -66,6 +66,30 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
 _PATH_TO_KEY = {v["path"]: k for k, v in SETTINGS_SCHEMA.items()}
 
 
+def resolve_key(key: str) -> str | None:
+    """Resolve a key to its flat config key name.
+
+    Accepts flat config keys (e.g. SPOTLIGHT_ENABLED),
+    TOML paths (e.g. parser.spotlight_enabled), or
+    case-insensitive variants of either.
+
+    Returns the canonical flat config key, or None if not found.
+    """
+    # Exact flat key match
+    upper = key.upper()
+    if upper in SETTINGS_SCHEMA:
+        return upper
+    # TOML path match
+    if key in _PATH_TO_KEY:
+        return _PATH_TO_KEY[key]
+    # Case-insensitive TOML path match
+    lower = key.lower()
+    for path, flat_key in _PATH_TO_KEY.items():
+        if path.lower() == lower:
+            return flat_key
+    return None
+
+
 def _coerce(value: Any, target_type: type) -> Any:
     """Coerce a value to the target type."""
     if isinstance(value, target_type):

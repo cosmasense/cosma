@@ -66,35 +66,29 @@ def settings_get(key: str, formatter: OutputFormatter):
 
     KEY is the flat config key (e.g. AI_PROVIDER, EMBEDDING_DIMENSIONS).
     """
+    from cosma_backend.settings import resolve_key as _resolve_key
+
+    canonical = _resolve_key(key)
+    if canonical is None:
+        formatter.error(f"Unknown setting: {key}")
+        formatter.hint("Use 'cosma settings show' to see all available settings")
+        return
+
     client = SyncClient()
     with formatter.status("Fetching settings..."):
         result = client.get_settings()
 
-    # Search for the key in the flat representation
-    # We need to get the flat dict from the API, but the API returns grouped.
-    # We'll also try get_settings_defaults to know valid keys.
-    defaults = client.get_settings_defaults()
-
-    # Build a flat key -> value mapping from grouped data
     flat = _flatten(result)
-    flat_defaults = _flatten(defaults)
 
-    # Try exact match on flat keys (uppercase)
-    upper_key = key.upper()
-    if upper_key in flat:
-        if formatter.mode == OutputMode.JSON:
-            formatter.output_json({upper_key: flat[upper_key]})
-        else:
-            formatter.print(f"[bold]{upper_key}[/bold] = {flat[upper_key]}")
-        return
+    # Find the value using the TOML path for this key
+    from cosma_backend.settings import SETTINGS_SCHEMA
+    path = SETTINGS_SCHEMA[canonical]["path"]
+    value = flat.get(path)
 
-    # Try as TOML path (e.g. embedder.provider)
-    for flat_key, value in flat.items():
-        # This is a simple heuristic; exact path matching would need the schema
-        pass
-
-    formatter.error(f"Unknown setting: {key}")
-    formatter.hint("Use 'cosma settings show' to see all available settings")
+    if formatter.mode == OutputMode.JSON:
+        formatter.output_json({canonical: value})
+    else:
+        formatter.print(f"[bold]{canonical}[/bold] = {value}")
 
 
 def _flatten(data: dict, prefix: str = "") -> dict:
@@ -121,14 +115,13 @@ def settings_set(key: str, value: str, formatter: OutputFormatter):
     VALUE is the new value to set.
     """
     client = SyncClient()
-    upper_key = key.upper()
-    with formatter.status(f"Updating {upper_key}..."):
-        result = client.update_settings({upper_key: value})
+    with formatter.status(f"Updating {key}..."):
+        result = client.update_settings({key: value})
 
     if formatter.mode == OutputMode.JSON:
         formatter.output_json(result)
     else:
-        formatter.success(f"Updated {upper_key}")
+        formatter.success(f"Updated {key}")
 
 
 @settings_group.command("defaults")
