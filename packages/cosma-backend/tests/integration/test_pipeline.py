@@ -132,18 +132,19 @@ class TestPipeline:
         # Create test file
         test_file = SampleFileFactory.create_text_file(temp_file_dir, "hash_test.txt")
         file_obj = File.from_path(test_file)
-        
-        # Mock content hash generation
+
+        # Mock content hash generation and set status to COMPLETE
         file_obj.content_hash = "original_hash"
-        
+        file_obj.status = ProcessingStatus.COMPLETE
+
         # Save file to database
         await test_pipeline.db.upsert_file(file_obj)
-        
+
         # Test with same hash
         file_obj.content_hash = "original_hash"
         has_changed = await test_pipeline._has_file_changed(file_obj)
         assert has_changed is False
-        
+
         # Test with different hash
         file_obj.content_hash = "different_hash"
         has_changed = await test_pipeline._has_file_changed(file_obj)

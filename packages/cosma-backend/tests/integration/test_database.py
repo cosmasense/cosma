@@ -169,31 +169,33 @@ class TestDatabaseOperations:
 
     async def test_keyword_search(self, temp_db: Database, sample_file_data):
         """Test keyword search functionality."""
-        # Insert file with specific content
+        # Insert file with specific content - FTS indexes title, summary, and keywords
         file_obj = File(**sample_file_data)
-        file_obj.content = "This is a document about artificial intelligence and machine learning"
+        file_obj.title = "Artificial Intelligence Research"
+        file_obj.summary = "This is a document about artificial intelligence and machine learning"
         file_obj.keywords = ["AI", "ML", "technology", "research"]
         await temp_db.upsert_file(file_obj)
-        
-        # Also insert content into FTS table for search to work
+
+        # Manually insert into FTS table since the trigger relies on file_keywords table
+        # and the FTS table only indexes: file_path, title, summary, keywords
         async with temp_db.acquire() as conn:
             await conn.execute(
-                """INSERT INTO files_fts (rowid, filename, content, summary, title)
+                """INSERT INTO files_fts (rowid, file_path, title, summary, keywords)
                    VALUES (?, ?, ?, ?, ?)""",
-                (file_obj.id, file_obj.filename, file_obj.content, 
-                 file_obj.summary or "", file_obj.title or "")
+                (file_obj.id, file_obj.file_path, file_obj.title,
+                 file_obj.summary or "", " ".join(file_obj.keywords or []))
             )
-        
-        # Search for "artificial intelligence"
+
+        # Search for "artificial intelligence" - this should match title and summary
         results = await temp_db.keyword_search("artificial intelligence", limit=10)
-        
+
         # Should find our file
         assert len(results) >= 1
-        
+
         found_file, relevance_score = results[0]
         assert isinstance(found_file, File)
         assert isinstance(relevance_score, (int, float))
-        assert "artificial" in found_file.content.lower() or "intelligence" in found_file.content.lower()
+        assert "artificial" in found_file.title.lower() or "intelligence" in found_file.summary.lower()
 
     async def test_add_watched_directory(self, temp_db: Database):
         """Test adding a watched directory."""
