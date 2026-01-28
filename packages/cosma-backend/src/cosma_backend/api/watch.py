@@ -109,16 +109,24 @@ class DeleteJobResponse:
 async def delete_job(job_id: int) -> tuple[DeleteJobResponse, int]:
     """
     Delete a watched directory job by ID.
-    
+
     DELETE /api/watch/jobs/{job_id}
-    
+
+    This will:
+    1. Stop the active watcher job (if running)
+    2. Delete all indexed files for this directory from the database
+    3. Remove the watched directory record
+
     Returns:
         200: Job deleted successfully
         404: Job not found
     """
-    # Delete the watched directory from database
+    # First, stop the watcher job if it's running
+    await current_app.watcher.stop_watching_by_id(job_id)
+
+    # Then delete the watched directory and files from database
     deleted_dir = await current_app.db.delete_watched_directory(job_id)
-    
+
     if deleted_dir:
         return DeleteJobResponse(
             success=True,

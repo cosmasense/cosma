@@ -16,8 +16,7 @@ from textual.widgets import Input, Static, ListView, ListItem, Label
 from textual.binding import Binding
 from textual.worker import Worker, WorkerState
 
-from .client import Client
-from .models import Update
+from cosma_client import Client, Update
 from .config import get_config
 from .onboarding import ThemeSelectionScreen, get_available_themes
 

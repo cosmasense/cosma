@@ -2,7 +2,7 @@ import asyncio
 import datetime
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from watchdog.events import (
     FileSystemEvent,
@@ -26,7 +26,13 @@ from cosma_backend.pipeline import Pipeline
 from cosma_backend.utils.pubsub import Hub
 from cosma_backend.watcher.awatchdog import watch
 
+if TYPE_CHECKING:
+    from cosma_backend.filter import FilterConfigManager
+
 logger = logging.getLogger(__name__)
+
+# Per-folder config file name to watch for changes
+LOCAL_CONFIG_FILENAME = ".cosmaconfig"
 
 
 class WatcherJob:
@@ -37,11 +43,19 @@ class WatcherJob:
     observer: Optional[BaseObserver]
     task: Optional[asyncio.Task]
     closed: bool
-    
-    def __init__(self, watched_dir: WatchedDirectory, pipeline: Pipeline, db: Database):
+    filter_manager: Optional["FilterConfigManager"]
+
+    def __init__(
+        self,
+        watched_dir: WatchedDirectory,
+        pipeline: Pipeline,
+        db: Database,
+        filter_manager: Optional["FilterConfigManager"] = None
+    ):
         self.watched_dir = watched_dir
         self.pipeline = pipeline
         self.db = db
+        self.filter_manager = filter_manager
         self.queue = asyncio.Queue()
         self.observer = None
         self.closed = False
@@ -53,7 +67,12 @@ class WatcherJob:
             self.pipeline.updates_hub.publish(update)
             
     async def do_initial_processing(self):
-        await self.pipeline.process_directory(self.watched_dir.path)
+        # Get filter config for this directory
+        filter_config = None
+        if self.filter_manager is not None:
+            filter_config = self.filter_manager.get_config_for_directory(self.watched_dir.path)
+
+        await self.pipeline.process_directory(self.watched_dir.path, filter_config=filter_config)
     
     async def start(self):
         logger.info(sm("Starting watchdog observer", watched_dir=self.watched_dir))
@@ -78,6 +97,30 @@ class WatcherJob:
         if self.observer is not None:
             self.observer.unschedule_all()
         
+    def _should_include_file(self, file_path: Path) -> bool:
+        """Check if file should be included based on filter config."""
+        if self.filter_manager is None:
+            return True
+
+        base_path = self.watched_dir.path
+        return self.filter_manager.should_include_file(file_path, base_path)
+
+    def _is_config_file(self, file_path: Path) -> bool:
+        """Check if the file is a .cosmaconfig file."""
+        return file_path.name == LOCAL_CONFIG_FILENAME
+
+    def _handle_config_change(self, file_path: Path):
+        """Handle changes to .cosmaconfig file."""
+        if self.filter_manager is None:
+            return
+
+        # Check if this is the config file for our watched directory
+        if file_path.parent == self.watched_dir.path:
+            logger.info(sm("Config file changed, reloading filter config",
+                          config_path=str(file_path),
+                          watched_dir=str(self.watched_dir.path)))
+            self.filter_manager.reload_directory(self.watched_dir.path)
+
     async def consumer_task(self):
         while not self.closed:
             event = await self.queue.get()
@@ -118,77 +161,162 @@ class WatcherJob:
                 elif isinstance(event, FileDeletedEvent):
                     logger.info(sm("File deleted", path=event.src_path))
                     path = Path(str(event.src_path)).resolve()
-                    
+
+                    # Check if config file was deleted
+                    if self._is_config_file(path):
+                        self._handle_config_change(path)
+
                     self._publish_update(Update.file_deleted(str(path)))
                     await self.db.delete_file(str(path))
-                    
+
                 elif isinstance(event, FileMovedEvent):
                     # Handle moved files as delete old + create new
                     logger.info(sm("File moved", src=event.src_path, dest=event.dest_path))
                     src_path = Path(str(event.src_path)).resolve()
                     dest_path = Path(str(event.dest_path)).resolve()
-                    
+
                     self._publish_update(Update.file_moved(str(src_path), str(dest_path)))
                     await self.db.delete_file(str(src_path))
-                    
+
+                    # Check if config file was moved
+                    if self._is_config_file(dest_path):
+                        self._handle_config_change(dest_path)
+                        continue  # Don't index config files
+
+                    # Check filter before processing destination
+                    if not self._should_include_file(dest_path):
+                        logger.debug(sm("Skipping excluded file", path=str(dest_path)))
+                        continue
+
                     # Check if destination file type is supported before processing
                     dest_file = File.from_path(dest_path)
                     if await self.pipeline.is_supported(dest_file):
                         await self.pipeline.process_file(dest_file)
                     else:
                         logger.debug(sm("Skipping unsupported file type", path=str(dest_path)))
-                    
+
                 elif isinstance(event, (FileCreatedEvent, FileModifiedEvent)):
                     # Handle created and modified files the same way - process them
                     event_type = "created" if isinstance(event, FileCreatedEvent) else "modified"
                     logger.info(sm(f"File {event_type}", path=event.src_path))
                     path = Path(str(event.src_path)).resolve()
-                    
+
+                    # Check if config file changed
+                    if self._is_config_file(path):
+                        self._handle_config_change(path)
+                        continue  # Don't index config files
+
+                    # Check filter before processing
+                    if not self._should_include_file(path):
+                        logger.debug(sm("Skipping excluded file", path=str(path)))
+                        continue
+
                     # Publish file system event update
                     if isinstance(event, FileCreatedEvent):
                         self._publish_update(Update.file_created(str(path)))
                     else:
                         self._publish_update(Update.file_modified(str(path)))
-                    
+
                     # Check if file type is supported before processing
                     file = File.from_path(path)
                     if await self.pipeline.is_supported(file):
                         await self.pipeline.process_file(file)
                     else:
                         logger.debug(sm("Skipping unsupported file type", path=str(path)))
-                    
+
                 else:
                     logger.warning(sm("Unknown event type", event_type=type(event).__name__, path=event.src_path))
-                    
+
             except Exception as e:
                 logger.error(sm("Error processing file system event", event_type=type(event).__name__, path=event.src_path, error=e))
     
 
 class Watcher:
     jobs: set[WatcherJob]
-    
+    filter_manager: Optional["FilterConfigManager"]
+
     def __init__(
         self,
         db: Database,
         pipeline: Pipeline,
         updates_hub: Optional[Hub] = None,
+        filter_manager: Optional["FilterConfigManager"] = None,
     ):
         self.db = db
         self.pipeline = pipeline
         self.updates_hub = updates_hub
-        
+        self.filter_manager = filter_manager
+
         self.jobs = set()
 
     async def create_job(self, watched_dir: WatchedDirectory):
         """
         Create and start a watcher job for a watched directory.
-        
+
         Args:
             watched_dir: WatchedDirectory instance to watch
         """
-        job = WatcherJob(watched_dir, self.pipeline, self.db)
+        job = WatcherJob(watched_dir, self.pipeline, self.db, self.filter_manager)
         self.jobs.add(job)
         await job.start()
+
+    async def stop_watching(self, path: Path | str) -> bool:
+        """
+        Stop watching a directory.
+
+        Args:
+            path: Path to the directory to stop watching
+
+        Returns:
+            True if a job was found and stopped, False otherwise
+        """
+        path = Path(path).resolve()
+
+        # Find the job for this path
+        job_to_stop = None
+        for job in self.jobs:
+            if job.watched_dir.path == path:
+                job_to_stop = job
+                break
+
+        if job_to_stop is None:
+            logger.warning(sm("No watcher job found for path", path=str(path)))
+            return False
+
+        # Stop the job
+        await job_to_stop.stop()
+        self.jobs.discard(job_to_stop)
+
+        logger.info(sm("Stopped watching directory", path=str(path)))
+        return True
+
+    async def stop_watching_by_id(self, job_id: int) -> bool:
+        """
+        Stop watching a directory by its database ID.
+
+        Args:
+            job_id: Database ID of the watched directory
+
+        Returns:
+            True if a job was found and stopped, False otherwise
+        """
+        # Find the job for this ID
+        job_to_stop = None
+        for job in self.jobs:
+            if job.watched_dir.id == job_id:
+                job_to_stop = job
+                break
+
+        if job_to_stop is None:
+            logger.warning(sm("No watcher job found for ID", job_id=job_id))
+            return False
+
+        # Stop the job
+        await job_to_stop.stop()
+        self.jobs.discard(job_to_stop)
+
+        logger.info(sm("Stopped watching directory by ID", job_id=job_id, path=str(job_to_stop.watched_dir.path)))
+        return True
 
     async def start_watching(self, path: str | Path, recursive: bool = True, file_pattern: Optional[str] = None):
         """

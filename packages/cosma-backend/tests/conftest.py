@@ -109,30 +109,22 @@ def sample_file_data() -> dict:
 
 @pytest_asyncio.fixture
 async def app_instance() -> AsyncGenerator[App, None]:
-    """Create a test instance of the Quart app."""
-    from quart_schema import QuartSchema
-    
-    app = App(__name__)
-    app.initialize_config()
-    
+    """Create a test instance of the Quart app using the real app with routes."""
+    # Import the actual app from app.py which has all routes registered
+    from cosma_backend.app import app as real_app
+
     # Override config for testing
-    app.config["TESTING"] = True
-    app.config["DATABASE_PATH"] = ":memory:"  # Will be overridden in test
-    
-    QuartSchema(app)
-    
-    yield app
+    real_app.config["TESTING"] = True
+    real_app.config["DATABASE_PATH"] = ":memory:"
+
+    yield real_app
 
 
 @pytest_asyncio.fixture
 async def test_client(app_instance: App, temp_db: Database) -> AsyncGenerator[App, None]:
     """Create a test client with a temporary database."""
     app_instance.db = temp_db
-    
-    # Register API blueprints
-    from cosma_backend.api import api_blueprint
-    app_instance.register_blueprint(api_blueprint, url_prefix='/api')
-    
+
     yield app_instance
 
 

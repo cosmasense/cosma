@@ -12,6 +12,7 @@ resolution-markers = [
 members = [
     "cosma",
     "cosma-backend",
+    "cosma-client",
     "cosma-tui",
 ]
 
@@ -407,11 +408,23 @@ wheels = [
 
 [[package]]
 name = "cosma"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "click-help-colors" },
+    { name = "cosma-client" },
+    { name = "rich" },
+]
+
+[package.optional-dependencies]
+all = [
     { name = "cosma-backend" },
+    { name = "cosma-tui" },
+]
+backend = [
+    { name = "cosma-backend" },
+]
+tui = [
     { name = "cosma-tui" },
 ]
 
@@ -424,9 +437,14 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click-help-colors", specifier = ">=0.9.4" },
-    { name = "cosma-backend", editable = "packages/cosma-backend" },
-    { name = "cosma-tui", editable = "packages/cosma-tui" },
+    { name = "cosma-backend", marker = "extra == 'all'", editable = "packages/cosma-backend" },
+    { name = "cosma-backend", marker = "extra == 'backend'", editable = "packages/cosma-backend" },
+    { name = "cosma-client", editable = "packages/cosma-client" },
+    { name = "cosma-tui", marker = "extra == 'all'", editable = "packages/cosma-tui" },
+    { name = "cosma-tui", marker = "extra == 'tui'", editable = "packages/cosma-tui" },
+    { name = "rich", specifier = ">=14.0.0" },
 ]
+provides-extras = ["tui", "backend", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -436,7 +454,7 @@ dev = [
 
 [[package]]
 name = "cosma-backend"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "packages/cosma-backend" }
 dependencies = [
     { name = "asqlite" },
@@ -478,7 +496,7 @@ requires-dist = [
     { name = "asqlite", specifier = ">=2.0.0" },
     { name = "litellm", specifier = ">=1.77.5" },
     { name = "llama-cpp-python", marker = "extra == 'llamacpp'", git = "https://github.com/JamePeng/llama-cpp-python" },
-    { name = "markitdown", extras = ["docx", "pdf", "pptx"], specifier = ">=0.1.3" },
+    { name = "markitdown", extras = ["docx", "pdf", "pptx"], specifier = ">=0.1.4" },
     { name = "ollama", specifier = ">=0.6.0" },
     { name = "platformdirs", specifier = ">=4.5.0" },
     { name = "quart", specifier = ">=0.20.0" },
@@ -507,11 +525,22 @@ test = [
 ]
 
 [[package]]
-name = "cosma-tui"
+name = "cosma-client"
 version = "0.1.0"
-source = { editable = "packages/cosma-tui" }
+source = { editable = "packages/cosma-client" }
 dependencies = [
     { name = "niquests" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "niquests", specifier = ">=3.15.2" }]
+
+[[package]]
+name = "cosma-tui"
+version = "0.2.0"
+source = { editable = "packages/cosma-tui" }
+dependencies = [
+    { name = "cosma-client" },
     { name = "platformdirs" },
     { name = "textual" },
 ]
@@ -524,7 +553,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "niquests", specifier = ">=3.15.2" },
+    { name = "cosma-client", editable = "packages/cosma-client" },
     { name = "platformdirs", specifier = ">=4.4.0" },
     { name = "textual", specifier = ">=6.1.0" },
 ]
@@ -1442,7 +1471,7 @@ wheels = [
 
 [[package]]
 name = "markitdown"
-version = "0.1.3"
+version = "0.1.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -1453,9 +1482,9 @@ dependencies = [
     { name = "onnxruntime", marker = "sys_platform == 'win32'" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/87/31/90cef2bc8ecd85c200ed3b3d1e20fc7a724213502685c4b05b5431e02668/markitdown-0.1.3.tar.gz", hash = "sha256:b0d9127c3373a68274dede6af6c9bb0684b78ce364c727c4c304da97a20d6fd9", size = 40039, upload-time = "2025-08-26T22:37:04.4Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f3/4d/06567465c1886c2ea47bac24eab0c96bb6b4ecea47224323409dc9cbb614/markitdown-0.1.4.tar.gz", hash = "sha256:e72a481d1a50c82ff744e85e3289f79a940c5d0ad5ffa2b37c33de814c195bb1", size = 39951, upload-time = "2025-12-01T18:20:30.937Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/97/83/7b47d2ecbf58650a03aeeb21ba2d59175f202bf4fb81d44f40f1deb82bc0/markitdown-0.1.3-py3-none-any.whl", hash = "sha256:08d9a25770979d78f60dcc0afcb868de6799608e4db65342b2e03304fb091251", size = 58391, upload-time = "2025-08-26T22:37:02.924Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/b3/6138d2b23d5b534b0fa3736987a2e11bcef5419cbc9286c8afd229d21558/markitdown-0.1.4-py3-none-any.whl", hash = "sha256:d7f3805716b22545f693d355e28e89584226c0614b3b80b7c4a3f825f068492d", size = 58314, upload-time = "2025-12-01T18:20:32.345Z" },
 ]
 
 [package.optional-dependencies]
