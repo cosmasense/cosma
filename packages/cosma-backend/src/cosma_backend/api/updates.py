@@ -6,14 +6,13 @@ Handles endpoints related to streaming updates.
 
 import asyncio
 from dataclasses import dataclass
-import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from quart import Blueprint, abort, current_app, make_response, request, stream_with_context
 from quart_schema import validate_request, validate_response
 
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models.update import UpdateOpcode
 from cosma_backend.utils.pubsub import subscribe
 from cosma_backend.utils.sse import ServerSentEvent, sse_comment
@@ -23,7 +22,7 @@ if TYPE_CHECKING:
 
 updates_bp = Blueprint('updates', __name__)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @updates_bp.get("/")  # type: ignore[return-value]

@@ -3,9 +3,9 @@ from datetime import datetime
 from pathlib import Path
 import sqlite3
 from typing import Any, Optional, Self
-import logging
+from cosma_backend.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass

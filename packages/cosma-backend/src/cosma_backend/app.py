@@ -1,12 +1,10 @@
 import asyncio
 import datetime
 from dataclasses import dataclass
-import logging
 from pathlib import Path
 from typing import Coroutine
 
 from dotenv import load_dotenv
-from rich.logging import RichHandler
 from platformdirs import PlatformDirs, user_config_dir
 from quart import Quart, request
 from quart_schema import QuartSchema, validate_request, validate_response
@@ -14,7 +12,7 @@ from quart_schema import QuartSchema, validate_request, validate_response
 from cosma_backend import db
 from cosma_backend.api import api_blueprint
 from cosma_backend.db.database import Database
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger, configure_logging
 from cosma_backend.models.update import Update
 from cosma_backend.utils.pubsub import Hub
 from cosma_backend.pipeline import Pipeline
@@ -28,12 +26,8 @@ from cosma_backend.filter import FilterConfigManager
 
 load_dotenv()
 
-FORMAT = "%(message)s"
-logging.basicConfig(
-    level="INFO", format=FORMAT, datefmt="[%X]", handlers=[RichHandler()]
-)
-
-logger = logging.getLogger(__name__)
+configure_logging()
+logger = get_logger(__name__)
 
 class App(Quart):
     db: Database
@@ -114,7 +108,7 @@ class App(Quart):
                 except ValueError:
                     pass  # Keep default if conversion fails
         
-        logger.debug(sm("Config loaded", config=self.config))
+        logger.debug("Config loaded", config=self.config)
         
     def submit_job(self, coro: Coroutine) -> asyncio.Task:
         def remove_task_callback(task: asyncio.Task):
@@ -136,19 +130,19 @@ app.register_blueprint(api_blueprint, url_prefix='/api')
 
 @app.before_serving
 async def initialize_services():
-    logger.info(sm("Initializing database"))
+    logger.info("Initializing database")
     app.db = await db.connect(app.config['DATABASE_PATH'])
 
-    logger.info(sm("Initializing filter configuration"))
+    logger.info("Initializing filter configuration")
     # Load global filter config (creates default if not exists)
     global_config = app.filter_manager.global_config
-    logger.info(sm("Filter config loaded",
+    logger.info("Filter config loaded",
                   mode=global_config.mode.value,
                   exclude_count=len(global_config.exclude),
                   include_count=len(global_config.include),
-                  config_path=str(global_config.config_path)))
+                  config_path=str(global_config.config_path))
 
-    logger.info(sm("Initializing services"))
+    logger.info("Initializing services")
     discoverer = Discoverer()
     parser = FileParser(config=app.config)
     summarizer = AutoSummarizer(config=app.config)
@@ -175,14 +169,14 @@ async def initialize_services():
     )
 
     # Run startup cleanup to remove excluded files from database
-    logger.info(sm("Running startup cleanup for excluded files"))
+    logger.info("Running startup cleanup for excluded files")
     removed_count = await cleanup_excluded_files_on_startup(app.db, app.filter_manager)
     if removed_count > 0:
-        logger.info(sm("Startup cleanup complete", removed_files=removed_count))
+        logger.info("Startup cleanup complete", removed_files=removed_count)
 
     await app.watcher.initialize_from_database()
 
-    logger.info(sm("Initialized services"))
+    logger.info("Initialized services")
 
 
 async def cleanup_excluded_files_on_startup(db: Database, filter_manager: FilterConfigManager) -> int:
@@ -215,8 +209,8 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
             if not is_under_watched:
                 await conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
                 removed_count += 1
-                logger.info(sm("Removed orphaned file from index (not under any watched directory)",
-                              file_path=file_path))
+                logger.info("Removed orphaned file from index (not under any watched directory)",
+                              file_path=file_path)
 
     if not watched_dirs:
         return removed_count
@@ -240,40 +234,40 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
                     # File should be excluded, delete it
                     await conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
                     removed_count += 1
-                    logger.info(sm("Removed excluded file from index",
-                                  file_path=str(file_path)))
+                    logger.info("Removed excluded file from index",
+                                  file_path=str(file_path))
 
     return removed_count
 
 
 @app.after_serving
 async def handle_shutdown():
-    logger.info(sm("Closing DB"))
+    logger.info("Closing DB")
     await app.db.close()
     
 
 @app.before_request
 async def log_request():
     request.start_time = datetime.datetime.now()
-    logger.info(sm(
+    logger.info(
         "Incoming request",
         method=request.method,
         path=request.path,
         remote_addr=request.remote_addr,
         user_agent=request.headers.get('User-Agent')
-    ))
+    )
 
 @app.after_request
 async def log_response(response):
     if hasattr(request, 'start_time'):
         duration = (datetime.datetime.now() - request.start_time).total_seconds()
-        logger.info(sm(
+        logger.info(
             "Request completed",
             method=request.method,
             path=request.path,
             status_code=response.status_code,
             duration_seconds=duration
-        ))
+        )
     return response
 
 @app.post("/echo")

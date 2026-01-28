@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime
-import logging
 from sqlite3 import Row
 import struct
 from types import TracebackType
@@ -10,7 +9,7 @@ import asqlite
 import sqlite_vec
 import numpy as np
 
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.models.watch import WatchedDirectory
 from cosma_backend.utils.bundled import get_bundled_file_text
@@ -21,7 +20,7 @@ if TYPE_CHECKING:
 # The schema file is bundled with the distribution
 SCHEMA_FILE = "./schema.sql"
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def to_timestamp(dt: datetime.datetime | None):
@@ -236,7 +235,7 @@ class Database:
             model_name: Name of the model used
             dimensions: Actual dimensions of the embedding
         """
-        logger.debug(sm("Inserting embedding", file_id=file.id, model=file.embedding_model, dimensions=file.embedding_dimensions))
+        logger.debug("Inserting embedding", file_id=file.id, model=file.embedding_model, dimensions=file.embedding_dimensions)
 
         # Normalize embedding to 1536 dimensions for consistent storage
         normalized_embedding = self._normalize_embedding_dimensions(file.embedding)
@@ -279,7 +278,7 @@ class Database:
             #     (file.id, file.embedding_model, file.embedding_dimensions)
             # )
 
-            logger.info(sm("Embedding inserted successfully", file_id=file.id))
+            logger.info("Embedding inserted successfully", file_id=file.id)
             
     async def search_similar_files(self, query_embedding: np.ndarray, limit: int = 10, threshold: float | None = None, directory: str | None = None) -> list[tuple[File, float]]:
         """
@@ -294,7 +293,7 @@ class Database:
         Returns:
             List of tuples (FileMetadata, distance)
         """
-        logger.debug(sm("Searching similar files", limit=limit, threshold=threshold, directory=directory))
+        logger.debug("Searching similar files", limit=limit, threshold=threshold, directory=directory)
 
         # Normalize and serialize query embedding
         normalized_embedding = self._normalize_embedding_dimensions(query_embedding)
@@ -338,7 +337,7 @@ class Database:
                 distance = row["distance"]
                 results.append((file, distance))
 
-            logger.info(sm("Found similar files", count=len(results)))
+            logger.info("Found similar files", count=len(results))
             return results
 
     async def get_file_embedding(self, file_id: str) -> tuple[np.ndarray, str, int] | None:
@@ -397,7 +396,7 @@ class Database:
             if rows_affected > 0:
                 # Also delete metadata
                 # await conn.execute("DELETE FROM embedding_metadata WHERE file_id = ?", (file_id,))
-                logger.info(sm("Embedding deleted", file_id=file_id))
+                logger.info("Embedding deleted", file_id=file_id)
                 return True
 
             return False
@@ -441,7 +440,7 @@ class Database:
             rows = await conn.fetchall(SQL, (directory_path, directory_path))
 
             deleted_files = [File.from_row(row) for row in rows]
-            logger.info(sm("Deleted files in directory", directory=directory_path, count=len(deleted_files)))
+            logger.info("Deleted files in directory", directory=directory_path, count=len(deleted_files))
             return deleted_files
 
     async def add_watched_directory(self, watched_dir: WatchedDirectory) -> int:
@@ -473,7 +472,7 @@ class Database:
             )) as cursor:
                 row = await cursor.fetchone()
                 watched_dir.id = row[0]
-                logger.info(sm("Watched directory added", path=watched_dir.path_str, id=watched_dir.id, recursive=watched_dir.recursive))
+                logger.info("Watched directory added", path=watched_dir.path_str, id=watched_dir.id, recursive=watched_dir.recursive)
                 return watched_dir.id
 
     async def get_watched_directories(self, active_only: bool = True) -> list[WatchedDirectory]:
@@ -504,7 +503,7 @@ class Database:
                 watched_dir = WatchedDirectory.from_row(row)
                 directories.append(watched_dir)
             
-            logger.info(sm("Retrieved watched directories", count=len(directories), active_only=active_only))
+            logger.info("Retrieved watched directories", count=len(directories), active_only=active_only)
             return directories
 
     async def delete_watched_directory(self, job_id: int) -> WatchedDirectory | None:
@@ -523,7 +522,7 @@ class Database:
             row = await conn.fetchone(get_dir_sql, (job_id,))
             
             if not row:
-                logger.warning(sm("Watched directory not found for deletion", job_id=job_id))
+                logger.warning("Watched directory not found for deletion", job_id=job_id)
                 return None
             
             watched_dir = WatchedDirectory.from_row(row)
@@ -542,12 +541,12 @@ class Database:
             delete_dir_sql = "DELETE FROM watched_directories WHERE id = ?"
             await conn.execute(delete_dir_sql, (job_id,))
             
-            logger.info(sm(
+            logger.info(
                 "Watched directory and associated files deleted", 
                 job_id=job_id, 
                 path=directory_path,
                 files_deleted=len(deleted_files)
-            ))
+            )
             
             return watched_dir
 
@@ -571,7 +570,7 @@ class Database:
         if not sanitized_query:
             return []
 
-        logger.debug(sm("Performing keyword search", query=sanitized_query, limit=limit, directory=directory))
+        logger.debug("Performing keyword search", query=sanitized_query, limit=limit, directory=directory)
 
         # FTS5 query with BM25 ranking
         # You can use advanced syntax like: "housing AND (apartment OR lease)"
@@ -603,7 +602,7 @@ class Database:
                 async with conn.execute(SQL, tuple(params)) as cursor:
                     rows = await cursor.fetchall()
             except Exception as e:
-                logger.error(sm("SQL query failed", error=str(e), query=sanitized_query))
+                logger.error("SQL query failed", error=str(e), query=sanitized_query)
                 raise
 
             results = []
@@ -614,7 +613,7 @@ class Database:
                 relevance_score = abs(row["relevance_score"])
                 results.append((file, relevance_score))
 
-            logger.info(sm("Keyword search completed", count=len(results)))
+            logger.info("Keyword search completed", count=len(results))
             return results
 
     async def get_fts5_suggestions(self, prefix: str, limit: int = 10) -> list[str]:
@@ -635,7 +634,7 @@ class Database:
         if not fts5_query:
             return []
 
-        logger.debug(sm("Getting FTS5 suggestions", prefix=prefix, fts5_query=fts5_query))
+        logger.debug("Getting FTS5 suggestions", prefix=prefix, fts5_query=fts5_query)
 
         SQL = """
         SELECT DISTINCT f.filename, f.title
@@ -650,7 +649,7 @@ class Database:
             try:
                 rows = await conn.fetchall(SQL, (fts5_query, limit * 2))
             except Exception as e:
-                logger.warning(sm("FTS5 suggestions query failed", error=str(e), prefix=prefix))
+                logger.warning("FTS5 suggestions query failed", error=str(e), prefix=prefix)
                 return []
 
             suggestions = []
@@ -675,7 +674,7 @@ class Database:
             # Deduplicate and limit
             unique_suggestions = list(dict.fromkeys(suggestions))[:limit]
 
-            logger.debug(sm("Generated FTS5 suggestions", count=len(unique_suggestions)))
+            logger.debug("Generated FTS5 suggestions", count=len(unique_suggestions))
             return unique_suggestions
 
     async def update_file_timestamp(self, file_path: str) -> bool:
@@ -696,7 +695,7 @@ class Database:
             rows_affected = cursor.get_cursor().rowcount
             
             if rows_affected > 0:
-                logger.debug(sm("File timestamp updated", file_path=file_path))
+                logger.debug("File timestamp updated", file_path=file_path)
                 return True
             
             return False
@@ -720,7 +719,7 @@ class Database:
             SQL_DELETE = "DELETE FROM files WHERE updated_at < ? AND (file_path LIKE ? OR file_path = ?) RETURNING *"
             rows = await conn.fetchall(SQL_DELETE, (to_timestamp(timestamp), directory_pattern, directory_path))
             
-            logger.info(sm("Deleted stale files", count=len(rows), timestamp=timestamp, directory=directory_path))
+            logger.info("Deleted stale files", count=len(rows), timestamp=timestamp, directory=directory_path)
             return rows
 
 

@@ -2,10 +2,10 @@
 
 import asyncio
 from contextlib import contextmanager
-import logging
+from cosma_backend.logging import get_logger
 from typing import TypeVar, Generic
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 T = TypeVar('T')
 

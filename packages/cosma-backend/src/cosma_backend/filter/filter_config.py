@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -18,9 +17,9 @@ from typing import Optional
 
 from platformdirs import PlatformDirs
 
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Config file names
 GLOBAL_CONFIG_FILENAME = "filter.json"  # Global config in app data dir
@@ -346,14 +345,14 @@ class FilterConfig:
         try:
             mode = FilterMode(mode_str)
         except ValueError:
-            logger.warning(sm("Invalid filter mode, defaulting to blacklist", mode=mode_str))
+            logger.warning("Invalid filter mode, defaulting to blacklist", mode=mode_str)
             mode = FilterMode.BLACKLIST
 
         version = data.get("version", 1)
 
         # Migration from version 1 to version 2
         if version == 1:
-            logger.info(sm("Migrating filter config from v1 to v2", path=str(config_path) if config_path else "unknown"))
+            logger.info("Migrating filter config from v1 to v2", path=str(config_path) if config_path else "unknown")
 
             # In v1, we only had exclude/include without mode-specific storage
             # Migrate based on current mode
@@ -421,7 +420,7 @@ class FilterConfig:
             data = json.loads(json_str)
             return cls.from_dict(data, config_path)
         except json.JSONDecodeError as e:
-            logger.error(sm("Failed to parse filter config JSON", error=str(e)))
+            logger.error("Failed to parse filter config JSON", error=str(e))
             raise ValueError(f"Invalid JSON in filter config: {e}")
 
     @classmethod
@@ -436,17 +435,17 @@ class FilterConfig:
             FilterConfig if file exists and is valid, None otherwise
         """
         if not path.exists():
-            logger.debug(sm("Config file not found", path=str(path)))
+            logger.debug("Config file not found", path=str(path))
             return None
 
         try:
             content = path.read_text(encoding="utf-8")
             config = cls.from_json(content, config_path=path)
-            logger.info(sm("Loaded filter config", path=str(path), mode=config.mode.value,
-                          exclude_count=len(config.exclude), include_count=len(config.include)))
+            logger.info("Loaded filter config", path=str(path), mode=config.mode.value,
+                          exclude_count=len(config.exclude), include_count=len(config.include))
             return config
         except Exception as e:
-            logger.error(sm("Failed to load filter config", path=str(path), error=str(e)))
+            logger.error("Failed to load filter config", path=str(path), error=str(e))
             return None
 
     def save_to_file(self, path: Optional[Path] = None) -> bool:
@@ -461,7 +460,7 @@ class FilterConfig:
         """
         save_path = path or self.config_path
         if save_path is None:
-            logger.error(sm("No path specified for saving filter config"))
+            logger.error("No path specified for saving filter config")
             return False
 
         try:
@@ -470,10 +469,10 @@ class FilterConfig:
 
             save_path.write_text(self.to_json(), encoding="utf-8")
             self.config_path = save_path
-            logger.info(sm("Saved filter config", path=str(save_path)))
+            logger.info("Saved filter config", path=str(save_path))
             return True
         except Exception as e:
-            logger.error(sm("Failed to save filter config", path=str(save_path), error=str(e)))
+            logger.error("Failed to save filter config", path=str(save_path), error=str(e))
             return False
 
     @classmethod
@@ -502,7 +501,7 @@ class FilterConfig:
             return config
 
         # Create default config with sensible defaults for both modes
-        logger.info(sm("Creating default global filter config", path=str(global_path)))
+        logger.info("Creating default global filter config", path=str(global_path))
 
         # Default whitelist patterns (common document and media types)
         default_whitelist_include = [
@@ -571,7 +570,7 @@ class FilterConfig:
 
         if folder_config is None:
             # No per-folder config, use global
-            logger.debug(sm("Using global config for directory", directory=str(directory)))
+            logger.debug("Using global config for directory", directory=str(directory))
             return global_config
 
         # Merge configs: per-folder extends global
@@ -595,11 +594,11 @@ class FilterConfig:
             config_path=folder_config_path,
         )
 
-        logger.info(sm("Merged filter config for directory",
+        logger.info("Merged filter config for directory",
                       directory=str(directory),
                       mode=merged.mode.value,
                       exclude_count=len(merged.exclude),
-                      include_count=len(merged.include)))
+                      include_count=len(merged.include))
 
         return merged
 

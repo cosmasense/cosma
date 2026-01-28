@@ -8,16 +8,15 @@
 """
 
 import asyncio
-import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import Any, Optional, Dict
 
-from ..logging import sm
+from ..logging import get_logger
 
 # Configure structured logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def extract_audio_transcript(path: Path, config: Optional[Dict[str, Any]] = None, backend: str | None = None) -> str | None:
@@ -43,13 +42,13 @@ async def extract_audio_transcript(path: Path, config: Optional[Dict[str, Any]] 
     backend = backend_map.get(provider, "openai")
     
     if not path.exists():
-        logger.warning(sm("Audio file not found", path=str(path)))
+        logger.warning("Audio file not found", path=str(path))
         return None
         
-    logger.info(sm("Extracting audio transcript", 
+    logger.info("Extracting audio transcript", 
                path=str(path), 
                backend=backend,
-               size=path.stat().st_size))
+               size=path.stat().st_size)
     
     try:
         if backend == "openai":
@@ -57,14 +56,14 @@ async def extract_audio_transcript(path: Path, config: Optional[Dict[str, Any]] 
         elif backend == "local":
             return await _transcribe_with_local_whisper(path)
         else:
-            logger.error(sm("Unknown Whisper backend", backend=backend))
+            logger.error("Unknown Whisper backend", backend=backend)
             return None
             
     except Exception as e:
-        logger.exception(sm("Audio transcription failed", 
+        logger.exception("Audio transcription failed", 
                         path=str(path), 
                         backend=backend,
-                        error=str(e)))
+                        error=str(e))
         return None
 
 
@@ -80,12 +79,12 @@ async def extract_video_transcript(path: Path, backend: str | None = None) -> st
         Transcript text or None if extraction failed
     """
     if not path.exists():
-        logger.warning(sm("Video file not found", path=str(path)))
+        logger.warning("Video file not found", path=str(path))
         return None
         
-    logger.info(sm("Extracting video transcript", 
+    logger.info("Extracting video transcript", 
                path=str(path), 
-               backend=backend))
+               backend=backend)
     
     try:
         # Extract audio from video using ffmpeg
@@ -102,9 +101,9 @@ async def extract_video_transcript(path: Path, backend: str | None = None) -> st
         return transcript
         
     except Exception as e:
-        logger.exception(sm("Video transcription failed", 
+        logger.exception("Video transcription failed", 
                         path=str(path), 
-                        error=str(e)))
+                        error=str(e))
         return None
 
 
@@ -120,7 +119,7 @@ async def extract_image_info(path: Path) -> dict[str, Any] | None:
         Dictionary with basic image info or None if failed
     """
     if not path.exists():
-        logger.warning(sm("Image file not found", path=str(path)))
+        logger.warning("Image file not found", path=str(path))
         return None
     
     try:
@@ -134,9 +133,9 @@ async def extract_image_info(path: Path) -> dict[str, Any] | None:
             with Image.open(path) as img:
                 dimensions = {"width": img.width, "height": img.height, "mode": img.mode}
         except ImportError:
-            logger.debug(sm("PIL not available, skipping image dimension extraction"))
+            logger.debug("PIL not available, skipping image dimension extraction")
         except Exception as e:
-            logger.debug(sm("Failed to extract image dimensions", error=str(e)))
+            logger.debug("Failed to extract image dimensions", error=str(e))
         
         info = {
             "file_size": file_stats.st_size,
@@ -144,16 +143,16 @@ async def extract_image_info(path: Path) -> dict[str, Any] | None:
             "dimensions": dimensions
         }
         
-        logger.info(sm("Image info extracted", 
+        logger.info("Image info extracted", 
                    path=str(path),
-                   **info))
+                   **info)
         
         return info
             
     except Exception as e:
-        logger.exception(sm("Image info extraction failed", 
+        logger.exception("Image info extraction failed", 
                         path=str(path),
-                        error=str(e)))
+                        error=str(e))
         return None
 
 
@@ -169,7 +168,7 @@ async def _transcribe_with_openai(audio_path: Path, config: Optional[Dict[str, A
         # Get API key
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            logger.error(sm("OpenAI API key not configured"))
+            logger.error("OpenAI API key not configured")
             return None
             
         client = openai.OpenAI(api_key=api_key)
@@ -179,9 +178,9 @@ async def _transcribe_with_openai(audio_path: Path, config: Optional[Dict[str, A
         max_size = 25 * 1024 * 1024  # 25MB
         
         if file_size > max_size:
-            logger.warning(sm("Audio file too large for OpenAI", 
+            logger.warning("Audio file too large for OpenAI", 
                           size=file_size, 
-                          max_size=max_size))
+                          max_size=max_size)
             # TODO: Could split large files into chunks
             return None
         
@@ -196,17 +195,17 @@ async def _transcribe_with_openai(audio_path: Path, config: Optional[Dict[str, A
                 response_format="text"
             )
         
-        logger.info(sm("OpenAI transcription completed", 
+        logger.info("OpenAI transcription completed", 
                    path=str(audio_path),
-                   length=len(transcript)))
+                   length=len(transcript))
         
         return transcript.strip() if transcript else None
         
     except ImportError:
-        logger.error(sm("OpenAI library not installed - install with: pip install openai"))
+        logger.error("OpenAI library not installed - install with: pip install openai")
         return None
     except Exception as e:
-        logger.exception(sm("OpenAI transcription error", error=str(e)))
+        logger.exception("OpenAI transcription error", error=str(e))
         return None
 
 
@@ -228,7 +227,7 @@ async def _transcribe_with_local_whisper(audio_path: Path) -> str | None:
             return await _transcribe_with_whisper_python(audio_path)
             
     except Exception as e:
-        logger.exception(sm("Local Whisper transcription error", error=str(e)))
+        logger.exception("Local Whisper transcription error", error=str(e))
         return None
 
 
@@ -254,24 +253,24 @@ async def _transcribe_with_whisper_cpp(audio_path: Path) -> str | None:
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            logger.warning(sm("whisper.cpp transcription timed out"))
+            logger.warning("whisper.cpp transcription timed out")
             return None
         
         if process.returncode == 0:
             transcript = stdout.decode().strip()
-            logger.info(sm("whisper.cpp transcription completed", 
+            logger.info("whisper.cpp transcription completed", 
                        model=model_name,
-                       length=len(transcript)))
+                       length=len(transcript))
             return transcript
         else:
-            logger.warning(sm("whisper.cpp failed", stderr=stderr.decode()))
+            logger.warning("whisper.cpp failed", stderr=stderr.decode())
             return None
             
     except FileNotFoundError:
-        logger.warning(sm("whisper.cpp not available or failed", error="Command not found"))
+        logger.warning("whisper.cpp not available or failed", error="Command not found")
         return None
     except Exception as e:
-        logger.warning(sm("whisper.cpp not available or failed", error=str(e)))
+        logger.warning("whisper.cpp not available or failed", error=str(e))
         return None
 
 
@@ -290,17 +289,17 @@ async def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
         result = await loop.run_in_executor(None, model.transcribe, str(audio_path))
         transcript = result["text"]
         
-        logger.info(sm("Whisper Python transcription completed", 
+        logger.info("Whisper Python transcription completed", 
                    model=model_name,
-                   length=len(transcript)))
+                   length=len(transcript))
         
         return transcript.strip()
         
     except ImportError:
-        logger.error(sm("Whisper library not installed - install with: pip install openai-whisper"))
+        logger.error("Whisper library not installed - install with: pip install openai-whisper")
         return None
     except Exception as e:
-        logger.exception(sm("Whisper Python error", error=str(e)))
+        logger.exception("Whisper Python error", error=str(e))
         return None
 
 
@@ -326,7 +325,7 @@ async def _extract_audio_from_video(video_path: Path) -> Path | None:
             raise subprocess.CalledProcessError(process.returncode, "ffmpeg")
         
     except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.error(sm("ffmpeg not available - required for video processing"))
+        logger.error("ffmpeg not available - required for video processing")
         return None
     
     try:
@@ -352,23 +351,23 @@ async def _extract_audio_from_video(video_path: Path) -> Path | None:
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            logger.warning(sm("ffmpeg audio extraction timed out"))
+            logger.warning("ffmpeg audio extraction timed out")
             return None
         
         if process.returncode == 0 and temp_audio.exists():
-            logger.info(sm("Audio extracted from video", 
+            logger.info("Audio extracted from video", 
                        video=str(video_path),
                        audio=str(temp_audio),
-                       size=temp_audio.stat().st_size))
+                       size=temp_audio.stat().st_size)
             return temp_audio
         else:
-            logger.warning(sm("Audio extraction failed", 
+            logger.warning("Audio extraction failed", 
                           video=str(video_path),
-                          stderr=stderr.decode()))
+                          stderr=stderr.decode())
             return None
             
     except Exception as e:
-        logger.exception(sm("ffmpeg audio extraction error", error=str(e)))
+        logger.exception("ffmpeg audio extraction error", error=str(e))
         return None
 
 
@@ -457,5 +456,5 @@ async def validate_media_backends() -> dict[str, bool]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         results["ffmpeg"] = False
     
-    logger.info(sm("Media backend availability", **results))
+    logger.info("Media backend availability", **results)
     return results

@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -8,7 +7,7 @@ from typing import Optional, Dict, Any
 
 from markitdown import MarkItDown
 
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models import File, ProcessingStatus
 from cosma_backend.parser.spotlight import spotlight_to_text
 from cosma_backend.parser.media import (
@@ -19,7 +18,7 @@ from cosma_backend.parser.media import (
 )
 
 # Configure structured logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class FileParser:
@@ -70,11 +69,11 @@ class FileParser:
                 "media_failed": 0
             }
             
-            logger.info(sm("FileParser initialized successfully",
+            logger.info("FileParser initialized successfully",
                           extraction_strategy=self.extraction_strategy,
-                          spotlight_enabled=self.spotlight_enabled))
+                          spotlight_enabled=self.spotlight_enabled)
         except Exception as e:
-            logger.exception(sm("Failed to initialize MarkItDown", error=str(e)))
+            logger.exception("Failed to initialize MarkItDown", error=str(e))
             raise
 
     def is_supported(self, file: File) -> bool:
@@ -127,29 +126,29 @@ class FileParser:
             ValueError: If the file format is not supported
             Exception: For other parsing errors
         """
-        logger.info(sm("Starting hybrid file parsing", 
+        logger.info("Starting hybrid file parsing", 
                        file_path=str(file.file_path), 
                        title=file.title,
-                       strategy=self.extraction_strategy))
+                       strategy=self.extraction_strategy)
         
         path = Path(file.file_path)
 
         # Validate file exists
         if not path.exists():
             error_msg = f"File not found: {file.file_path}"
-            logger.error(sm(error_msg))
+            logger.error(error_msg)
             raise FileNotFoundError(error_msg)
 
         # Check if format is supported
         if not self.is_supported(file):
             error_msg = f"Unsupported file format: {path.suffix}"
-            logger.error(sm(error_msg, extension=path.suffix))
+            logger.error(error_msg, extension=path.suffix)
             raise ValueError(error_msg)
             
         MB_50 = 50 * 1024 * 1024  # 50MB in bytes (52,428,800 bytes)
         if file.file_size > MB_50:
             error_msg = "File size too large (over 50MB)"
-            logger.error(sm(error_msg, size=file.file_size, max=MB_50))
+            logger.error(error_msg, size=file.file_size, max=MB_50)
             raise ValueError(error_msg)
 
 
@@ -169,15 +168,15 @@ class FileParser:
                 if extracted_content:
                     extraction_method = "spotlight"
                     self.extraction_stats["spotlight_success"] += 1
-                    logger.info(sm("EXTRACTION: Spotlight successful", 
+                    logger.info("EXTRACTION: Spotlight successful", 
                                    filename=path.name,
                                    method="spotlight", 
-                                   content_length=len(extracted_content)))
+                                   content_length=len(extracted_content))
                 else:
                     self.extraction_stats["spotlight_failed"] += 1
-                    logger.info(sm("EXTRACTION: Spotlight failed, falling back",
+                    logger.info("EXTRACTION: Spotlight failed, falling back",
                                    filename=path.name,
-                                   method="spotlight_failed"))
+                                   method="spotlight_failed")
 
             # Strategy 2: Try media processing for audio/video/image files
             if not extracted_content:
@@ -187,17 +186,17 @@ class FileParser:
                     if extracted_content:
                         extraction_method = f"media_{media_type}"
                         self.extraction_stats["media_success"] += 1
-                        logger.info(sm("EXTRACTION: Media successful",
+                        logger.info("EXTRACTION: Media successful",
                                        filename=path.name,
                                        media_type=media_type,
                                        method=f"media_{media_type}", 
-                                       content_length=len(extracted_content)))
+                                       content_length=len(extracted_content))
                     else:
                         self.extraction_stats["media_failed"] += 1
-                        logger.info(sm("EXTRACTION: Media failed",
+                        logger.info("EXTRACTION: Media failed",
                                        filename=path.name,
                                        media_type=media_type,
-                                       method=f"media_{media_type}_failed"))
+                                       method=f"media_{media_type}_failed")
 
             # Strategy 3: Fallback to MarkItDown
             if not extracted_content and self.extraction_strategy != "spotlight_only":
@@ -205,15 +204,15 @@ class FileParser:
                 if extracted_content:
                     extraction_method = "markitdown"
                     self.extraction_stats["markitdown_success"] += 1
-                    logger.info(sm("EXTRACTION: MarkItDown successful",
+                    logger.info("EXTRACTION: MarkItDown successful",
                                    filename=path.name,
                                    method="markitdown", 
-                                   content_length=len(extracted_content)))
+                                   content_length=len(extracted_content))
                 else:
                     self.extraction_stats["markitdown_failed"] += 1
-                    logger.info(sm("EXTRACTION: MarkItDown failed",
+                    logger.info("EXTRACTION: MarkItDown failed",
                                    filename=path.name,
-                                   method="markitdown_failed"))
+                                   method="markitdown_failed")
 
             # Process results
             if extracted_content and len(extracted_content.strip()) > 10:
@@ -226,23 +225,23 @@ class FileParser:
                 # Mark as successfully processed
                 file.status = ProcessingStatus.PARSED
 
-                logger.info(sm("File parsed successfully",
+                logger.info("File parsed successfully",
                                filename=file.filename,
                                content_length=len(extracted_content),
                                extraction_method=extraction_method,
-                               content_hash=content_hash[:12]))
+                               content_hash=content_hash[:12])
 
                 return file
             else:
                 error_msg = f"All extraction methods failed or returned empty content"
-                logger.warning(sm(error_msg, file_path=str(path)))
+                logger.warning(error_msg, file_path=str(path))
                 file.status = ProcessingStatus.FAILED
                 file.processing_error = error_msg
                 raise ValueError(error_msg)
 
         except Exception as e:
             error_msg = f"Failed to parse file: {e!s}"
-            logger.exception(sm(error_msg, file_path=str(path), error=str(e)))
+            logger.exception(error_msg, file_path=str(path), error=str(e))
 
             raise e
 
@@ -259,18 +258,18 @@ class FileParser:
         try:
             content = await spotlight_to_text(path, self.config)
             if content and len(content.strip()) > 50:  # Minimum content threshold
-                logger.debug(sm("Spotlight extraction successful", 
+                logger.debug("Spotlight extraction successful", 
                                 path=str(path), 
-                                length=len(content)))
+                                length=len(content))
                 return content
             else:
-                logger.debug(sm("Spotlight extraction returned insufficient content", 
-                                path=str(path)))
+                logger.debug("Spotlight extraction returned insufficient content", 
+                                path=str(path))
                 return None
         except Exception as e:
-            logger.debug(sm("Spotlight extraction failed", 
+            logger.debug("Spotlight extraction failed", 
                             path=str(path), 
-                            error=str(e)))
+                            error=str(e))
             return None
 
     async def _try_media_extraction(self, path: Path, media_type: str) -> str | None:
@@ -303,26 +302,26 @@ class FileParser:
                 else:
                     content = f"Image file: {path.name}"
             else:
-                logger.warning(sm("Unknown media type", media_type=media_type))
+                logger.warning("Unknown media type", media_type=media_type)
                 return None
                 
             if content and len(content.strip()) > 10:
-                logger.debug(sm("Media extraction successful", 
+                logger.debug("Media extraction successful", 
                                 path=str(path), 
                                 media_type=media_type,
-                                length=len(content)))
+                                length=len(content))
                 return content
             else:
-                logger.debug(sm("Media extraction returned insufficient content", 
+                logger.debug("Media extraction returned insufficient content", 
                                 path=str(path), 
-                                media_type=media_type))
+                                media_type=media_type)
                 return None
                 
         except Exception as e:
-            logger.debug(sm("Media extraction failed", 
+            logger.debug("Media extraction failed", 
                             path=str(path), 
                             media_type=media_type,
-                            error=str(e)))
+                            error=str(e))
             return None
 
     async def _try_markitdown_extraction(self, path: Path) -> str | None:
@@ -336,25 +335,25 @@ class FileParser:
             Extracted markdown content or None if failed
         """
         try:
-            logger.debug(sm("Trying MarkItDown extraction", path=str(path)))
+            logger.debug("Trying MarkItDown extraction", path=str(path))
             
             result = await asyncio.to_thread(self.markitdown.convert, str(path))
             
             if result and result.text_content:
                 content = result.text_content.strip()
                 if len(content) > 0:
-                    logger.debug(sm("MarkItDown extraction successful", 
+                    logger.debug("MarkItDown extraction successful", 
                                     path=str(path), 
-                                    length=len(content)))
+                                    length=len(content))
                     return content
                     
-            logger.debug(sm("MarkItDown extraction returned empty content", path=str(path)))
+            logger.debug("MarkItDown extraction returned empty content", path=str(path))
             return None
             
         except Exception as e:
-            logger.debug(sm("MarkItDown extraction failed", 
+            logger.debug("MarkItDown extraction failed", 
                             path=str(path), 
-                            error=str(e)))
+                            error=str(e))
             return None
 
     def set_extraction_strategy(self, strategy: str) -> None:
@@ -369,7 +368,7 @@ class FileParser:
             raise ValueError(f"Invalid strategy. Must be one of: {valid_strategies}")
             
         self.extraction_strategy = strategy
-        logger.info(sm("Extraction strategy updated", strategy=strategy))
+        logger.info("Extraction strategy updated", strategy=strategy)
 
     def get_extraction_stats(self) -> dict[str, int]:
         """
@@ -384,7 +383,7 @@ class FileParser:
         """Reset extraction statistics."""
         for key in self.extraction_stats:
             self.extraction_stats[key] = 0
-        logger.info(sm("Extraction statistics reset"))
+        logger.info("Extraction statistics reset")
 
 
 def get_supported_extensions() -> set[str]:

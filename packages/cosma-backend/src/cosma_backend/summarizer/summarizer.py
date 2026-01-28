@@ -13,7 +13,6 @@
 
 import base64
 import json
-import logging
 import os
 import re
 from abc import ABC, abstractmethod
@@ -27,10 +26,10 @@ import tiktoken
 
 from cosma_backend.models import ProcessingStatus
 from cosma_backend.models.file import File
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 
 # Configure standard logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def get_encoding_for_model(model: str) -> tiktoken.Encoding:
@@ -152,11 +151,11 @@ async def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50,
         sentence_tokens = await estimate_tokens(sentence, model, use_fast=True)
         
         if sentence_tokens > (max_tokens - safety_buffer):
-            logger.info(sm("Sentence too big", sentence_tokens=sentence_tokens, current_tokens=current_tokens, max=max_tokens - safety_buffer))
+            logger.info("Sentence too big", sentence_tokens=sentence_tokens, current_tokens=current_tokens, max=max_tokens - safety_buffer)
             continue
         
         if current_tokens + sentence_tokens > (max_tokens - safety_buffer) and current_chunk:
-            logger.info(sm("Chunk created", chunk=len(chunks) + 1, tokens=current_tokens))
+            logger.info("Chunk created", chunk=len(chunks) + 1, tokens=current_tokens)
             # Finalize current chunk and verify it's within limits
             chunk_text = '. '.join(current_chunk) + '.'
             
@@ -288,11 +287,11 @@ class BaseSummarizer(ABC):
     def _validate_content(self, file_metadata: File) -> bool:
         """Validate that the file metadata has content to summarize."""
         if not file_metadata.content:
-            logger.warning(sm("File content is empty, cannot summarize", filename=file_metadata.filename))
+            logger.warning("File content is empty, cannot summarize", filename=file_metadata.filename)
             return False
         
         if len(file_metadata.content.strip()) < 10:
-            logger.warning(sm("File content too short to summarize", filename=file_metadata.filename, length=len(file_metadata.content)))
+            logger.warning("File content too short to summarize", filename=file_metadata.filename, length=len(file_metadata.content))
             return False
         
         return True
@@ -327,14 +326,14 @@ class BaseSummarizer(ABC):
         
         # Content is too large, need to chunk
         if estimated_tokens >= 200_000:
-            logger.warning(sm("Content exceeds max token limit, will not summarize", estimated_tokens=estimated_tokens))
+            logger.warning("Content exceeds max token limit, will not summarize", estimated_tokens=estimated_tokens)
             raise RuntimeError("File too large to summarize")
         
-        logger.info(sm("Content exceeds token limit, chunking required", estimated_tokens=estimated_tokens, max_tokens=self.max_tokens))
+        logger.info("Content exceeds token limit, chunking required", estimated_tokens=estimated_tokens, max_tokens=self.max_tokens)
         
         # Use optimized chunking
         chunks = await chunk_content(content, self.max_tokens, self.chunk_overlap, self.model)
-        logger.info(sm("Content chunked (noverify)", num_chunks=len(chunks)))
+        logger.info("Content chunked (noverify)", num_chunks=len(chunks))
         
         # Use fast estimation for chunk statistics (sample a few chunks for accurate check)
         if len(chunks) <= 5:
@@ -342,7 +341,7 @@ class BaseSummarizer(ABC):
             accurate_chunk_tokens = [await estimate_tokens(chunk, self.model, use_fast=False) for chunk in chunks]
             avg_chunk_tokens = sum(accurate_chunk_tokens) // len(chunks)
             max_chunk_tokens = max(accurate_chunk_tokens)
-            logger.info(sm("Content chunked and verified", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_tokens=max_chunk_tokens))
+            logger.info("Content chunked and verified", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_tokens=max_chunk_tokens)
         else:
             # For many chunks, sample a few for accurate verification and use fast for rest
             sample_size = min(3, len(chunks))
@@ -351,10 +350,10 @@ class BaseSummarizer(ABC):
             fast_chunk_tokens = [await estimate_tokens(chunk, self.model, use_fast=True) for chunk in chunks]
             avg_chunk_tokens = sum(fast_chunk_tokens) // len(chunks)
             max_chunk_tokens = max(accurate_sample_tokens)
-            logger.info(sm("Content chunked", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_sample=max_chunk_tokens))
+            logger.info("Content chunked", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_sample=max_chunk_tokens)
             
         if len(chunks) > 5:
-            logger.warning(sm("More than 5 chunks, will not summarize", chunks=len(chunks)))
+            logger.warning("More than 5 chunks, will not summarize", chunks=len(chunks))
             raise RuntimeError("Too many chunks to summarize")
         
         return chunks
@@ -402,7 +401,7 @@ class BaseSummarizer(ABC):
         # Limit to reasonable number of keywords
         combined_keywords = unique_keywords[:15]
         
-        logger.info(sm("Combined chunk summaries", num_chunks=len(chunk_summaries), final_keywords=len(combined_keywords)))
+        logger.info("Combined chunk summaries", num_chunks=len(chunk_summaries), final_keywords=len(combined_keywords))
         
         return combined_summary, combined_keywords
     
@@ -432,13 +431,13 @@ class BaseSummarizer(ABC):
             keywords = [str(kw).strip() for kw in keywords if str(kw).strip()]
             
             if not summary:
-                logger.error(sm("Response did not contain a valid summary", response=response_content))
+                logger.error("Response did not contain a valid summary", response=response_content)
                 raise ValueError("Response did not contain a valid summary")
             
             return title, summary, keywords
             
         except json.JSONDecodeError as e:
-            logger.error(sm("Failed to parse AI response as JSON", response=response_content, error={str(e)}))
+            logger.error("Failed to parse AI response as JSON", response=response_content, error={str(e)})
             raise ValueError(f"Invalid JSON response: {str(e)}")
             
     def _get_system_prompt(self, include_title: bool = False):
@@ -469,7 +468,7 @@ class BaseSummarizer(ABC):
         if not self._validate_content(file_metadata):
             return file_metadata
         
-        logger.info(sm("Summarizing with Ollama", filename=file_metadata.filename, model=self.model))
+        logger.info("Summarizing with Ollama", filename=file_metadata.filename, model=self.model)
         
         try:
             # Prepare content chunks
@@ -481,11 +480,11 @@ class BaseSummarizer(ABC):
             
             # Process each chunk
             for i, chunk in enumerate(content_chunks):
-                logger.info(sm(f"Processing chunk {i+1}/{len(content_chunks)}", length=len(chunk), images=len(images)))                
+                logger.info(f"Processing chunk {i+1}/{len(content_chunks)}", length=len(chunk), images=len(images))                
                 response = await self._get_ai_response(chunk, i, images)
                 
                 if not response:
-                    logger.warning(sm("Empty response for chunk", chunk_num=i+1))
+                    logger.warning("Empty response for chunk", chunk_num=i+1)
                     continue
                 
                 try:
@@ -494,7 +493,7 @@ class BaseSummarizer(ABC):
                     if i == 0 and title:
                         resolved_title = title
                 except ValueError as e:
-                    logger.warning(sm("Failed to parse chunk response", chunk_num=i+1, error=str(e)))
+                    logger.warning("Failed to parse chunk response", chunk_num=i+1, error=str(e))
                     continue
             
             if not chunk_summaries:
@@ -509,17 +508,17 @@ class BaseSummarizer(ABC):
             file_metadata.keywords = final_keywords
             file_metadata.status = ProcessingStatus.SUMMARIZED
             
-            logger.info(sm("Successfully summarized", filename=file_metadata.filename, 
+            logger.info("Successfully summarized", filename=file_metadata.filename, 
                           summarizer=self.__class__.__name__,
                           title=resolved_title,
                           summary_length=len(final_summary), keyword_count=len(final_keywords), 
-                          chunks_processed=len(chunk_summaries)))
+                          chunks_processed=len(chunk_summaries))
             
             return file_metadata
             
         except Exception as e:
             error_msg = f"{self.__class__.__name__} summarization failed: {str(e)}"
-            logger.error(sm("Summarization failed", summarizer=self.__class__.__name__, filename=file_metadata.filename, model=self.model, error=str(e)))
+            logger.error("Summarization failed", summarizer=self.__class__.__name__, filename=file_metadata.filename, model=self.model, error=str(e))
             raise AIProviderError(error_msg)
 
 
@@ -556,9 +555,9 @@ class OllamaSummarizer(BaseSummarizer):
         
         try:
             self.client = ollama.AsyncClient(host=self.host)
-            logger.info(sm("Ollama summarizer initialized", host=self.host, model=self.model, max_tokens=self.max_tokens))
+            logger.info("Ollama summarizer initialized", host=self.host, model=self.model, max_tokens=self.max_tokens)
         except Exception as e:
-            logger.error(sm("Failed to initialize Ollama client", host=self.host, error=str(e)))
+            logger.error("Failed to initialize Ollama client", host=self.host, error=str(e))
             raise AIProviderError(f"Failed to initialize Ollama: {str(e)}")
     
     async def is_available(self) -> bool:
@@ -567,7 +566,7 @@ class OllamaSummarizer(BaseSummarizer):
             # Try to list models to check if Ollama is running
             list = await self.client.list()
             if self.model and self.model not in (m.model for m in list.models):
-                logger.info(sm("Ollama model not found, pulling", model=self.model))
+                logger.info("Ollama model not found, pulling", model=self.model)
                 await self.client.pull(self.model)
             return True
         except Exception as e:
@@ -594,7 +593,7 @@ class OllamaSummarizer(BaseSummarizer):
             )
         )
         
-        logger.info(sm("AI response", summarizer=self.__class__.__name__, response=raw_response))
+        logger.info("AI response", summarizer=self.__class__.__name__, response=raw_response)
         return extract_json_from_response(raw_response['message']['content'])
 
 
@@ -631,7 +630,7 @@ class OnlineSummarizer(BaseSummarizer):
         if api_key:
             os.environ["OPENAI_API_KEY"] = api_key
         
-        logger.info(sm("Online summarizer initialized", model=self.model, max_tokens=self.max_tokens))
+        logger.info("Online summarizer initialized", model=self.model, max_tokens=self.max_tokens)
     
     async def is_available(self) -> bool:
         """Check if online models are available."""
@@ -716,11 +715,11 @@ class LlamaCppSummarizer(BaseSummarizer):
                     n_gpu_layers=self.config.get("LLAMACPP_N_GPU_LAYERS", 0),  # 0 = CPU only, -1 = all layers on GPU
                     verbose=self.config.get("LLAMACPP_VERBOSE", False),
                 )
-                logger.info(sm("llama.cpp summarizer initialized", 
+                logger.info("llama.cpp summarizer initialized", 
                             repo_id=self.repo_id,
                             filename=self.filename,
                             n_ctx=self.n_ctx, 
-                            max_tokens=self.max_tokens))
+                            max_tokens=self.max_tokens)
             else:
                 self.llm = Llama(
                     repo_id=self.repo_id,
@@ -730,12 +729,12 @@ class LlamaCppSummarizer(BaseSummarizer):
                     n_gpu_layers=self.config.get("LLAMACPP_N_GPU_LAYERS", 0),  # 0 = CPU only, -1 = all layers on GPU
                     verbose=self.config.get("LLAMACPP_VERBOSE", False),
                 )
-                logger.info(sm("llama.cpp summarizer initialized", 
+                logger.info("llama.cpp summarizer initialized", 
                             model_path=self.model_path, 
                             n_ctx=self.n_ctx, 
-                            max_tokens=self.max_tokens))
+                            max_tokens=self.max_tokens)
         except Exception as e:
-            logger.error(sm("Failed to initialize llama.cpp model", model_path=self.model_path, error=str(e)))
+            logger.error("Failed to initialize llama.cpp model", model_path=self.model_path, error=str(e))
             raise AIProviderError(f"Failed to initialize llama.cpp: {str(e)}")
     
     async def is_available(self) -> bool:
@@ -765,7 +764,7 @@ class LlamaCppSummarizer(BaseSummarizer):
         )
         
         response_content = response['choices'][0]['message']['content'].strip()
-        logger.info(sm("llama.cpp raw response", response=response_content))
+        logger.info("llama.cpp raw response", response=response_content)
         return extract_json_from_response(response_content)
 
 
@@ -792,23 +791,23 @@ class AutoSummarizer:
         self.preferred_provider = preferred_provider or self.config.get("AI_PROVIDER", "auto")
         self.summarizers = {}
         
-        logger.info(sm("AutoSummarizer initialized", preferred_provider=self.preferred_provider))
+        logger.info("AutoSummarizer initialized", preferred_provider=self.preferred_provider)
     
     async def _get_llamacpp_summarizer(self) -> Optional[LlamaCppSummarizer]:
         """Get or create llama.cpp summarizer if available."""
         if "llamacpp" not in self.summarizers:
             try:
-                logger.info(sm("llama.cpp summarizer initalizing"))
+                logger.info("llama.cpp summarizer initalizing")
                 summarizer = LlamaCppSummarizer(config=self.config)
                 if await summarizer.is_available():
                     self.summarizers["llamacpp"] = summarizer
-                    logger.info(sm("llama.cpp summarizer available"))
+                    logger.info("llama.cpp summarizer available")
                 else:
                     self.summarizers["llamacpp"] = None
                     logger.debug("llama.cpp summarizer not available")
                     return None
             except Exception as e:
-                logger.warning(sm("Failed to create llama.cpp summarizer)", error=str(e)))
+                logger.warning("Failed to create llama.cpp summarizer", error=str(e))
                 self.summarizers["llamacpp"] = None
                 return None
         
@@ -821,7 +820,7 @@ class AutoSummarizer:
                 summarizer = OllamaSummarizer(config=self.config)
                 if await summarizer.is_available():
                     self.summarizers["ollama"] = summarizer
-                    logger.info(sm("Ollama summarizer available"))
+                    logger.info("Ollama summarizer available")
                 else:
                     logger.debug("Ollama summarizer not available")
                     self.summarizers["ollama"] = None
@@ -840,7 +839,7 @@ class AutoSummarizer:
                 summarizer = OnlineSummarizer(config=self.config)
                 if await summarizer.is_available():
                     self.summarizers["online"] = summarizer
-                    logger.info(sm("Online summarizer available"))
+                    logger.info("Online summarizer available")
                 else:
                     logger.debug("Online summarizer not available")
                     self.summarizers["online"] = None
@@ -888,14 +887,14 @@ class AutoSummarizer:
             if provider and await provider.is_available():
                 summarizer = provider
                 try:
-                    logger.info(sm("Attempting summarization", provider=type(summarizer).__name__))
+                    logger.info("Attempting summarization", provider=type(summarizer).__name__)
                     return await summarizer.summarize(file_metadata)
                 except Exception as e:
-                    logger.warning(sm("Summarizer failed, trying next provider", provider=type(summarizer).__name__, error=str(e)))
+                    logger.warning("Summarizer failed, trying next provider", provider=type(summarizer).__name__, error=str(e))
                     continue # Try next provider
         
         error_msg = "All AI summarizers failed or are unavailable"
-        logger.error(sm("All AI summarizers failed or are unavailable", preferred_provider=self.preferred_provider))
+        logger.error("All AI summarizers failed or are unavailable", preferred_provider=self.preferred_provider)
         raise SummarizerError(error_msg)
     
     async def get_available_providers(self) -> List[str]:

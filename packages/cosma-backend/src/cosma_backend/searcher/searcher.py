@@ -11,16 +11,15 @@
 
 from dataclasses import dataclass
 
-import logging
 
 from cosma_backend.db.database import Database
 from cosma_backend.embedder.embedder import AutoEmbedder
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.searcher.rrf import merge_with_rrf
 
 # Configure logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class SearchError(Exception):
@@ -73,7 +72,7 @@ class HybridSearcher:
         """
         self.db = db
         self.embedder = embedder or AutoEmbedder()
-        logger.info(sm("HybridSearcher initialized"))
+        logger.info("HybridSearcher initialized")
 
     async def search(
         self,
@@ -105,11 +104,11 @@ class HybridSearcher:
         Returns:
             List of SearchResult objects sorted by RRF score
         """
-        logger.info(sm("Performing hybrid search with RRF",
+        logger.info("Performing hybrid search with RRF",
                        query=query,
                        limit=limit,
                        rrf_k=rrf_k,
-                       directory=directory))
+                       directory=directory)
 
         # Fetch more results than needed - RRF benefits from larger candidate pools
         fetch_limit = limit * 3
@@ -125,9 +124,9 @@ class HybridSearcher:
                 file_id = file_metadata.id if hasattr(file_metadata, "id") else hash(file_metadata.file_path)
                 semantic_list.append((file_id, file_metadata, distance))
 
-            logger.debug(sm("Semantic search completed", results=len(semantic_list)))
+            logger.debug("Semantic search completed", results=len(semantic_list))
         except Exception as e:
-            logger.warning(sm("Semantic search failed", error=str(e)))
+            logger.warning("Semantic search failed", error=str(e))
 
         # 2. Keyword search
         try:
@@ -136,9 +135,9 @@ class HybridSearcher:
                 file_id = file_metadata.id if hasattr(file_metadata, "id") else hash(file_metadata.file_path)
                 keyword_list.append((file_id, file_metadata, score))
 
-            logger.debug(sm("Keyword search completed", results=len(keyword_list)))
+            logger.debug("Keyword search completed", results=len(keyword_list))
         except Exception as e:
-            logger.warning(sm("Keyword search failed", error=str(e)))
+            logger.warning("Keyword search failed", error=str(e))
 
         # 3. Merge using RRF
         merged = merge_with_rrf(semantic_list, keyword_list, k=rrf_k)
@@ -155,10 +154,10 @@ class HybridSearcher:
             )
             results.append(result)
 
-        logger.info(sm("Hybrid search completed",
+        logger.info("Hybrid search completed",
                        total_results=len(results),
                        semantic_matches=len(semantic_list),
-                       keyword_matches=len(keyword_list)))
+                       keyword_matches=len(keyword_list))
 
         return results
 
@@ -181,7 +180,7 @@ class HybridSearcher:
 
 
         except Exception as e:
-            logger.exception(sm("Semantic search failed", error=str(e)))
+            logger.exception("Semantic search failed", error=str(e))
             return []
 
     async def _keyword_search(self, query: str, limit: int, directory: str | None = None) -> list[tuple]:
@@ -195,7 +194,7 @@ class HybridSearcher:
             return results
 
         except Exception as e:
-            logger.exception(sm("Keyword search failed", error=str(e)))
+            logger.exception("Keyword search failed", error=str(e))
             return []
 
     async def search_similar_to_file(self,
@@ -213,7 +212,7 @@ class HybridSearcher:
         Returns:
             List of similar files
         """
-        logger.info(sm("Searching for similar files", file_id=file_id))
+        logger.info("Searching for similar files", file_id=file_id)
 
         try:
             # Get file's embedding
@@ -247,16 +246,16 @@ class HybridSearcher:
             # Limit results
             search_results = search_results[:limit]
 
-            logger.info(sm("Found similar files",
+            logger.info("Found similar files",
                            file_id=file_id,
-                           similar_count=len(search_results)))
+                           similar_count=len(search_results))
 
             return search_results
 
         except Exception as e:
-            logger.exception(sm("Similar file search failed",
+            logger.exception("Similar file search failed",
                                 file_id=file_id,
-                                error=str(e)))
+                                error=str(e))
             msg = f"Failed to find similar files: {e!s}"
             raise SearchError(msg)
 
@@ -271,7 +270,7 @@ class HybridSearcher:
         Returns:
             List of suggested search terms
         """
-        logger.debug(sm("Getting search suggestions", query=query))
+        logger.debug("Getting search suggestions", query=query)
 
         if not query or not query.strip():
             return []
@@ -280,16 +279,16 @@ class HybridSearcher:
             # Use FTS5 prefix search for efficient autocomplete
             suggestions = await self.db.get_fts5_suggestions(query.strip(), limit)
 
-            logger.debug(sm("Generated search suggestions",
+            logger.debug("Generated search suggestions",
                             query=query,
-                            suggestions=len(suggestions)))
+                            suggestions=len(suggestions))
 
             return suggestions
 
         except Exception as e:
-            logger.exception(sm("Failed to get search suggestions",
+            logger.exception("Failed to get search suggestions",
                                 query=query,
-                                error=str(e)))
+                                error=str(e))
             return []
 
 

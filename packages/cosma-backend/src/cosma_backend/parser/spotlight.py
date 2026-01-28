@@ -8,16 +8,15 @@
 """
 
 import asyncio
-import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from ..logging import sm
+from ..logging import get_logger
 
 # Configure structured logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def spotlight_to_text(path: Path, config: Optional[Dict[str, Any]] = None) -> str | None:
@@ -35,11 +34,11 @@ async def spotlight_to_text(path: Path, config: Optional[Dict[str, Any]] = None)
         OSError: If not running on macOS
     """
     if sys.platform != "darwin":
-        logger.warning(sm("Spotlight extraction only available on macOS", platform=sys.platform))
+        logger.warning("Spotlight extraction only available on macOS", platform=sys.platform)
         return None
         
     if not path.exists():
-        logger.warning(sm("File not found for Spotlight extraction", path=str(path)))
+        logger.warning("File not found for Spotlight extraction", path=str(path))
         return None
         
     # Get timeout from config or environment
@@ -49,7 +48,7 @@ async def spotlight_to_text(path: Path, config: Optional[Dict[str, Any]] = None)
         timeout = int(os.getenv("SPOTLIGHT_TIMEOUT_SECONDS", "5"))
     
     try:
-        logger.debug(sm("Extracting text via Spotlight", path=str(path)))
+        logger.debug("Extracting text via Spotlight", path=str(path))
         
         # Use asyncio.create_subprocess_exec to get kMDItemTextContent
         process = await asyncio.create_subprocess_exec(
@@ -63,21 +62,21 @@ async def spotlight_to_text(path: Path, config: Optional[Dict[str, Any]] = None)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            logger.warning(sm("Spotlight extraction timed out", path=str(path), timeout=timeout))
+            logger.warning("Spotlight extraction timed out", path=str(path), timeout=timeout)
             return None
         
         if process.returncode != 0:
-            logger.debug(sm("mdls command failed", 
+            logger.debug("mdls command failed", 
                         path=str(path), 
                         returncode=process.returncode,
-                        stderr=stderr.decode().strip()))
+                        stderr=stderr.decode().strip())
             return None
             
         output = stdout.decode().strip()
         
         # Parse mdls output format: kMDItemTextContent = "content here"
         if "= " not in output:
-            logger.debug(sm("No text content found in Spotlight", path=str(path)))
+            logger.debug("No text content found in Spotlight", path=str(path))
             return None
             
         # Extract content after "= "
@@ -85,7 +84,7 @@ async def spotlight_to_text(path: Path, config: Optional[Dict[str, Any]] = None)
         
         # Handle null value
         if content_part.strip() == "(null)":
-            logger.debug(sm("Spotlight returned null content", path=str(path)))
+            logger.debug("Spotlight returned null content", path=str(path))
             return None
             
         # Remove surrounding quotes and clean up
@@ -97,18 +96,18 @@ async def spotlight_to_text(path: Path, config: Optional[Dict[str, Any]] = None)
         content = content.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
         
         if len(content.strip()) < 10:  # Too short to be useful
-            logger.debug(sm("Spotlight content too short", path=str(path), length=len(content)))
+            logger.debug("Spotlight content too short", path=str(path), length=len(content))
             return None
             
-        logger.info(sm("Successfully extracted text via Spotlight", 
+        logger.info("Successfully extracted text via Spotlight", 
                    path=str(path), 
-                   content_length=len(content)))
+                   content_length=len(content))
         return content
         
     except Exception as e:
-        logger.exception(sm("Unexpected error in Spotlight extraction", 
+        logger.exception("Unexpected error in Spotlight extraction", 
                         path=str(path), 
-                        error=str(e)))
+                        error=str(e))
         return None
 
 
@@ -123,11 +122,11 @@ async def spotlight_metadata(path: Path) -> dict[str, Any]:
         Dictionary of metadata attributes
     """
     if sys.platform != "darwin":
-        logger.warning(sm("Spotlight metadata only available on macOS"))
+        logger.warning("Spotlight metadata only available on macOS")
         return {}
         
     if not path.exists():
-        logger.warning(sm("File not found for metadata extraction", path=str(path)))
+        logger.warning("File not found for metadata extraction", path=str(path))
         return {}
         
     try:
@@ -164,15 +163,15 @@ async def spotlight_metadata(path: Path) -> dict[str, Any]:
             if result:  # Non-None result means we got metadata
                 metadata[attributes[i]] = result
                 
-        logger.debug(sm("Retrieved Spotlight metadata", 
+        logger.debug("Retrieved Spotlight metadata", 
                     path=str(path), 
-                    attributes_found=len(metadata)))
+                    attributes_found=len(metadata))
         return metadata
         
     except Exception as e:
-        logger.exception(sm("Error retrieving Spotlight metadata", 
+        logger.exception("Error retrieving Spotlight metadata", 
                         path=str(path), 
-                        error=str(e)))
+                        error=str(e))
         return {}
 
 
@@ -288,14 +287,14 @@ async def validate_spotlight_availability() -> bool:
             available = process.returncode == 0
         
         if available:
-            logger.info(sm("Spotlight/mdls tools are available"))
+            logger.info("Spotlight/mdls tools are available")
         else:
-            logger.warning(sm("Spotlight/mdls tools not found in PATH"))
+            logger.warning("Spotlight/mdls tools not found in PATH")
             
         return available
         
     except Exception as e:
-        logger.exception(sm("Error checking Spotlight availability", error=str(e)))
+        logger.exception("Error checking Spotlight availability", error=str(e))
         return False
 
 

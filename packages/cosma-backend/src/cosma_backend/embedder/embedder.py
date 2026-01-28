@@ -19,12 +19,11 @@ from typing import Any, Optional, Dict
 import litellm
 import numpy as np
 from cosma_backend.models import File
-import logging
-from cosma_backend.logging import sm
+from cosma_backend.logging import get_logger
 from cosma_backend.models.status import ProcessingStatus
 
 # Configure structured logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class EmbedderError(Exception):
@@ -48,7 +47,7 @@ class BaseEmbedder(ABC):
         """
         self.model_name = model_name
         self.dimensions = dimensions
-        logger.info(sm("Initializing embedder", model=model_name, dimensions=dimensions))
+        logger.info("Initializing embedder", model=model_name, dimensions=dimensions)
 
     @abstractmethod
     def embed_text(self, text: str | list[str]) -> np.ndarray:
@@ -129,9 +128,9 @@ class OnlineEmbedder(BaseEmbedder):
                 msg = f"Dimensions must be between 512 and 1536 for {self.model}"
                 raise ValueError(msg)
 
-        logger.info(sm("Online embedder initialized",
+        logger.info("Online embedder initialized",
                    model=self.model,
-                   dimensions=self.configured_dimensions))
+                   dimensions=self.configured_dimensions)
 
     def is_available(self) -> bool:
         """Check if online embedder is available."""
@@ -141,10 +140,10 @@ class OnlineEmbedder(BaseEmbedder):
         """Generate embeddings using online model."""
         texts = self._validate_text(text)
 
-        logger.debug(sm("Generating embeddings",
+        logger.debug("Generating embeddings",
                     model=self.model,
                     num_texts=len(texts),
-                    dimensions=self.configured_dimensions))
+                    dimensions=self.configured_dimensions)
 
         try:
             # Call litellm embedding endpoint
@@ -172,17 +171,17 @@ class OnlineEmbedder(BaseEmbedder):
 
         except Exception as e:
             error_msg = f"Online embedding generation failed: {e!s}"
-            logger.exception(sm(error_msg, model=self.model))
+            logger.exception(error_msg, model=self.model)
             raise EmbeddingProviderError(error_msg)
     
     async def _embed_text_async(self, text: str | list[str]) -> np.ndarray:
         """Truly async embedding generation using litellm async API."""
         texts = self._validate_text(text)
 
-        logger.debug(sm("Generating embeddings async",
+        logger.debug("Generating embeddings async",
                     model=self.model,
                     num_texts=len(texts),
-                    dimensions=self.configured_dimensions))
+                    dimensions=self.configured_dimensions)
 
         try:
             # Call async litellm embedding endpoint
@@ -210,7 +209,7 @@ class OnlineEmbedder(BaseEmbedder):
 
         except Exception as e:
             error_msg = f"Async online embedding generation failed: {e!s}"
-            logger.exception(sm(error_msg, model=self.model))
+            logger.exception(error_msg, model=self.model)
             raise EmbeddingProviderError(error_msg)
 
 
@@ -233,7 +232,7 @@ class LocalEmbedder(BaseEmbedder):
             self.sentence_transformers_available = True
         except ImportError:
             self.sentence_transformers_available = False
-            logger.warning(sm("sentence-transformers not installed, local embeddings unavailable"))
+            logger.warning("sentence-transformers not installed, local embeddings unavailable")
 
         # Default to intfloat/e5-base-v2 model with 768 dimensions for efficiency
         self.model_name = model_name or self.config.get("LOCAL_EMBEDDING_MODEL", "intfloat/e5-base-v2")
@@ -252,19 +251,19 @@ class LocalEmbedder(BaseEmbedder):
         self.model = None
         if self.sentence_transformers_available:
             try:
-                logger.info(sm("Loading local embedding model",
+                logger.info("Loading local embedding model",
                            model=self.model_name,
-                           dimensions=self.configured_dimensions))
+                           dimensions=self.configured_dimensions)
                 # This will automatically download from HuggingFace if model doesn't exist locally
                 self.model = SentenceTransformer(self.model_name)
-                logger.info(sm("Local embedder initialized",
+                logger.info("Local embedder initialized",
                            model=self.model_name,
-                           dimensions=self.configured_dimensions))
+                           dimensions=self.configured_dimensions)
             except Exception as e:
-                logger.exception(sm("Failed to load local model",
+                logger.exception("Failed to load local model",
                             model=self.model_name,
-                            error=str(e)))
-                logger.info(sm("Model will be downloaded from HuggingFace on first use"))
+                            error=str(e))
+                logger.info("Model will be downloaded from HuggingFace on first use")
 
     def is_available(self) -> bool:
         """Check if local embedder is available."""
@@ -278,10 +277,10 @@ class LocalEmbedder(BaseEmbedder):
 
         texts = self._validate_text(text)
 
-        logger.debug(sm("Generating local embeddings",
+        logger.debug("Generating local embeddings",
                     model=self.model_name,
                     num_texts=len(texts),
-                    dimensions=self.configured_dimensions))
+                    dimensions=self.configured_dimensions)
 
         try:
             # Generate embeddings
@@ -306,7 +305,7 @@ class LocalEmbedder(BaseEmbedder):
 
         except Exception as e:
             error_msg = f"Local embedding generation failed: {e!s}"
-            logger.exception(sm(error_msg, model=self.model_name))
+            logger.exception(error_msg, model=self.model_name)
             raise EmbeddingProviderError(error_msg)
 
     async def _embed_text_async(self, text: str | list[str]) -> np.ndarray:
@@ -317,10 +316,10 @@ class LocalEmbedder(BaseEmbedder):
 
         texts = self._validate_text(text)
 
-        logger.debug(sm("Generating local embeddings async",
+        logger.debug("Generating local embeddings async",
                     model=self.model_name,
                     num_texts=len(texts),
-                    dimensions=self.configured_dimensions))
+                    dimensions=self.configured_dimensions)
 
         try:
             # Generate embeddings asynchronously using asyncio.to_thread
@@ -346,7 +345,7 @@ class LocalEmbedder(BaseEmbedder):
 
         except Exception as e:
             error_msg = f"Async local embedding generation failed: {e!s}"
-            logger.exception(sm(error_msg, model=self.model_name))
+            logger.exception(error_msg, model=self.model_name)
             raise EmbeddingProviderError(error_msg)
 
 
@@ -370,60 +369,60 @@ class AutoEmbedder:
         """
         self.config = config or {}
         self.preferred_provider = preferred_provider or self.config.get("EMBEDDING_PROVIDER", "local")
-        logger.debug(sm("Preferred provider", og=preferred_provider, provider=self.preferred_provider))
+        logger.debug("Preferred provider", og=preferred_provider, provider=self.preferred_provider)
         self.embedders = {}
 
-        logger.info(sm("AutoEmbedder initializing",
-                   preferred_provider=self.preferred_provider))
+        logger.info("AutoEmbedder initializing",
+                   preferred_provider=self.preferred_provider)
         
         # Eagerly initialize models based on preferred provider
         self._eagerly_initialize_models()
 
     def _eagerly_initialize_models(self) -> None:
         """Initialize embedding models based on provider preference - eager for local, lazy for online."""
-        logger.info(sm("Initializing embedding models"))
+        logger.info("Initializing embedding models")
         
         if self.preferred_provider == "local":
             # Eagerly initialize local embedder for local preference
-            logger.info(sm("Eagerly loading local embedding models"))
+            logger.info("Eagerly loading local embedding models")
             local_embedder = self._get_local_embedder()
             if local_embedder:
-                logger.info(sm("Local embedder ready", 
+                logger.info("Local embedder ready", 
                            model=local_embedder.model_name,
-                           dimensions=local_embedder.dimensions))
+                           dimensions=local_embedder.dimensions)
             else:
-                logger.warning(sm("Local embedder failed to initialize"))
+                logger.warning("Local embedder failed to initialize")
                 
             # Check online availability but don't initialize (lazy loading)
-            logger.info(sm("Checking online embedding provider availability (lazy loading)"))
+            logger.info("Checking online embedding provider availability (lazy loading)")
             online_available = self._check_online_availability()
             if online_available:
-                logger.info(sm("Online embedder available as fallback (will load on first use)"))
+                logger.info("Online embedder available as fallback (will load on first use)")
             else:
-                logger.warning(sm("Online embedder not available - check API keys"))
+                logger.warning("Online embedder not available - check API keys")
         else:
             # For online preference, check availability but don't initialize (lazy loading)
-            logger.info(sm("Checking online embedding provider availability (lazy loading)"))
+            logger.info("Checking online embedding provider availability (lazy loading)")
             online_available = self._check_online_availability()
             if online_available:
-                logger.info(sm("Online embedder ready (will load on first use)", 
-                           provider="online"))
+                logger.info("Online embedder ready (will load on first use)", 
+                           provider="online")
             else:
-                logger.warning(sm("Online embedder not available - check API keys"))
+                logger.warning("Online embedder not available - check API keys")
                 
             # Skip local model initialization when user explicitly chose online
-            logger.info(sm("Skipping local embedding model initialization (online provider preferred)"))
-            logger.info(sm("To use local models as fallback, set EMBEDDING_PROVIDER=local"))
+            logger.info("Skipping local embedding model initialization (online provider preferred)")
+            logger.info("To use local models as fallback, set EMBEDDING_PROVIDER=local")
         
         # Summary of initialization strategy
         if self.preferred_provider == "local":
-            logger.info(sm("AutoEmbedder configured: LOCAL models preloaded, ONLINE models lazy-loaded"))
+            logger.info("AutoEmbedder configured: LOCAL models preloaded, ONLINE models lazy-loaded")
         else:
-            logger.info(sm("AutoEmbedder configured: ONLINE models only (LOCAL models skipped)"))
+            logger.info("AutoEmbedder configured: ONLINE models only (LOCAL models skipped)")
 
-        logger.info(sm("AutoEmbedder initialization complete",
+        logger.info("AutoEmbedder initialization complete",
                    preferred_provider=self.preferred_provider,
-                   strategy="eager_local_lazy_online" if self.preferred_provider == "local" else "online_only"))
+                   strategy="eager_local_lazy_online" if self.preferred_provider == "local" else "online_only")
 
     def _check_online_availability(self) -> bool:
         """Check if online embedder is available without initializing it."""
@@ -447,12 +446,12 @@ class AutoEmbedder:
                 embedder = OnlineEmbedder(config=self.config)
                 if embedder.is_available():
                     self.embedders["online"] = embedder
-                    logger.info(sm("Online embedder available"))
+                    logger.info("Online embedder available")
                 else:
-                    logger.debug(sm("Online embedder not available"))
+                    logger.debug("Online embedder not available")
                     return None
             except Exception as e:
-                logger.debug(sm("Failed to create online embedder", error=str(e)))
+                logger.debug("Failed to create online embedder", error=str(e))
                 return None
 
         return self.embedders.get("online")
@@ -464,12 +463,12 @@ class AutoEmbedder:
                 embedder = LocalEmbedder(config=self.config)
                 if embedder.is_available():
                     self.embedders["local"] = embedder
-                    logger.info(sm("Local embedder available"))
+                    logger.info("Local embedder available")
                 else:
-                    logger.debug(sm("Local embedder not available"))
+                    logger.debug("Local embedder not available")
                     return None
             except Exception as e:
-                logger.warning(sm("Failed to create local embedder", error=str(e)))
+                logger.warning("Failed to create local embedder", error=str(e))
                 return None
 
         return self.embedders.get("local")
@@ -498,23 +497,23 @@ class AutoEmbedder:
         else:  # default: local first
             providers = [self._get_local_embedder(), self._get_online_embedder()]
             
-        logger.debug(sm("All available providers", providers=providers))
+        logger.debug("All available providers", providers=providers)
 
         # Try each provider
         for embedder in providers:
             if embedder:
                 try:
-                    logger.info(sm("Attempting embedding generation",
-                               provider=type(embedder).__name__))
+                    logger.info("Attempting embedding generation",
+                               provider=type(embedder).__name__)
                     return embedder.embed_text(text)
                 except Exception as e:
-                    logger.warning(sm("Embedder failed, trying next provider",
+                    logger.warning("Embedder failed, trying next provider",
                                  provider=type(embedder).__name__,
-                                 error=str(e)))
+                                 error=str(e))
                     continue
 
         error_msg = "All embedding providers failed or are unavailable"
-        logger.error(sm(error_msg, preferred_provider=self.preferred_provider))
+        logger.error(error_msg, preferred_provider=self.preferred_provider)
         raise EmbedderError(error_msg)
     
     async def embed_text_async(self, text: str | list[str]) -> np.ndarray:
@@ -544,17 +543,17 @@ class AutoEmbedder:
         for embedder in providers:
             if embedder:
                 try:
-                    logger.info(sm("Attempting async embedding generation",
-                               provider=type(embedder).__name__))
+                    logger.info("Attempting async embedding generation",
+                               provider=type(embedder).__name__)
                     return await embedder.embed_text_async(text)
                 except Exception as e:
-                    logger.warning(sm("Async embedder failed, trying next provider",
+                    logger.warning("Async embedder failed, trying next provider",
                                  provider=type(embedder).__name__,
-                                 error=str(e)))
+                                 error=str(e))
                     continue
 
         error_msg = "All embedding providers failed or are unavailable"
-        logger.error(sm(error_msg, preferred_provider=self.preferred_provider))
+        logger.error(error_msg, preferred_provider=self.preferred_provider)
         raise EmbedderError(error_msg)
 
     def get_model_info(self) -> dict[str, Any]:
