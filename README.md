@@ -24,8 +24,8 @@ Cosma can run 100% locally or in the cloud.
 
 ## Get Started
 
-Currently, Cosma has only been tested on MacOS ARM.
-Windows and Linux support is coming soon!
+Cosma has been tested on MacOS ARM and Windows.
+Linux support is coming soon!
 
 ### Installing
 
@@ -65,9 +65,27 @@ To start the terminal UI and start searching, run search.
 ```sh
 cosma search /path/to/directory/to/search
 ```
-> [!WARNING]  
+> [!WARNING]
 > This will begin processing all files in the directory specified,
 > which will take some time if running locally.
+
+## CLI
+
+Cosma includes a CLI with three output modes:
+
+- **default** - Rich formatted output with colors and tables for interactive use
+- `--plain` - Simple text output without colors, for piping and scripts
+- `--json` - Structured JSON output for agents and programmatic access
+
+```sh
+cosma search "my query"               # Search indexed files
+cosma index /path/to/dir              # Index a directory
+cosma status                          # Check backend status
+cosma watch add /path/to/dir          # Watch directory for changes
+cosma files stats                     # Get file statistics
+```
+
+Run `cosma --help` for all commands.
 
 ## MacOS App
 
