@@ -128,28 +128,29 @@ def settings_get(key: str, formatter: OutputFormatter):
       cosma settings get AI_PROVIDER
       cosma settings get summarizer.provider
     """
-    from cosma_backend.settings import resolve_key as _resolve_key
-
-    canonical = _resolve_key(key)
-    if canonical is None:
-        formatter.error(f"Unknown setting: {key}")
-        formatter.hint("Use 'cosma settings show' to see all available settings")
-        return
-
     client = SyncClient()
     with formatter.status("Fetching settings..."):
         result = client.get_settings()
 
     flat = _flatten(result)
 
-    from cosma_backend.settings import SETTINGS_SCHEMA
-    path = SETTINGS_SCHEMA[canonical]["path"]
-    value = flat.get(path)
+    # Try as TOML path first (e.g. parser.spotlight_enabled)
+    if key in flat:
+        found_key, value = key, flat[key]
+    # Try uppercased as TOML path
+    elif key.lower() in {k.lower(): k for k in flat}:
+        normalized = {k.lower(): k for k in flat}
+        real_key = normalized[key.lower()]
+        found_key, value = real_key, flat[real_key]
+    else:
+        formatter.error(f"Unknown setting: {key}")
+        formatter.hint("Use 'cosma settings show' to see all available settings")
+        return
 
     if formatter.mode == OutputMode.JSON:
-        formatter.output_json({canonical: value})
+        formatter.output_json({found_key: value})
     else:
-        formatter.print(f"[bold]{canonical}[/bold] = {value}")
+        formatter.print(f"[bold]{found_key}[/bold] = {value}")
 
 
 def _flatten(data: dict, prefix: str = "") -> dict:
@@ -245,11 +246,14 @@ def settings_reset(formatter: OutputFormatter):
     """
     client = SyncClient()
 
-    from cosma_backend.settings import SETTINGS_SCHEMA
-    update = {key: schema["default"] for key, schema in SETTINGS_SCHEMA.items()}
+    with formatter.status("Fetching defaults..."):
+        defaults = client.get_settings_defaults()
+
+    # Flatten the grouped defaults into TOML paths and send them back
+    flat_defaults = _flatten(defaults)
 
     with formatter.status("Resetting settings..."):
-        result = client.update_settings(update)
+        result = client.update_settings(flat_defaults)
 
     if formatter.mode == OutputMode.JSON:
         formatter.output_json(result)
