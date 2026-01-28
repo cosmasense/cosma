@@ -459,8 +459,17 @@ class BaseSummarizer(ABC):
                 "Example: {{'summary': 'A concise summary of the file content', 'keywords': ['keyword1', 'keyword2', 'keyword3']}}"
             )
     
+    def _format_content_with_context(self, chunk: str, chunk_num: int, total_chunks: int, filename: str) -> str:
+        """Format content with filename and chunk context for the first chunk."""
+        if chunk_num == 0:
+            if total_chunks > 1:
+                return f"Filename: {filename}\n(Part 1 of {total_chunks})\n\nContent:\n{chunk}"
+            else:
+                return f"Filename: {filename}\n\nContent:\n{chunk}"
+        return chunk
+
     @abstractmethod
-    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
+    async def _get_ai_response(self, chunk: str, chunk_num: int, total_chunks: int, images: list[str], filename: str) -> str | None:
         raise NotImplementedError
             
     async def summarize(self, file_metadata: File) -> File:
@@ -479,9 +488,10 @@ class BaseSummarizer(ABC):
             images = await self._prepare_images(file_metadata)
             
             # Process each chunk
+            total_chunks = len(content_chunks)
             for i, chunk in enumerate(content_chunks):
-                logger.info(f"Processing chunk {i+1}/{len(content_chunks)}", length=len(chunk), images=len(images))                
-                response = await self._get_ai_response(chunk, i, images)
+                logger.info(f"Processing chunk {i+1}/{total_chunks}", length=len(chunk), images=len(images))
+                response = await self._get_ai_response(chunk, i, total_chunks, images, file_metadata.filename)
                 
                 if not response:
                     logger.warning("Empty response for chunk", chunk_num=i+1)
@@ -573,8 +583,9 @@ class OllamaSummarizer(BaseSummarizer):
             logger.debug(f"Ollama not available - error: {str(e)}")
             return False
             
-    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
-        user_message: dict[str, Any] = {"role": "user", "content": chunk}
+    async def _get_ai_response(self, chunk: str, chunk_num: int, total_chunks: int, images: list[str], filename: str) -> str | None:
+        content = self._format_content_with_context(chunk, chunk_num, total_chunks, filename)
+        user_message: dict[str, Any] = {"role": "user", "content": content}
         if images:
             user_message["images"] = images
         
@@ -645,11 +656,12 @@ class OnlineSummarizer(BaseSummarizer):
             # Assume OpenAI by default
             return bool(os.getenv("OPENAI_API_KEY"))
             
-    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
-        user_message = {"role": "user", "content": chunk}
+    async def _get_ai_response(self, chunk: str, chunk_num: int, total_chunks: int, images: list[str], filename: str) -> str | None:
+        content = self._format_content_with_context(chunk, chunk_num, total_chunks, filename)
+        user_message = {"role": "user", "content": content}
         if images:
             user_message["images"] = images
-        
+
         response = litellm.completion(
             model=self.model,
             messages=[
@@ -751,11 +763,12 @@ class LlamaCppSummarizer(BaseSummarizer):
             logger.debug(f"llama.cpp not available - error: {str(e)}")
             return False
             
-    async def _get_ai_response(self, chunk: str, chunk_num: int, images: list[str]) -> str | None:
+    async def _get_ai_response(self, chunk: str, chunk_num: int, total_chunks: int, images: list[str], filename: str) -> str | None:
+        content = self._format_content_with_context(chunk, chunk_num, total_chunks, filename)
         response = self.llm.create_chat_completion(
             messages=[
                 {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
-                {"role": "user", "content": chunk},
+                {"role": "user", "content": content},
             ],
             max_tokens=500,
             temperature=0.1,
