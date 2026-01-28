@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "WebSearch",
+      "Bash(uv run pytest:*)",
+      "Bash(uv run:*)",
+      "Bash(gh api:*)",
+      "Bash(tree:*)",
+      "Bash(wc:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv build:*)",
+      "Bash(git rebase:*)"
+    ]
+  }
+}
