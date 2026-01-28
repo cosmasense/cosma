@@ -2,11 +2,12 @@
 
 ## Codebases
 
-There are three codebases:
+There are four codebases:
 
-- `cosma-backend` (packages/cosma-backend)
-- `cosma-tui` (packages/cosma-tui)
-- `cosma` (root)
+- `cosma-backend` (packages/cosma-backend) - Backend service with vector search, file watching, document parsing, and LLM integration
+- `cosma-client` (packages/cosma-client) - API client library for communicating with the backend
+- `cosma-tui` (packages/cosma-tui) - Terminal user interface built with Textual
+- `cosma` (root) - Main CLI with commands for indexing, searching, and managing the backend
 
 ## Testing
 - Run all tests: `uv run pytest`
