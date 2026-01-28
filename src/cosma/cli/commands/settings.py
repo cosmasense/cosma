@@ -9,19 +9,72 @@ from cosma_client import SyncClient
 from .. import output_options, handle_client_errors, OutputFormatter, OutputMode
 
 
-@click.group("settings")
+SETTINGS_EPILOG = """
+\b
+Settings are persisted to a TOML file in your config directory and
+take effect immediately. Environment variables (COSMA_<KEY>) still
+override file values on server startup.
+\b
+Keys can be specified as either:
+  - Flat config keys:  EMBEDDING_PROVIDER, AI_PROVIDER
+  - TOML paths:        embedder.provider, summarizer.provider
+\b
+Sections:
+  embedder     Embedding model and provider configuration
+  summarizer   LLM provider, model selection, and context settings
+  parser       File extraction strategy, Spotlight, and Whisper
+\b
+Common keys:
+  AI_PROVIDER / summarizer.provider
+      LLM provider: auto, ollama, online, llamacpp
+  EMBEDDING_PROVIDER / embedder.provider
+      Embedding provider: local, online
+  OLLAMA_MODEL / summarizer.ollama.model
+      Ollama model name for summarization
+  EMBEDDING_MODEL / embedder.model
+      Online embedding model name
+  EXTRACTION_STRATEGY / parser.extraction_strategy
+      File parsing strategy: spotlight_first, auto
+\b
+Examples:
+  cosma settings show
+  cosma settings show -s embedder
+  cosma settings get AI_PROVIDER
+  cosma settings set AI_PROVIDER ollama
+  cosma settings set summarizer.ollama.model llama3
+  cosma settings set parser.spotlight_enabled false
+  cosma settings defaults
+  cosma settings reset
+"""
+
+
+@click.group("settings", epilog=SETTINGS_EPILOG)
 def settings_group():
-    """Manage application settings."""
+    """Manage application settings.
+
+    View, update, and reset runtime configuration for the embedder,
+    summarizer, and parser. Changes are saved to settings.toml and
+    applied immediately.
+    """
     pass
 
 
-@settings_group.command("show")
+@settings_group.command("show", epilog="""\b
+Examples:
+  cosma settings show
+  cosma settings show -s embedder
+  cosma settings show --json
+""")
 @click.option("--section", "-s", type=click.Choice(["embedder", "summarizer", "parser"]),
-              help="Show only a specific section")
+              help="Show only a specific section.")
 @output_options
 @handle_client_errors
 def settings_show(section: str | None, formatter: OutputFormatter):
-    """Show current settings configuration."""
+    """Show current settings configuration.
+
+    Displays all settings grouped by section (embedder, summarizer,
+    parser). Use --section to filter to a single section.
+    """
     client = SyncClient()
     with formatter.status("Fetching settings..."):
         result = client.get_settings()
@@ -57,14 +110,23 @@ def _print_nested(formatter: OutputFormatter, data: dict, indent: int = 0):
             formatter.print(f"{prefix}[bold]{key}[/bold] = {value}")
 
 
-@settings_group.command("get")
+@settings_group.command("get", epilog="""\b
+Examples:
+  cosma settings get AI_PROVIDER
+  cosma settings get summarizer.provider
+  cosma settings get EMBEDDING_DIMENSIONS
+  cosma settings get embedder.model --json
+""")
 @click.argument("key")
 @output_options
 @handle_client_errors
 def settings_get(key: str, formatter: OutputFormatter):
     """Get the value of a specific setting.
 
-    KEY is the flat config key (e.g. AI_PROVIDER, EMBEDDING_DIMENSIONS).
+    \b
+    KEY can be a flat config key or a TOML path:
+      cosma settings get AI_PROVIDER
+      cosma settings get summarizer.provider
     """
     from cosma_backend.settings import resolve_key as _resolve_key
 
@@ -80,7 +142,6 @@ def settings_get(key: str, formatter: OutputFormatter):
 
     flat = _flatten(result)
 
-    # Find the value using the TOML path for this key
     from cosma_backend.settings import SETTINGS_SCHEMA
     path = SETTINGS_SCHEMA[canonical]["path"]
     value = flat.get(path)
@@ -103,7 +164,14 @@ def _flatten(data: dict, prefix: str = "") -> dict:
     return result
 
 
-@settings_group.command("set")
+@settings_group.command("set", epilog="""\b
+Examples:
+  cosma settings set AI_PROVIDER ollama
+  cosma settings set summarizer.ollama.model llama3
+  cosma settings set EMBEDDING_DIMENSIONS 1024
+  cosma settings set parser.spotlight_enabled false
+  cosma settings set WHISPER_PROVIDER local
+""")
 @click.argument("key")
 @click.argument("value")
 @output_options
@@ -111,8 +179,13 @@ def _flatten(data: dict, prefix: str = "") -> dict:
 def settings_set(key: str, value: str, formatter: OutputFormatter):
     """Set a configuration value.
 
-    KEY is the flat config key (e.g. AI_PROVIDER, EMBEDDING_DIMENSIONS).
-    VALUE is the new value to set.
+    \b
+    KEY can be a flat config key or a TOML path:
+      cosma settings set AI_PROVIDER ollama
+      cosma settings set summarizer.provider ollama
+
+    Values are automatically coerced to the correct type
+    (int, bool, string) based on the setting's schema.
     """
     client = SyncClient()
     with formatter.status(f"Updating {key}..."):
@@ -124,11 +197,20 @@ def settings_set(key: str, value: str, formatter: OutputFormatter):
         formatter.success(f"Updated {key}")
 
 
-@settings_group.command("defaults")
+@settings_group.command("defaults", epilog="""\b
+Examples:
+  cosma settings defaults
+  cosma settings defaults --json
+""")
 @output_options
 @handle_client_errors
 def settings_defaults(formatter: OutputFormatter):
-    """Show default values for all settings."""
+    """Show default values for all settings.
+
+    Displays the built-in default value for every setting. Useful for
+    seeing what a setting will revert to after a reset, or for comparing
+    against your current configuration.
+    """
     client = SyncClient()
     with formatter.status("Fetching defaults..."):
         result = client.get_settings_defaults()
@@ -146,25 +228,23 @@ def settings_defaults(formatter: OutputFormatter):
         formatter.print("")
 
 
-@settings_group.command("reset")
+@settings_group.command("reset", epilog="""\b
+Examples:
+  cosma settings reset
+  cosma settings reset --yes          # skip confirmation prompt
+""")
 @click.confirmation_option(prompt="Reset all settings to defaults?")
 @output_options
 @handle_client_errors
 def settings_reset(formatter: OutputFormatter):
-    """Reset all settings to their default values."""
+    """Reset all settings to their default values.
+
+    Restores every setting to its built-in default and saves the result
+    to settings.toml. This does not affect bootstrap settings (HOST,
+    PORT, DATABASE_PATH) which are always read from environment variables.
+    """
     client = SyncClient()
 
-    with formatter.status("Fetching defaults..."):
-        defaults = client.get_settings_defaults()
-
-    # Flatten defaults to get flat key -> value pairs
-    flat_defaults = _flatten(defaults)
-
-    # Map TOML paths back to config keys by using the known schema mapping
-    # We'll build the update dict using the path-based keys from the defaults
-    # Since the API accepts flat config keys, we need to reverse-map
-    # For now, we can get the flat defaults from the settings manager
-    # The simplest approach: fetch defaults, then PUT them as an update
     from cosma_backend.settings import SETTINGS_SCHEMA
     update = {key: schema["default"] for key, schema in SETTINGS_SCHEMA.items()}
 
