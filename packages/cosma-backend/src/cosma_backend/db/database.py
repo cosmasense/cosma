@@ -418,8 +418,31 @@ class Database:
 
         if not row:
             return None
-            
+
         return File.from_row(row)
+
+    async def delete_files_in_directory(self, directory_path: str) -> list[File]:
+        """
+        Delete all files within a directory (including subdirectories).
+
+        Args:
+            directory_path: Path of the directory
+
+        Returns:
+            List of deleted File objects
+        """
+        async with self.acquire() as conn:
+            # Delete all files in this directory
+            SQL = """
+                DELETE FROM files
+                WHERE file_path LIKE ? || '/%' OR file_path = ?
+                RETURNING *
+            """
+            rows = await conn.fetchall(SQL, (directory_path, directory_path))
+
+            deleted_files = [File.from_row(row) for row in rows]
+            logger.info(sm("Deleted files in directory", directory=directory_path, count=len(deleted_files)))
+            return deleted_files
 
     async def add_watched_directory(self, watched_dir: WatchedDirectory) -> int:
         """
