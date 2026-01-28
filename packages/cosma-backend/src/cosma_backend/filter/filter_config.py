@@ -587,12 +587,21 @@ class FilterConfig:
             if pattern not in merged_include:
                 merged_include.append(pattern)
 
-        merged = cls(
-            mode=global_config.mode,  # Mode always from global
-            exclude=merged_exclude,
-            include=merged_include,
-            config_path=folder_config_path,
-        )
+        # Populate mode-specific fields so __post_init__ preserves them
+        if global_config.mode == FilterMode.BLACKLIST:
+            merged = cls(
+                mode=global_config.mode,
+                blacklist_exclude=merged_exclude,
+                blacklist_include=merged_include,
+                config_path=folder_config_path,
+            )
+        else:
+            merged = cls(
+                mode=global_config.mode,
+                whitelist_exclude=merged_exclude,
+                whitelist_include=merged_include,
+                config_path=folder_config_path,
+            )
 
         logger.info("Merged filter config for directory",
                       directory=str(directory),
@@ -626,12 +635,21 @@ class FilterConfig:
             if pattern not in merged_include:
                 merged_include.append(pattern)
 
-        return FilterConfig(
-            mode=self.mode,
-            exclude=merged_exclude,
-            include=merged_include,
-            config_path=other.config_path or self.config_path,
-        )
+        # Populate mode-specific fields so __post_init__ preserves them
+        if self.mode == FilterMode.BLACKLIST:
+            return FilterConfig(
+                mode=self.mode,
+                blacklist_exclude=merged_exclude,
+                blacklist_include=merged_include,
+                config_path=other.config_path or self.config_path,
+            )
+        else:
+            return FilterConfig(
+                mode=self.mode,
+                whitelist_exclude=merged_exclude,
+                whitelist_include=merged_include,
+                config_path=other.config_path or self.config_path,
+            )
 
 
 class FilterConfigManager:
