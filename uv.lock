@@ -12,6 +12,7 @@ resolution-markers = [
 members = [
     "cosma",
     "cosma-backend",
+    "cosma-client",
     "cosma-tui",
 ]
 
@@ -411,7 +412,19 @@ version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "click-help-colors" },
+    { name = "cosma-client" },
+    { name = "rich" },
+]
+
+[package.optional-dependencies]
+all = [
     { name = "cosma-backend" },
+    { name = "cosma-tui" },
+]
+backend = [
+    { name = "cosma-backend" },
+]
+tui = [
     { name = "cosma-tui" },
 ]
 
@@ -424,9 +437,14 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click-help-colors", specifier = ">=0.9.4" },
-    { name = "cosma-backend", editable = "packages/cosma-backend" },
-    { name = "cosma-tui", editable = "packages/cosma-tui" },
+    { name = "cosma-backend", marker = "extra == 'all'", editable = "packages/cosma-backend" },
+    { name = "cosma-backend", marker = "extra == 'backend'", editable = "packages/cosma-backend" },
+    { name = "cosma-client", editable = "packages/cosma-client" },
+    { name = "cosma-tui", marker = "extra == 'all'", editable = "packages/cosma-tui" },
+    { name = "cosma-tui", marker = "extra == 'tui'", editable = "packages/cosma-tui" },
+    { name = "rich", specifier = ">=14.0.0" },
 ]
+provides-extras = ["tui", "backend", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -507,11 +525,22 @@ test = [
 ]
 
 [[package]]
+name = "cosma-client"
+version = "0.1.0"
+source = { editable = "packages/cosma-client" }
+dependencies = [
+    { name = "niquests" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "niquests", specifier = ">=3.15.2" }]
+
+[[package]]
 name = "cosma-tui"
 version = "0.2.0"
 source = { editable = "packages/cosma-tui" }
 dependencies = [
-    { name = "niquests" },
+    { name = "cosma-client" },
     { name = "platformdirs" },
     { name = "textual" },
 ]
@@ -524,7 +553,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "niquests", specifier = ">=3.15.2" },
+    { name = "cosma-client", editable = "packages/cosma-client" },
     { name = "platformdirs", specifier = ">=4.4.0" },
     { name = "textual", specifier = ">=6.1.0" },
 ]
