@@ -1,3 +1,4 @@
+import logging
 import structlog
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal
@@ -59,13 +60,13 @@ def configure_logging():
             _serialize_event_dict,
             structlog.dev.ConsoleRenderer(),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(structlog.stdlib.INFO),
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
 
 
-def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
+def get_logger(name: str | None = None) -> structlog.typing.FilteringBoundLogger:
     """Get a structlog logger instance."""
     return structlog.get_logger(name)
