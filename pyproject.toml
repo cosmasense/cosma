@@ -6,15 +6,12 @@ description="Search engine for your files!"
 readme = "README.md"
 dependencies = [
     "click-help-colors>=0.9.4",
+    "cosma-backend",
     "cosma-client",
+    "cosma-tui",
     "rich>=14.0.0",
 ]
 license = "MIT"
-
-[project.optional-dependencies]
-tui = ["cosma-tui"]
-backend = ["cosma-backend"]
-all = ["cosma-backend", "cosma-tui"]
 
 [project.urls]
 Homepage = "https://github.com/cosmasense/cosma"
