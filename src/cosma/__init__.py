@@ -1,3 +1,5 @@
+from importlib.metadata import version, PackageNotFoundError
+
 import click
 from click_help_colors import HelpColorsGroup
 
@@ -12,10 +14,47 @@ from .cli.commands.serve import serve_command
 from .cli.commands.tui import tui_command
 
 
+def _get_version(package: str) -> str:
+    """Get version for a package, or 'not installed' if not found."""
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return "not installed"
+
+
+def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    """Print version information for all cosma packages."""
+    if not value or ctx.resilient_parsing:
+        return
+
+    packages = [
+        ("cosma", "cosma"),
+        ("cosma-backend", "cosma-backend"),
+        ("cosma-tui", "cosma-tui"),
+        ("cosma-client", "cosma-client"),
+    ]
+
+    click.echo("cosma version info:")
+    click.echo()
+    for display_name, package_name in packages:
+        ver = _get_version(package_name)
+        click.echo(f"  {display_name}: {ver}")
+
+    ctx.exit()
+
+
 @click.group(
     cls=HelpColorsGroup,
     help_headers_color='cyan',
     help_options_color='green',
+)
+@click.option(
+    "--version", "-V",
+    is_flag=True,
+    callback=_print_version,
+    expose_value=False,
+    is_eager=True,
+    help="Show version information for all packages.",
 )
 def cli():
     """Search engine for your files!"""
