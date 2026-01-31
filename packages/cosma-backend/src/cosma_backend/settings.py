@@ -88,10 +88,35 @@ class ParserConfig:
 
 
 @dataclass
+class SchedulerRuleConfig:
+    rule: str = ""
+    operator: str = ""
+    value: Any = None
+    enabled: bool = True
+
+
+@dataclass
+class SchedulerConfig:
+    enabled: bool = False
+    combine_mode: str = "ALL"
+    check_interval_seconds: int = 30
+    rules: list[SchedulerRuleConfig] = field(default_factory=list)
+
+
+@dataclass
+class QueueConfig:
+    cooldown_seconds: int = 60
+    max_concurrency: int = 2
+    max_retries: int = 3
+
+
+@dataclass
 class Settings:
     embedder: EmbedderConfig = field(default_factory=EmbedderConfig)
     summarizer: SummarizerConfig = field(default_factory=SummarizerConfig)
     parser: ParserConfig = field(default_factory=ParserConfig)
+    queue: QueueConfig = field(default_factory=QueueConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +147,15 @@ def _from_dict(cls: type, data: dict[str, Any]) -> Any:
             continue
         raw = data[f.name]
         field_type = hints[f.name]
-        if dataclasses.is_dataclass(field_type) and isinstance(raw, dict):
+        # Handle list[SomeDataclass] types
+        origin = getattr(field_type, "__origin__", None)
+        if origin is list and isinstance(raw, list):
+            args = getattr(field_type, "__args__", ())
+            if args and dataclasses.is_dataclass(args[0]):
+                kwargs[f.name] = [_from_dict(args[0], item) if isinstance(item, dict) else item for item in raw]
+            else:
+                kwargs[f.name] = raw
+        elif dataclasses.is_dataclass(field_type) and isinstance(raw, dict):
             kwargs[f.name] = _from_dict(field_type, raw)
         else:
             kwargs[f.name] = _coerce(raw, field_type)

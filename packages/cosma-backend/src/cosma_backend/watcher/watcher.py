@@ -27,6 +27,7 @@ from cosma_backend.watcher.awatchdog import watch
 
 if TYPE_CHECKING:
     from cosma_backend.filter import FilterConfigManager
+    from cosma_backend.queue import IndexingQueue
 
 logger = get_logger(__name__)
 
@@ -38,24 +39,27 @@ class WatcherJob:
     pipeline: Pipeline
     db: Database
     watched_dir: WatchedDirectory
-    queue: asyncio.Queue[FileSystemEvent]
+    event_queue: asyncio.Queue[FileSystemEvent]
     observer: Optional[BaseObserver]
     task: Optional[asyncio.Task]
     closed: bool
     filter_manager: Optional["FilterConfigManager"]
+    indexing_queue: Optional["IndexingQueue"]
 
     def __init__(
         self,
         watched_dir: WatchedDirectory,
         pipeline: Pipeline,
         db: Database,
-        filter_manager: Optional["FilterConfigManager"] = None
+        filter_manager: Optional["FilterConfigManager"] = None,
+        indexing_queue: Optional["IndexingQueue"] = None,
     ):
         self.watched_dir = watched_dir
         self.pipeline = pipeline
         self.db = db
         self.filter_manager = filter_manager
-        self.queue = asyncio.Queue()
+        self.indexing_queue = indexing_queue
+        self.event_queue = asyncio.Queue()
         self.observer = None
         self.closed = False
         self.task = None
@@ -85,7 +89,7 @@ class WatcherJob:
             file_pattern=self.watched_dir.file_pattern
         ))
         
-        self.observer = await watch(self.watched_dir.path, self.queue, recursive=self.watched_dir.recursive)
+        self.observer = await watch(self.watched_dir.path, self.event_queue, recursive=self.watched_dir.recursive)
         self.task = asyncio.create_task(self.consumer_task())
         asyncio.create_task(self.do_initial_processing())
         
@@ -121,8 +125,10 @@ class WatcherJob:
             self.filter_manager.reload_directory(self.watched_dir.path)
 
     async def consumer_task(self):
+        from cosma_backend.queue import QueueAction
+
         while not self.closed:
-            event = await self.queue.get()
+            event = await self.event_queue.get()
 
             # Skip directory created and modified events - we only care about deletion/movement
             if isinstance(event, (DirCreatedEvent, DirModifiedEvent)):
@@ -130,7 +136,7 @@ class WatcherJob:
                 continue
 
             try:
-                # Handle directory deletion
+                # Handle directory deletion — direct DB ops + remove queued items
                 if isinstance(event, DirDeletedEvent):
                     logger.info("Directory deleted", path=event.src_path)
                     path = Path(str(event.src_path)).resolve()
@@ -138,8 +144,10 @@ class WatcherJob:
                     self._publish_update(Update.directory_deleted(str(path)))
                     deleted_files = await self.db.delete_files_in_directory(str(path))
                     logger.info("Deleted files from deleted directory", directory=str(path), count=len(deleted_files))
+                    if self.indexing_queue:
+                        await self.indexing_queue.remove_items_under(path)
 
-                # Handle directory movement
+                # Handle directory movement — direct DB ops + remove queued items
                 elif isinstance(event, DirMovedEvent):
                     logger.info("Directory moved", src=event.src_path, dest=event.dest_path)
                     src_path = Path(str(event.src_path)).resolve()
@@ -147,81 +155,89 @@ class WatcherJob:
 
                     self._publish_update(Update.directory_moved(str(src_path), str(dest_path)))
 
-                    # Delete all files at the old location
                     deleted_files = await self.db.delete_files_in_directory(str(src_path))
                     logger.info("Deleted files from moved directory", old_directory=str(src_path), count=len(deleted_files))
+                    if self.indexing_queue:
+                        await self.indexing_queue.remove_items_under(src_path)
 
                     # Process the new directory location if it exists
                     if dest_path.exists() and dest_path.is_dir():
                         logger.info("Processing files in new directory location", directory=str(dest_path))
                         await self.pipeline.process_directory(dest_path)
 
-                # Handle different event types
+                # File events → route through indexing queue
                 elif isinstance(event, FileDeletedEvent):
                     logger.info("File deleted", path=event.src_path)
                     path = Path(str(event.src_path)).resolve()
 
-                    # Check if config file was deleted
                     if self._is_config_file(path):
                         self._handle_config_change(path)
 
                     self._publish_update(Update.file_deleted(str(path)))
-                    await self.db.delete_file(str(path))
+
+                    if self.indexing_queue:
+                        await self.indexing_queue.enqueue(path, QueueAction.DELETE)
+                    else:
+                        await self.db.delete_file(str(path))
 
                 elif isinstance(event, FileMovedEvent):
-                    # Handle moved files as delete old + create new
                     logger.info("File moved", src=event.src_path, dest=event.dest_path)
                     src_path = Path(str(event.src_path)).resolve()
                     dest_path = Path(str(event.dest_path)).resolve()
 
                     self._publish_update(Update.file_moved(str(src_path), str(dest_path)))
-                    await self.db.delete_file(str(src_path))
 
-                    # Check if config file was moved
                     if self._is_config_file(dest_path):
                         self._handle_config_change(dest_path)
-                        continue  # Don't index config files
-
-                    # Check filter before processing destination
-                    if not self._should_include_file(dest_path):
-                        logger.debug("Skipping excluded file", path=str(dest_path))
+                        # Still delete old path from DB / queue
+                        if self.indexing_queue:
+                            await self.indexing_queue.enqueue(src_path, QueueAction.DELETE)
+                        else:
+                            await self.db.delete_file(str(src_path))
                         continue
 
-                    # Check if destination file type is supported before processing
-                    dest_file = File.from_path(dest_path)
-                    if await self.pipeline.is_supported(dest_file):
-                        await self.pipeline.process_file(dest_file)
+                    if not self._should_include_file(dest_path):
+                        logger.debug("Skipping excluded file", path=str(dest_path))
+                        if self.indexing_queue:
+                            await self.indexing_queue.enqueue(src_path, QueueAction.DELETE)
+                        else:
+                            await self.db.delete_file(str(src_path))
+                        continue
+
+                    if self.indexing_queue:
+                        await self.indexing_queue.enqueue(src_path, QueueAction.MOVE, dest_path=dest_path)
                     else:
-                        logger.debug("Skipping unsupported file type", path=str(dest_path))
+                        await self.db.delete_file(str(src_path))
+                        dest_file = File.from_path(dest_path)
+                        if await self.pipeline.is_supported(dest_file):
+                            await self.pipeline.process_file(dest_file)
 
                 elif isinstance(event, (FileCreatedEvent, FileModifiedEvent)):
-                    # Handle created and modified files the same way - process them
                     event_type = "created" if isinstance(event, FileCreatedEvent) else "modified"
                     logger.info(f"File {event_type}", path=event.src_path)
                     path = Path(str(event.src_path)).resolve()
 
-                    # Check if config file changed
                     if self._is_config_file(path):
                         self._handle_config_change(path)
-                        continue  # Don't index config files
+                        continue
 
-                    # Check filter before processing
                     if not self._should_include_file(path):
                         logger.debug("Skipping excluded file", path=str(path))
                         continue
 
-                    # Publish file system event update
                     if isinstance(event, FileCreatedEvent):
                         self._publish_update(Update.file_created(str(path)))
                     else:
                         self._publish_update(Update.file_modified(str(path)))
 
-                    # Check if file type is supported before processing
-                    file = File.from_path(path)
-                    if await self.pipeline.is_supported(file):
-                        await self.pipeline.process_file(file)
+                    if self.indexing_queue:
+                        await self.indexing_queue.enqueue(path, QueueAction.INDEX)
                     else:
-                        logger.debug("Skipping unsupported file type", path=str(path))
+                        file = File.from_path(path)
+                        if await self.pipeline.is_supported(file):
+                            await self.pipeline.process_file(file)
+                        else:
+                            logger.debug("Skipping unsupported file type", path=str(path))
 
                 else:
                     logger.warning("Unknown event type", event_type=type(event).__name__, path=event.src_path)
@@ -233,6 +249,7 @@ class WatcherJob:
 class Watcher:
     jobs: set[WatcherJob]
     filter_manager: Optional["FilterConfigManager"]
+    indexing_queue: Optional["IndexingQueue"]
 
     def __init__(
         self,
@@ -240,11 +257,13 @@ class Watcher:
         pipeline: Pipeline,
         updates_hub: Optional[Hub] = None,
         filter_manager: Optional["FilterConfigManager"] = None,
+        indexing_queue: Optional["IndexingQueue"] = None,
     ):
         self.db = db
         self.pipeline = pipeline
         self.updates_hub = updates_hub
         self.filter_manager = filter_manager
+        self.indexing_queue = indexing_queue
 
         self.jobs = set()
 
@@ -255,7 +274,7 @@ class Watcher:
         Args:
             watched_dir: WatchedDirectory instance to watch
         """
-        job = WatcherJob(watched_dir, self.pipeline, self.db, self.filter_manager)
+        job = WatcherJob(watched_dir, self.pipeline, self.db, self.filter_manager, self.indexing_queue)
         self.jobs.add(job)
         await job.start()
 

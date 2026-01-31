@@ -13,6 +13,7 @@ class FileResponse:
     accessed: datetime
     title: str | None
     summary: str | None
+    keywords: list[str] | None = None
 
 
 @dataclass

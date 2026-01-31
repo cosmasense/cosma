@@ -166,4 +166,5 @@ class File:
             accessed=self.accessed,
             title=self.title,
             summary=self.summary,
+            keywords=self.keywords,
         )

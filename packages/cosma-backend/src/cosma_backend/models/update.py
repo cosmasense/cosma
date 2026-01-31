@@ -39,11 +39,25 @@ class UpdateOpcode(enum.Enum):
     DIRECTORY_PROCESSING_STARTED = "directory_processing_started"
     DIRECTORY_PROCESSING_COMPLETED = "directory_processing_completed"
     
+    # Queue updates
+    QUEUE_ITEM_ADDED = "queue_item_added"
+    QUEUE_ITEM_UPDATED = "queue_item_updated"
+    QUEUE_ITEM_PROCESSING = "queue_item_processing"
+    QUEUE_ITEM_COMPLETED = "queue_item_completed"
+    QUEUE_ITEM_FAILED = "queue_item_failed"
+    QUEUE_ITEM_REMOVED = "queue_item_removed"
+    QUEUE_PAUSED = "queue_paused"
+    QUEUE_RESUMED = "queue_resumed"
+
+    # Scheduler updates
+    SCHEDULER_PAUSED = "scheduler_paused"
+    SCHEDULER_RESUMED = "scheduler_resumed"
+
     # General updates
     STATUS_UPDATE = "status_update"
     ERROR = "error"
     INFO = "info"
-    
+
     SHUTTING_DOWN = "shutting_down"
 
 

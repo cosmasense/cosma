@@ -1,0 +1,451 @@
+"""
+Indexing Queue
+
+Core queue with debounce, pause/resume, and a processing loop that feeds
+items to the pipeline after their cooldown expires.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
+
+from cosma_backend.logging import get_logger
+from cosma_backend.models import File
+from cosma_backend.models.update import Update, UpdateOpcode
+
+if TYPE_CHECKING:
+    from cosma_backend.pipeline import Pipeline
+    from cosma_backend.settings import QueueConfig
+    from cosma_backend.utils.pubsub import Hub
+
+logger = get_logger(__name__)
+
+
+class QueueAction(enum.Enum):
+    INDEX = "index"
+    DELETE = "delete"
+    MOVE = "move"
+
+
+class QueueItemStatus(enum.Enum):
+    COOLING_DOWN = "cooling_down"
+    READY = "ready"
+    PROCESSING = "processing"
+
+
+@dataclass
+class QueueItem:
+    id: str
+    file_path: str
+    action: QueueAction
+    status: QueueItemStatus
+    enqueued_at: float
+    cooldown_expires_at: float
+    dest_path: Optional[str] = None
+    retry_count: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "file_path": self.file_path,
+            "action": self.action.value,
+            "status": self.status.value,
+            "enqueued_at": self.enqueued_at,
+            "cooldown_expires_at": self.cooldown_expires_at,
+            "dest_path": self.dest_path,
+            "retry_count": self.retry_count,
+        }
+
+
+class IndexingQueue:
+    """
+    Queue that sits between the file watcher and the processing pipeline.
+
+    Files are enqueued with a cooldown (debounce) period. Rapid re-enqueue
+    of the same path resets the timer. Once the cooldown expires the item
+    becomes READY and is dispatched to ``Pipeline.process_file()``.
+    """
+
+    def __init__(
+        self,
+        pipeline: Pipeline,
+        updates_hub: Optional[Hub] = None,
+        config: Optional[QueueConfig] = None,
+    ):
+        from cosma_backend.settings import QueueConfig as _QC
+
+        self._pipeline = pipeline
+        self._updates_hub = updates_hub
+        self._config = config or _QC()
+
+        # keyed by file_path (src_path for MOVEs) for fast dedup/lookup
+        self._items: dict[str, QueueItem] = {}
+        # Reverse lookup: dest_path → src_path for MOVE items, so an INDEX
+        # for dest_path can find the existing MOVE and skip redundant work.
+        self._dest_to_src: dict[str, str] = {}
+        # Pending re-enqueue requests for items currently being processed.
+        # Keyed by file_path → (action, dest_path).
+        self._pending_reenqueue: dict[str, tuple[QueueAction, Optional[str]]] = {}
+        self._lock = asyncio.Lock()
+
+        self._manually_paused = False
+        self._scheduler_paused = False
+
+        self._processing_task: Optional[asyncio.Task] = None
+        self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
+
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
+
+    @property
+    def is_paused(self) -> bool:
+        return self._manually_paused or self._scheduler_paused
+
+    @property
+    def is_manually_paused(self) -> bool:
+        return self._manually_paused
+
+    @property
+    def is_scheduler_paused(self) -> bool:
+        return self._scheduler_paused
+
+    @property
+    def item_count(self) -> int:
+        return len(self._items)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the background processing loop."""
+        if self._processing_task is None or self._processing_task.done():
+            self._processing_task = asyncio.create_task(self._processing_loop())
+            logger.info("Indexing queue processing loop started")
+
+    async def stop(self) -> None:
+        """Stop the background processing loop."""
+        if self._processing_task is not None and not self._processing_task.done():
+            self._processing_task.cancel()
+            try:
+                await self._processing_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Indexing queue processing loop stopped")
+
+    # ------------------------------------------------------------------
+    # Pause / Resume
+    # ------------------------------------------------------------------
+
+    def manual_pause(self) -> None:
+        if not self._manually_paused:
+            self._manually_paused = True
+            self._publish(Update.create(UpdateOpcode.QUEUE_PAUSED, source="manual"))
+            logger.info("Queue manually paused")
+
+    def manual_resume(self) -> None:
+        if self._manually_paused:
+            self._manually_paused = False
+            self._publish(Update.create(UpdateOpcode.QUEUE_RESUMED, source="manual"))
+            logger.info("Queue manually resumed")
+
+    def scheduler_pause(self) -> None:
+        if not self._scheduler_paused:
+            self._scheduler_paused = True
+            self._publish(Update.create(UpdateOpcode.SCHEDULER_PAUSED))
+            logger.info("Queue paused by scheduler")
+
+    def scheduler_resume(self) -> None:
+        if self._scheduler_paused:
+            self._scheduler_paused = False
+            self._publish(Update.create(UpdateOpcode.SCHEDULER_RESUMED))
+            logger.info("Queue resumed by scheduler")
+
+    # ------------------------------------------------------------------
+    # Enqueue / Remove
+    # ------------------------------------------------------------------
+
+    async def enqueue(
+        self,
+        file_path: str | Path,
+        action: QueueAction,
+        dest_path: Optional[str | Path] = None,
+    ) -> QueueItem:
+        """Add or update an item in the queue with debounce."""
+        key = str(Path(file_path).resolve())
+        dest_key = str(Path(dest_path).resolve()) if dest_path else None
+        now = time.time()
+
+        async with self._lock:
+            existing = self._items.get(key)
+
+            # If an INDEX arrives for a path that is the dest of a pending MOVE,
+            # the MOVE already covers it — just reset the MOVE's cooldown.
+            if existing is None and action == QueueAction.INDEX:
+                src_key = self._dest_to_src.get(key)
+                if src_key is not None:
+                    move_item = self._items.get(src_key)
+                    if move_item is not None and move_item.status == QueueItemStatus.COOLING_DOWN:
+                        move_item.cooldown_expires_at = now + self._config.cooldown_seconds
+                        self._publish(Update.create(
+                            UpdateOpcode.QUEUE_ITEM_UPDATED, **move_item.to_dict()
+                        ))
+                        logger.info("INDEX for MOVE dest_path, reset MOVE cooldown",
+                                    dest_path=key, src_path=src_key)
+                        return move_item
+                    # If MOVE is PROCESSING or READY, let the INDEX create a new
+                    # item keyed by dest_path — it will re-index after the MOVE.
+
+            if existing is not None:
+                if existing.status == QueueItemStatus.PROCESSING:
+                    # Item is currently being processed. Stash the new request
+                    # so _process_item can re-enqueue it after completion.
+                    dp = str(dest_path) if dest_path else None
+                    self._pending_reenqueue[key] = (action, dp)
+                    logger.info("Item currently processing, pending re-enqueue",
+                                file_path=key, action=action.value)
+                    return existing
+
+                if existing.status == QueueItemStatus.COOLING_DOWN:
+                    # Clean up old dest mapping if action is changing
+                    if existing.action == QueueAction.MOVE and existing.dest_path:
+                        self._dest_to_src.pop(existing.dest_path, None)
+
+                    # DELETE on a cooling-down item → make it ready immediately
+                    if action == QueueAction.DELETE:
+                        existing.action = QueueAction.DELETE
+                        existing.dest_path = None
+                        existing.cooldown_expires_at = now
+                        existing.status = QueueItemStatus.READY
+                        self._publish(Update.create(
+                            UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
+                        ))
+                        logger.info("Queue item fast-tracked to DELETE", file_path=key)
+                        return existing
+
+                    # Otherwise reset the cooldown timer
+                    existing.action = action
+                    existing.cooldown_expires_at = now + self._config.cooldown_seconds
+                    existing.dest_path = dest_key if dest_key else existing.dest_path
+                    # Update dest mapping
+                    if action == QueueAction.MOVE and existing.dest_path:
+                        self._dest_to_src[existing.dest_path] = key
+                    self._publish(Update.create(
+                        UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
+                    ))
+                    logger.info("Queue item cooldown reset", file_path=key)
+                    return existing
+
+            # New item
+            item = QueueItem(
+                id=str(uuid.uuid4()),
+                file_path=key,
+                action=action,
+                status=QueueItemStatus.COOLING_DOWN,
+                enqueued_at=now,
+                cooldown_expires_at=now + self._config.cooldown_seconds,
+                dest_path=dest_key,
+            )
+            self._items[key] = item
+            if action == QueueAction.MOVE and dest_key:
+                self._dest_to_src[dest_key] = key
+            self._publish(Update.create(
+                UpdateOpcode.QUEUE_ITEM_ADDED, **item.to_dict()
+            ))
+            logger.info("Item enqueued", file_path=key, action=action.value)
+            return item
+
+    async def remove_item(self, item_id: str) -> bool:
+        """Remove an item by its ID. Returns True if found and removed."""
+        async with self._lock:
+            for key, item in self._items.items():
+                if item.id == item_id:
+                    del self._items[key]
+                    self._cleanup_dest_map(item)
+                    self._publish(Update.create(
+                        UpdateOpcode.QUEUE_ITEM_REMOVED, **item.to_dict()
+                    ))
+                    logger.info("Queue item removed", item_id=item_id, file_path=key)
+                    return True
+        return False
+
+    async def remove_items_under(self, directory: str | Path) -> int:
+        """Remove all queued items whose path is under the given directory."""
+        prefix = str(Path(directory).resolve())
+        removed = 0
+        async with self._lock:
+            keys_to_remove = [
+                k for k in self._items
+                if k.startswith(prefix + "/") or k == prefix
+            ]
+            for key in keys_to_remove:
+                item = self._items.pop(key)
+                self._cleanup_dest_map(item)
+                self._publish(Update.create(
+                    UpdateOpcode.QUEUE_ITEM_REMOVED, **item.to_dict()
+                ))
+                removed += 1
+        if removed:
+            logger.info("Removed items under directory", directory=prefix, count=removed)
+        return removed
+
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
+    async def get_items(self) -> list[QueueItem]:
+        async with self._lock:
+            return list(self._items.values())
+
+    async def get_item(self, item_id: str) -> Optional[QueueItem]:
+        async with self._lock:
+            for item in self._items.values():
+                if item.id == item_id:
+                    return item
+            return None
+
+    async def get_status(self) -> dict:
+        async with self._lock:
+            items = list(self._items.values())
+        return {
+            "paused": self.is_paused,
+            "manually_paused": self._manually_paused,
+            "scheduler_paused": self._scheduler_paused,
+            "total_items": len(items),
+            "cooling_down": sum(1 for i in items if i.status == QueueItemStatus.COOLING_DOWN),
+            "ready": sum(1 for i in items if i.status == QueueItemStatus.READY),
+            "processing": sum(1 for i in items if i.status == QueueItemStatus.PROCESSING),
+        }
+
+    # ------------------------------------------------------------------
+    # Processing loop
+    # ------------------------------------------------------------------
+
+    async def _processing_loop(self) -> None:
+        """Main loop: transition items through cooldown → ready → processing."""
+        while True:
+            try:
+                if self.is_paused:
+                    await asyncio.sleep(1)
+                    continue
+
+                now = time.time()
+                ready_items: list[QueueItem] = []
+
+                async with self._lock:
+                    for item in self._items.values():
+                        if (
+                            item.status == QueueItemStatus.COOLING_DOWN
+                            and now >= item.cooldown_expires_at
+                        ):
+                            item.status = QueueItemStatus.READY
+
+                    ready_items = [
+                        i for i in self._items.values()
+                        if i.status == QueueItemStatus.READY
+                    ]
+
+                if ready_items:
+                    tasks = [self._process_item(item) for item in ready_items]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error in queue processing loop")
+                await asyncio.sleep(1)
+
+    async def _process_item(self, item: QueueItem) -> None:
+        """Process a single queue item through the pipeline."""
+        async with self._semaphore:
+            async with self._lock:
+                # Item may have been removed while waiting for the semaphore
+                if item.file_path not in self._items:
+                    return
+                item.status = QueueItemStatus.PROCESSING
+
+            self._publish(Update.create(
+                UpdateOpcode.QUEUE_ITEM_PROCESSING, **item.to_dict()
+            ))
+
+            try:
+                if item.action == QueueAction.DELETE:
+                    await self._pipeline.db.delete_file(item.file_path)
+                elif item.action == QueueAction.MOVE:
+                    await self._pipeline.db.delete_file(item.file_path)
+                    if item.dest_path:
+                        dest_file = File.from_path(Path(item.dest_path))
+                        if await self._pipeline.is_supported(dest_file):
+                            await self._pipeline.process_file(dest_file)
+                elif item.action == QueueAction.INDEX:
+                    file = File.from_path(Path(item.file_path))
+                    if await self._pipeline.is_supported(file):
+                        await self._pipeline.process_file(file)
+
+                # Success — remove from queue
+                async with self._lock:
+                    self._items.pop(item.file_path, None)
+                    self._cleanup_dest_map(item)
+                self._publish(Update.create(
+                    UpdateOpcode.QUEUE_ITEM_COMPLETED, **item.to_dict()
+                ))
+                logger.info("Queue item completed", file_path=item.file_path, action=item.action.value)
+
+            except Exception as e:
+                item.retry_count += 1
+                if item.retry_count >= self._config.max_retries:
+                    async with self._lock:
+                        self._items.pop(item.file_path, None)
+                        self._cleanup_dest_map(item)
+                    item_data = item.to_dict()
+                    item_data["error"] = str(e)
+                    self._publish(Update.create(
+                        UpdateOpcode.QUEUE_ITEM_FAILED, **item_data
+                    ))
+                    logger.error("Queue item failed permanently",
+                                 file_path=item.file_path, error=str(e),
+                                 retry_count=item.retry_count)
+                else:
+                    # Put back into cooldown for retry
+                    item.status = QueueItemStatus.COOLING_DOWN
+                    item.cooldown_expires_at = time.time() + self._config.cooldown_seconds
+                    self._publish(Update.create(
+                        UpdateOpcode.QUEUE_ITEM_UPDATED, **item.to_dict()
+                    ))
+                    logger.warning("Queue item failed, will retry",
+                                   file_path=item.file_path, error=str(e),
+                                   retry_count=item.retry_count)
+            finally:
+                # Check if a new event arrived while we were processing
+                await self._handle_pending_reenqueue(item.file_path)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _handle_pending_reenqueue(self, file_path: str) -> None:
+        """Re-enqueue a file if a new event arrived while it was being processed."""
+        async with self._lock:
+            pending = self._pending_reenqueue.pop(file_path, None)
+        if pending is not None:
+            action, dest = pending
+            logger.info("Re-enqueueing after processing completed",
+                        file_path=file_path, action=action.value)
+            await self.enqueue(file_path, action, dest_path=dest)
+
+    def _cleanup_dest_map(self, item: QueueItem) -> None:
+        """Remove the dest_path → src_path reverse mapping for a MOVE item."""
+        if item.action == QueueAction.MOVE and item.dest_path:
+            self._dest_to_src.pop(item.dest_path, None)
+
+    def _publish(self, update: Update) -> None:
+        if self._updates_hub:
+            self._updates_hub.publish(update)

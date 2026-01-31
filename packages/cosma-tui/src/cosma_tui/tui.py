@@ -6,19 +6,24 @@ Cosma TUI - A file search interface using Textual
 import json
 import sys
 import asyncio
+import time
 from typing import List, Optional
 from pathlib import Path
 
 from cosma_tui.error_modal import ConnectionErrorModal
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
-from textual.widgets import Input, Static, ListView, ListItem, Label
+from textual.containers import Vertical, Horizontal
+from textual.widgets import Input, Static, ListView, ListItem, Label, ProgressBar
 from textual.binding import Binding
 from textual.worker import Worker, WorkerState
 
 from cosma_client import Client, Update
+from cosma_client.models import UpdateOpcode
 from .config import get_config
 from .onboarding import ThemeSelectionScreen, get_available_themes
+
+# Window for tracking progress (seconds)
+PROGRESS_WINDOW_SECONDS = 30 * 60  # 30 minutes
 
 
 class SearchListView(ListView):
@@ -111,6 +116,28 @@ class CosmaApp(App):
         padding: 0 1;
     }
 
+    #progress-container {
+        height: 1;
+        display: none;
+        padding: 0 1;
+        background: $surface-darken-1;
+    }
+
+    #progress-container.visible {
+        display: block;
+    }
+
+    #progress-bar {
+        width: 1fr;
+    }
+
+    #progress-label {
+        width: auto;
+        min-width: 10;
+        text-align: right;
+        padding: 0 0 0 1;
+    }
+
     ListItem {
         padding: 0 1;
     }
@@ -189,7 +216,12 @@ class CosmaApp(App):
         self.pending_query: Optional[str] = None
         self.last_search_time: float = 0.0
         self.show_onboarding = show_onboarding
-        
+
+        # Progress tracking: items within the time window
+        # Each entry: {"file_path": str, "added_at": float, "completed": bool}
+        self._progress_items: dict[str, dict] = {}
+        self._progress_visible: bool = False
+
         # Load and apply theme from config
         config = get_config()
         theme = config.get_theme()
@@ -202,6 +234,9 @@ class CosmaApp(App):
             with Vertical(classes="list-wrapper"):
                 yield SearchListView(id="list", initial_index=0)
 
+            with Horizontal(id="progress-container"):
+                yield ProgressBar(id="progress-bar", total=100, show_eta=False, show_percentage=True)
+                yield Static("0/0", id="progress-label")
             yield Static(self.status_message, classes="status", id="status")
             yield Input(placeholder="Type to search...", id="search")
 
@@ -262,22 +297,82 @@ class CosmaApp(App):
         await self._initialize_app()
 
     async def listen_to_updates(self) -> None:
-        """Listen to server-sent events and update status bar"""
+        """Listen to server-sent events and update status bar + progress"""
         try:
             self.log("Starting SSE listener...")
-            async for update in self.client.stream_updates():                    
+            async for update in self.client.stream_updates():
                 if not self.running:
                     break
-                # Update is now an Update instance, use its display message
                 if isinstance(update, Update):
+                    self._handle_progress_update(update)
                     self.update_status(update.get_display_message())
                 else:
-                    # Fallback for unexpected data
                     self.update_status(str(update))
         except Exception as e:
             self.log(f"SSE Exception: {e}")
             self.update_status(f"Can't connect: {str(e)}")
             self.push_screen(ConnectionErrorModal())
+
+    def _handle_progress_update(self, update: Update) -> None:
+        """Track queue events for the progress bar."""
+        now = time.time()
+
+        # Expire old items beyond the window
+        self._expire_old_progress_items(now)
+
+        opcode = update.opcode
+        file_path = update.data.get("file_path", "")
+
+        if opcode == UpdateOpcode.QUEUE_ITEM_ADDED and file_path:
+            self._progress_items[file_path] = {
+                "file_path": file_path,
+                "added_at": now,
+                "completed": False,
+            }
+        elif opcode in (
+            UpdateOpcode.QUEUE_ITEM_COMPLETED,
+            UpdateOpcode.QUEUE_ITEM_FAILED,
+        ) and file_path:
+            if file_path in self._progress_items:
+                self._progress_items[file_path]["completed"] = True
+        elif opcode == UpdateOpcode.QUEUE_ITEM_REMOVED and file_path:
+            # Removed items drop from the total entirely
+            self._progress_items.pop(file_path, None)
+
+        self._refresh_progress_bar()
+
+    def _expire_old_progress_items(self, now: float) -> None:
+        """Remove completed items older than the progress window."""
+        cutoff = now - PROGRESS_WINDOW_SECONDS
+        expired = [
+            k for k, v in self._progress_items.items()
+            if v["added_at"] < cutoff and v["completed"]
+        ]
+        for k in expired:
+            del self._progress_items[k]
+
+    def _refresh_progress_bar(self) -> None:
+        """Update the progress bar widget based on current tracking state."""
+        total = len(self._progress_items)
+        completed = sum(1 for v in self._progress_items.values() if v["completed"])
+
+        container = self.query_one("#progress-container")
+
+        if total == 0:
+            if self._progress_visible:
+                container.remove_class("visible")
+                self._progress_visible = False
+            return
+
+        if not self._progress_visible:
+            container.add_class("visible")
+            self._progress_visible = True
+
+        bar = self.query_one("#progress-bar", ProgressBar)
+        label = self.query_one("#progress-label", Static)
+
+        bar.update(total=total, progress=completed)
+        label.update(f"{completed}/{total}")
 
     def update_status(self, message: str) -> None:
         """Update the status bar from any thread"""

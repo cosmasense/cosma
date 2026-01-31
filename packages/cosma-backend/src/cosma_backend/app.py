@@ -24,6 +24,8 @@ from cosma_backend.summarizer import AutoSummarizer
 from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.watcher import Watcher
 from cosma_backend.filter import FilterConfigManager
+from cosma_backend.queue import IndexingQueue
+from cosma_backend.queue.scheduler import Scheduler
 
 load_dotenv()
 
@@ -39,6 +41,8 @@ class App(Quart):
     filter_manager: FilterConfigManager
     settings_manager: SettingsManager
     dirs: PlatformDirs
+    indexing_queue: IndexingQueue
+    scheduler: Scheduler
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -121,10 +125,25 @@ async def initialize_services():
         embedder=embedder,
     )
 
+    app.indexing_queue = IndexingQueue(
+        pipeline=app.pipeline,
+        updates_hub=app.updates_hub,
+        config=settings.queue,
+    )
+    app.indexing_queue.start()
+
+    app.scheduler = Scheduler(
+        queue=app.indexing_queue,
+        updates_hub=app.updates_hub,
+        config=settings.scheduler,
+    )
+    app.scheduler.start()
+
     app.watcher = Watcher(
         db=app.db,
         pipeline=app.pipeline,
         filter_manager=app.filter_manager,
+        indexing_queue=app.indexing_queue,
     )
 
     # Run startup cleanup to remove excluded files from database
@@ -201,6 +220,9 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
 
 @app.after_serving
 async def handle_shutdown():
+    logger.info("Stopping scheduler and indexing queue")
+    await app.scheduler.stop()
+    await app.indexing_queue.stop()
     logger.info("Closing DB")
     await app.db.close()
     
