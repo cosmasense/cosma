@@ -723,5 +723,47 @@ class Database:
             return rows
 
 
+    # ====== Queue Item Persistence ======
+
+    async def upsert_queue_item(self, item: dict) -> None:
+        """Insert or replace a queue item."""
+        SQL = """
+            INSERT OR REPLACE INTO queue_items
+                (id, file_path, action, status, enqueued_at, cooldown_expires_at, dest_path, retry_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        async with self.acquire() as conn:
+            await conn.execute(SQL, (
+                item["id"],
+                item["file_path"],
+                item["action"],
+                item["status"],
+                item["enqueued_at"],
+                item["cooldown_expires_at"],
+                item.get("dest_path"),
+                item.get("retry_count", 0),
+            ))
+
+    async def get_queue_items(self) -> list[dict]:
+        """Get all persisted queue items."""
+        SQL = "SELECT * FROM queue_items"
+        async with self.acquire() as conn:
+            rows = await conn.fetchall(SQL)
+            return [dict(row) for row in rows]
+
+    async def delete_queue_item(self, item_id: str) -> None:
+        """Delete a queue item by id."""
+        SQL = "DELETE FROM queue_items WHERE id = ?"
+        async with self.acquire() as conn:
+            await conn.execute(SQL, (item_id,))
+
+    async def delete_queue_items_under(self, directory: str) -> int:
+        """Delete queue items whose file_path is under the given directory."""
+        SQL = "DELETE FROM queue_items WHERE file_path LIKE ? || '/%' OR file_path = ?"
+        async with self.acquire() as conn:
+            cursor = await conn.execute(SQL, (directory, directory))
+            return cursor.get_cursor().rowcount
+
+
 async def connect(path: str) -> Database:
     return await Database.from_path(path)

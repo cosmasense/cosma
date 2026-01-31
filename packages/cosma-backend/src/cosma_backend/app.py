@@ -129,8 +129,9 @@ async def initialize_services():
         pipeline=app.pipeline,
         updates_hub=app.updates_hub,
         config=settings.queue,
+        db=app.db,
     )
-    app.indexing_queue.start()
+    await app.indexing_queue.start()
 
     app.scheduler = Scheduler(
         queue=app.indexing_queue,

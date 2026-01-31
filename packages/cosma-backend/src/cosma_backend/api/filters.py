@@ -357,15 +357,28 @@ async def test_patterns(data: TestPatternRequest) -> tuple[TestPatternResponse, 
         mode = FilterMode.BLACKLIST
 
     # Create temporary config for testing
-    # Split patterns into exclude and include based on ! prefix
-    exclude_patterns = [p for p in data.patterns if not p.startswith("!")]
-    include_patterns = [p[1:] for p in data.patterns if p.startswith("!")]
+    # Split patterns into exclude and include based on ! prefix and mode
+    if mode == FilterMode.WHITELIST:
+        # In whitelist mode: non-! patterns are include, ! patterns are exclude
+        include_patterns = [p for p in data.patterns if not p.startswith("!")]
+        exclude_patterns = [p[1:] for p in data.patterns if p.startswith("!")]
+    else:
+        # In blacklist mode: non-! patterns are exclude, ! patterns are include
+        exclude_patterns = [p for p in data.patterns if not p.startswith("!")]
+        include_patterns = [p[1:] for p in data.patterns if p.startswith("!")]
 
-    test_config = FilterConfig(
-        mode=mode,
-        exclude=exclude_patterns,
-        include=include_patterns,
-    )
+    if mode == FilterMode.WHITELIST:
+        test_config = FilterConfig(
+            mode=mode,
+            whitelist_include=include_patterns,
+            whitelist_exclude=exclude_patterns,
+        )
+    else:
+        test_config = FilterConfig(
+            mode=mode,
+            blacklist_exclude=exclude_patterns,
+            blacklist_include=include_patterns,
+        )
 
     results = []
     for file_path_str in data.file_paths:
@@ -379,13 +392,23 @@ async def test_patterns(data: TestPatternRequest) -> tuple[TestPatternResponse, 
         matched_pattern = None
         filename = file_path.name
 
-        if not included:
-            # Check exclude patterns
-            for pattern in exclude_patterns:
-                temp_config = FilterConfig(mode=mode, exclude=[pattern], include=[])
-                if not temp_config.should_include(file_path, base_path):
-                    matched_pattern = pattern
-                    break
+        if mode == FilterMode.WHITELIST:
+            if included:
+                # In whitelist mode, file is included because an include pattern matched
+                for pattern in include_patterns:
+                    temp_config = FilterConfig(mode=mode, whitelist_include=[pattern])
+                    if temp_config.should_include(file_path, base_path):
+                        matched_pattern = pattern
+                        break
+            # If not included in whitelist mode, no pattern matched (matched_pattern stays None)
+        else:
+            if not included:
+                # In blacklist mode, file is excluded because an exclude pattern matched
+                for pattern in exclude_patterns:
+                    temp_config = FilterConfig(mode=mode, blacklist_exclude=[pattern])
+                    if not temp_config.should_include(file_path, base_path):
+                        matched_pattern = pattern
+                        break
 
         results.append(PatternTestResult(
             file_path=file_path_str,

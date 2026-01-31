@@ -201,6 +201,7 @@ class CosmaApp(App):
         Binding("enter", "select", "Select"),
         Binding("up", "cursor_up", "Up"),
         Binding("down", "cursor_down", "Down"),
+        Binding("p", "toggle_pause", "Pause/Resume"),
     ]
 
     def __init__(self, directory: str = "./test2", base_url: str = "http://127.0.0.1:60534", show_onboarding: bool = False):
@@ -216,6 +217,9 @@ class CosmaApp(App):
         self.pending_query: Optional[str] = None
         self.last_search_time: float = 0.0
         self.show_onboarding = show_onboarding
+
+        # Queue paused state
+        self._queue_paused: bool = False
 
         # Progress tracking: items within the time window
         # Each entry: {"file_path": str, "added_at": float, "completed": bool}
@@ -338,6 +342,14 @@ class CosmaApp(App):
         elif opcode == UpdateOpcode.QUEUE_ITEM_REMOVED and file_path:
             # Removed items drop from the total entirely
             self._progress_items.pop(file_path, None)
+        elif opcode == UpdateOpcode.QUEUE_PAUSED:
+            self._queue_paused = True
+        elif opcode == UpdateOpcode.QUEUE_RESUMED:
+            self._queue_paused = False
+        elif opcode == UpdateOpcode.SCHEDULER_PAUSED:
+            self._queue_paused = True
+        elif opcode == UpdateOpcode.SCHEDULER_RESUMED:
+            self._queue_paused = False
 
         self._refresh_progress_bar()
 
@@ -377,9 +389,19 @@ class CosmaApp(App):
     def update_status(self, message: str) -> None:
         """Update the status bar from any thread"""
         status = self.query_one("#status", Static)
+        parts = []
+        if self._queue_paused:
+            parts.append("[bold yellow]PAUSED[/]")
+        total = len(self._progress_items)
+        if total > 0:
+            completed = sum(1 for v in self._progress_items.values() if v["completed"])
+            parts.append(f"Queue: {completed}/{total}")
         # Add loading indicator if searching
         if self.is_searching:
             message = f"⏳ {message}"
+        if parts:
+            prefix = " | ".join(parts)
+            message = f"{prefix}  {message}"
         status.update(message)
 
     async def index_directory(self) -> dict:
@@ -546,6 +568,22 @@ class CosmaApp(App):
         """Move cursor down in the list"""
         list_view = self.query_one("#list", SearchListView)
         list_view.action_cursor_down()
+
+    def action_toggle_pause(self) -> None:
+        """Toggle queue pause/resume"""
+        self.run_worker(self._toggle_pause(), exclusive=True, group="pause")
+
+    async def _toggle_pause(self) -> dict:
+        """Pause or resume the queue"""
+        if self._queue_paused:
+            result = await self.client.resume_queue()
+            self._queue_paused = False
+            self.update_status("Queue resumed")
+        else:
+            result = await self.client.pause_queue()
+            self._queue_paused = True
+            self.update_status("Queue paused")
+        return result
 
     async def action_quit(self) -> None:
         """Quit the application"""

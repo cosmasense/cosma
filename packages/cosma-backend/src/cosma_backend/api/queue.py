@@ -40,6 +40,9 @@ class QueueActionResponse:
 @dataclass
 class QueueItemsResponse:
     items: list[dict[str, Any]]
+    total_count: int
+    offset: int
+    limit: int
 
 
 @dataclass
@@ -88,8 +91,19 @@ async def queue_resume() -> tuple[QueueActionResponse, int]:
 @queue_bp.get("/items")
 @validate_response(QueueItemsResponse, 200)
 async def queue_items() -> tuple[QueueItemsResponse, int]:
-    items = await current_app.indexing_queue.get_items()
-    return QueueItemsResponse(items=[i.to_dict() for i in items]), 200
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", 50, type=int)
+
+    all_items = await current_app.indexing_queue.get_items()
+    total_count = len(all_items)
+    paginated = all_items[offset:offset + limit]
+
+    return QueueItemsResponse(
+        items=[i.to_dict() for i in paginated],
+        total_count=total_count,
+        offset=offset,
+        limit=limit,
+    ), 200
 
 
 @queue_bp.delete("/items/<item_id>")

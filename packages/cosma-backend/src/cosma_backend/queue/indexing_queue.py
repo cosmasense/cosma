@@ -20,6 +20,7 @@ from cosma_backend.models import File
 from cosma_backend.models.update import Update, UpdateOpcode
 
 if TYPE_CHECKING:
+    from cosma_backend.db.database import Database
     from cosma_backend.pipeline import Pipeline
     from cosma_backend.settings import QueueConfig
     from cosma_backend.utils.pubsub import Hub
@@ -77,12 +78,14 @@ class IndexingQueue:
         pipeline: Pipeline,
         updates_hub: Optional[Hub] = None,
         config: Optional[QueueConfig] = None,
+        db: Optional["Database"] = None,
     ):
         from cosma_backend.settings import QueueConfig as _QC
 
         self._pipeline = pipeline
         self._updates_hub = updates_hub
         self._config = config or _QC()
+        self._db = db
 
         # keyed by file_path (src_path for MOVEs) for fast dedup/lookup
         self._items: dict[str, QueueItem] = {}
@@ -124,8 +127,9 @@ class IndexingQueue:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
-        """Start the background processing loop."""
+    async def start(self) -> None:
+        """Load persisted items and start the background processing loop."""
+        await self._load_from_db()
         if self._processing_task is None or self._processing_task.done():
             self._processing_task = asyncio.create_task(self._processing_loop())
             logger.info("Indexing queue processing loop started")
@@ -227,6 +231,7 @@ class IndexingQueue:
                         self._publish(Update.create(
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                         ))
+                        await self._save_item(existing)
                         logger.info("Queue item fast-tracked to DELETE", file_path=key)
                         return existing
 
@@ -240,6 +245,7 @@ class IndexingQueue:
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                     ))
+                    await self._save_item(existing)
                     logger.info("Queue item cooldown reset", file_path=key)
                     return existing
 
@@ -259,6 +265,7 @@ class IndexingQueue:
             self._publish(Update.create(
                 UpdateOpcode.QUEUE_ITEM_ADDED, **item.to_dict()
             ))
+            await self._save_item(item)
             logger.info("Item enqueued", file_path=key, action=action.value)
             return item
 
@@ -272,6 +279,7 @@ class IndexingQueue:
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_REMOVED, **item.to_dict()
                     ))
+                    await self._delete_item_from_db(item_id)
                     logger.info("Queue item removed", item_id=item_id, file_path=key)
                     return True
         return False
@@ -292,7 +300,11 @@ class IndexingQueue:
                     UpdateOpcode.QUEUE_ITEM_REMOVED, **item.to_dict()
                 ))
                 removed += 1
-        if removed:
+        if removed and self._db is not None:
+            try:
+                await self._db.delete_queue_items_under(prefix)
+            except Exception:
+                logger.exception("Failed to delete queue items under directory from DB")
             logger.info("Removed items under directory", directory=prefix, count=removed)
         return removed
 
@@ -397,6 +409,7 @@ class IndexingQueue:
                 self._publish(Update.create(
                     UpdateOpcode.QUEUE_ITEM_COMPLETED, **item.to_dict()
                 ))
+                await self._delete_item_from_db(item.id)
                 logger.info("Queue item completed", file_path=item.file_path, action=item.action.value)
 
             except Exception as e:
@@ -410,19 +423,24 @@ class IndexingQueue:
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_FAILED, **item_data
                     ))
+                    await self._delete_item_from_db(item.id)
                     logger.error("Queue item failed permanently",
                                  file_path=item.file_path, error=str(e),
                                  retry_count=item.retry_count)
                 else:
-                    # Put back into cooldown for retry
+                    # Exponential backoff: base * 2^(retry-1), capped at 8x base
+                    backoff = self._config.cooldown_seconds * (2 ** (item.retry_count - 1))
+                    max_backoff = self._config.cooldown_seconds * 8
                     item.status = QueueItemStatus.COOLING_DOWN
-                    item.cooldown_expires_at = time.time() + self._config.cooldown_seconds
+                    item.cooldown_expires_at = time.time() + min(backoff, max_backoff)
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_UPDATED, **item.to_dict()
                     ))
+                    await self._save_item(item)
                     logger.warning("Queue item failed, will retry",
                                    file_path=item.file_path, error=str(e),
-                                   retry_count=item.retry_count)
+                                   retry_count=item.retry_count,
+                                   backoff_seconds=min(backoff, max_backoff))
             finally:
                 # Check if a new event arrived while we were processing
                 await self._handle_pending_reenqueue(item.file_path)
@@ -430,6 +448,62 @@ class IndexingQueue:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    async def _load_from_db(self) -> None:
+        """Load persisted queue items from the database on startup."""
+        if self._db is None:
+            return
+        try:
+            rows = await self._db.get_queue_items()
+            for row in rows:
+                action = QueueAction(row["action"])
+                # Restore PROCESSING items as READY so they get re-processed
+                raw_status = row["status"]
+                if raw_status == "processing":
+                    status = QueueItemStatus.READY
+                else:
+                    status = QueueItemStatus(raw_status)
+
+                item = QueueItem(
+                    id=row["id"],
+                    file_path=row["file_path"],
+                    action=action,
+                    status=status,
+                    enqueued_at=row["enqueued_at"],
+                    cooldown_expires_at=row["cooldown_expires_at"],
+                    dest_path=row.get("dest_path"),
+                    retry_count=row.get("retry_count", 0),
+                )
+                self._items[item.file_path] = item
+                if action == QueueAction.MOVE and item.dest_path:
+                    self._dest_to_src[item.dest_path] = item.file_path
+
+            if rows:
+                logger.info("Loaded queue items from database", count=len(rows))
+        except Exception:
+            logger.exception("Failed to load queue items from database")
+
+    async def _save_item(self, item: QueueItem) -> None:
+        """Persist a queue item to the database."""
+        if self._db is None:
+            return
+        try:
+            await self._db.upsert_queue_item(item.to_dict())
+        except Exception:
+            logger.exception("Failed to persist queue item", file_path=item.file_path)
+
+    async def _delete_item_from_db(self, item_id: str) -> None:
+        """Remove a queue item from the database."""
+        if self._db is None:
+            return
+        try:
+            await self._db.delete_queue_item(item_id)
+        except Exception:
+            logger.exception("Failed to delete queue item from DB", item_id=item_id)
 
     async def _handle_pending_reenqueue(self, file_path: str) -> None:
         """Re-enqueue a file if a new event arrived while it was being processed."""

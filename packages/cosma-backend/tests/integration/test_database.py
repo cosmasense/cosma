@@ -277,3 +277,88 @@ class TestDatabaseOperations:
         # Note: We can't easily verify the timestamp changed without
         # implementing a updated_at field in the File model or adding
         # a direct database query here
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestQueueItemCrud:
+    """Test queue_items table CRUD operations."""
+
+    async def test_upsert_and_get_queue_items(self, temp_db: Database):
+        item = {
+            "id": "test-id-1",
+            "file_path": "/tmp/test.txt",
+            "action": "index",
+            "status": "cooling_down",
+            "enqueued_at": 1000.0,
+            "cooldown_expires_at": 1060.0,
+            "dest_path": None,
+            "retry_count": 0,
+        }
+        await temp_db.upsert_queue_item(item)
+
+        items = await temp_db.get_queue_items()
+        assert len(items) == 1
+        assert items[0]["id"] == "test-id-1"
+        assert items[0]["file_path"] == "/tmp/test.txt"
+        assert items[0]["action"] == "index"
+
+    async def test_upsert_replaces_existing(self, temp_db: Database):
+        item = {
+            "id": "test-id-2",
+            "file_path": "/tmp/test2.txt",
+            "action": "index",
+            "status": "cooling_down",
+            "enqueued_at": 1000.0,
+            "cooldown_expires_at": 1060.0,
+            "dest_path": None,
+            "retry_count": 0,
+        }
+        await temp_db.upsert_queue_item(item)
+
+        # Update status
+        item["status"] = "ready"
+        item["retry_count"] = 2
+        await temp_db.upsert_queue_item(item)
+
+        items = await temp_db.get_queue_items()
+        assert len(items) == 1
+        assert items[0]["status"] == "ready"
+        assert items[0]["retry_count"] == 2
+
+    async def test_delete_queue_item(self, temp_db: Database):
+        item = {
+            "id": "test-id-3",
+            "file_path": "/tmp/test3.txt",
+            "action": "delete",
+            "status": "ready",
+            "enqueued_at": 1000.0,
+            "cooldown_expires_at": 1000.0,
+            "dest_path": None,
+            "retry_count": 0,
+        }
+        await temp_db.upsert_queue_item(item)
+        await temp_db.delete_queue_item("test-id-3")
+
+        items = await temp_db.get_queue_items()
+        assert len(items) == 0
+
+    async def test_delete_queue_items_under(self, temp_db: Database):
+        for i, path in enumerate(["/tmp/dir/a.txt", "/tmp/dir/b.txt", "/tmp/other/c.txt"]):
+            await temp_db.upsert_queue_item({
+                "id": f"under-{i}",
+                "file_path": path,
+                "action": "index",
+                "status": "cooling_down",
+                "enqueued_at": 1000.0,
+                "cooldown_expires_at": 1060.0,
+                "dest_path": None,
+                "retry_count": 0,
+            })
+
+        deleted = await temp_db.delete_queue_items_under("/tmp/dir")
+        assert deleted == 2
+
+        items = await temp_db.get_queue_items()
+        assert len(items) == 1
+        assert items[0]["file_path"] == "/tmp/other/c.txt"

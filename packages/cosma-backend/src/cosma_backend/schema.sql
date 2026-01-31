@@ -307,13 +307,30 @@ LIMIT 100;
 
 -- Insert initial processing session if none exists
 INSERT OR IGNORE INTO processing_stats (
-    id, 
-    session_id, 
+    id,
+    session_id,
     started_at,
     status
 ) VALUES (
-    1, 
-    'initial_session', 
+    1,
+    'initial_session',
     (strftime('%s', 'now')),
     'completed'
 );
+
+-- =============================================================================
+-- Queue Items Table (persistence for IndexingQueue)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS queue_items (
+    id TEXT PRIMARY KEY,
+    file_path TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('index', 'delete', 'move')),
+    status TEXT NOT NULL CHECK (status IN ('cooling_down', 'ready', 'processing')),
+    enqueued_at REAL NOT NULL,
+    cooldown_expires_at REAL NOT NULL,
+    dest_path TEXT,
+    retry_count INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_queue_items_status ON queue_items(status);
+CREATE INDEX IF NOT EXISTS idx_queue_items_file_path ON queue_items(file_path);

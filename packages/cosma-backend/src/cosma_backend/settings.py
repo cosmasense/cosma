@@ -175,6 +175,14 @@ def _get_by_path(obj: Any, path: str) -> Any:
     return current
 
 
+_VALIDATIONS: dict[tuple[str, str], tuple[callable, str]] = {
+    ("queue", "cooldown_seconds"): (lambda v: v >= 1, "cooldown_seconds must be >= 1"),
+    ("queue", "max_concurrency"): (lambda v: v >= 1, "max_concurrency must be >= 1"),
+    ("queue", "max_retries"): (lambda v: v >= 0, "max_retries must be >= 0"),
+    ("scheduler", "check_interval_seconds"): (lambda v: v >= 5, "check_interval_seconds must be >= 5"),
+}
+
+
 def _set_by_path(obj: Any, path: str, value: Any) -> None:
     """Walk a dotted path on a dataclass tree and set the leaf value with type coercion."""
     parts = path.split(".")
@@ -192,7 +200,17 @@ def _set_by_path(obj: Any, path: str, value: Any) -> None:
 
     hints = get_type_hints(type(current))
     target_type = hints[leaf]
-    setattr(current, leaf, _coerce(value, target_type))
+    coerced = _coerce(value, target_type)
+
+    # Validate if a rule exists for this (parent_name, leaf) pair
+    parent_name = type(current).__name__.replace("Config", "").lower()
+    validation_key = (parent_name, leaf)
+    if validation_key in _VALIDATIONS:
+        check_fn, msg = _VALIDATIONS[validation_key]
+        if not check_fn(coerced):
+            raise ValueError(msg)
+
+    setattr(current, leaf, coerced)
 
 
 # ---------------------------------------------------------------------------

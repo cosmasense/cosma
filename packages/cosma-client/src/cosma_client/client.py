@@ -308,6 +308,34 @@ class Client:
             raise ServerNotRunningError(self.base_url)
 
     # =========================================================================
+    # Queue API
+    # =========================================================================
+
+    async def get_queue_status(self) -> Dict[str, Any]:
+        """Get queue status (paused, item counts)"""
+        try:
+            response = await self.session.get(self._url("/api/queue/status"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def pause_queue(self) -> Dict[str, Any]:
+        """Manually pause the indexing queue"""
+        try:
+            response = await self.session.post(self._url("/api/queue/pause"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def resume_queue(self) -> Dict[str, Any]:
+        """Resume the indexing queue"""
+        try:
+            response = await self.session.post(self._url("/api/queue/resume"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    # =========================================================================
     # Settings API
     # =========================================================================
 
