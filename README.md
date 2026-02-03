@@ -29,10 +29,17 @@ Linux support is in progress.
 ### Installing
 
 Cosma can be downloaded from PyPI.
-We highly recommend you do this with [uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+#### MacOS/Linux
 
 ```sh
-uv tool install cosma
+curl -LsSf uvx.sh/cosma/install.sh | sh
+```
+
+#### Windows
+
+```sh
+powershell -ExecutionPolicy ByPass -c "irm https://uvx.sh/cosma/install.ps1 | iex"
 ```
 
 ### Upgrading
