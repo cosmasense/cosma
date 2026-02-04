@@ -55,6 +55,30 @@ class SchedulerResponse:
 
 
 @dataclass
+class FileListItem:
+    file_path: str
+    filename: str
+    extension: str
+    processing_error: str | None
+    status: str
+    updated_at: int | None
+
+
+@dataclass
+class FileListResponse:
+    files: list[dict[str, Any]]
+    total_count: int
+    offset: int
+    limit: int
+
+
+@dataclass
+class ReindexResponse:
+    success: bool
+    message: str
+
+
+@dataclass
 class MetricsResponse:
     metrics: dict[str, Any]
 
@@ -168,3 +192,71 @@ async def system_metrics() -> tuple[MetricsResponse, int]:
     collector = SystemMetricsCollector()
     metrics = await collector.collect()
     return MetricsResponse(metrics=metrics), 200
+
+
+# ------------------------------------------------------------------
+# Failed / Recent / Reindex
+# ------------------------------------------------------------------
+
+def _file_to_list_item(f) -> dict[str, Any]:
+    """Convert a File model to a dict suitable for FileListResponse."""
+    return {
+        "file_path": f.file_path,
+        "filename": f.filename,
+        "extension": f.extension,
+        "processing_error": f.processing_error,
+        "status": f.status.name if hasattr(f.status, "name") else str(f.status),
+        "updated_at": int(f.modified.timestamp()) if f.modified else None,
+    }
+
+
+@queue_bp.get("/failed")
+@validate_response(FileListResponse, 200)
+async def queue_failed_files() -> tuple[FileListResponse, int]:
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", 50, type=int)
+
+    files, total_count = await current_app.db.get_files_by_status("FAILED", limit=limit, offset=offset)
+
+    return FileListResponse(
+        files=[_file_to_list_item(f) for f in files],
+        total_count=total_count,
+        offset=offset,
+        limit=limit,
+    ), 200
+
+
+@queue_bp.get("/recent")
+@validate_response(FileListResponse, 200)
+async def queue_recent_files() -> tuple[FileListResponse, int]:
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", 50, type=int)
+
+    files, total_count = await current_app.db.get_files_by_status("COMPLETE", limit=limit, offset=offset)
+
+    return FileListResponse(
+        files=[_file_to_list_item(f) for f in files],
+        total_count=total_count,
+        offset=offset,
+        limit=limit,
+    ), 200
+
+
+@queue_bp.post("/reindex")
+@validate_response(ReindexResponse, 200)
+async def queue_reindex_file() -> tuple[ReindexResponse, int]:
+    from cosma_backend.queue import QueueAction
+
+    data = await request.get_json()
+    file_path = data.get("file_path") if data else None
+
+    if not file_path:
+        return ReindexResponse(success=False, message="file_path is required"), 400
+
+    # Delete the existing file record so it gets fully reprocessed
+    await current_app.db.delete_file(file_path)
+
+    # Enqueue for re-indexing
+    await current_app.indexing_queue.enqueue(file_path, QueueAction.INDEX)
+
+    return ReindexResponse(success=True, message=f"File enqueued for reindexing: {file_path}"), 200

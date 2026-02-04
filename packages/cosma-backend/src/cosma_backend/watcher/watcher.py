@@ -75,7 +75,14 @@ class WatcherJob:
         if self.filter_manager is not None:
             filter_config = self.filter_manager.get_config_for_directory(self.watched_dir.path)
 
-        await self.pipeline.process_directory(self.watched_dir.path, filter_config=filter_config)
+        if self.indexing_queue is not None:
+            await self.pipeline.enqueue_directory(
+                self.watched_dir.path,
+                indexing_queue=self.indexing_queue,
+                filter_config=filter_config,
+            )
+        else:
+            await self.pipeline.process_directory(self.watched_dir.path, filter_config=filter_config)
     
     async def start(self):
         logger.info("Starting watchdog observer", watched_dir=self.watched_dir)

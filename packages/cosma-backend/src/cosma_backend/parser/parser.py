@@ -151,10 +151,10 @@ class FileParser:
             logger.error(error_msg, extension=path.suffix)
             raise ValueError(error_msg)
             
-        MB_50 = 50 * 1024 * 1024  # 50MB in bytes (52,428,800 bytes)
-        if file.file_size > MB_50:
-            error_msg = "File size too large (over 50MB)"
-            logger.error(error_msg, size=file.file_size, max=MB_50)
+        max_file_size = self.config.max_file_size_mb * 1024 * 1024
+        if file.file_size > max_file_size:
+            error_msg = f"File size too large (over {self.config.max_file_size_mb}MB)"
+            logger.error(error_msg, size=file.file_size, max=max_file_size)
             raise ValueError(error_msg)
 
 

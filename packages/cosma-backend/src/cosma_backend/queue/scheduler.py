@@ -143,6 +143,9 @@ class Scheduler:
         if not enabled_rules:
             return True
 
+        # Inject queue_size into metrics so rules can reference it
+        metrics["queue_size"] = self._queue.queue_size
+
         results = [self._evaluate_rule(r, metrics) for r in enabled_rules]
 
         if self._config.combine_mode == "ANY":
@@ -173,6 +176,9 @@ class Scheduler:
             "cpu_idle": "cpu_idle_seconds",
             "cpu_temperature": "cpu_temperature",
             "fan_speed": "fan_speed",
+            "memory_usage": "memory_usage",
+            "gpu_usage": "gpu_usage",
+            "queue_size": "queue_size",
         }
 
         actual = metrics.get(metric_map.get(metric_key, metric_key))

@@ -123,6 +123,11 @@ class IndexingQueue:
     def item_count(self) -> int:
         return len(self._items)
 
+    @property
+    def queue_size(self) -> int:
+        """Return the count of active (non-completed) items in the queue."""
+        return len(self._items)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -358,6 +363,7 @@ class IndexingQueue:
                             and now >= item.cooldown_expires_at
                         ):
                             item.status = QueueItemStatus.READY
+                            await self._save_item(item)
 
                     ready_items = [
                         i for i in self._items.values()
@@ -383,6 +389,7 @@ class IndexingQueue:
                 if item.file_path not in self._items:
                     return
                 item.status = QueueItemStatus.PROCESSING
+                await self._save_item(item)
 
             self._publish(Update.create(
                 UpdateOpcode.QUEUE_ITEM_PROCESSING, **item.to_dict()
@@ -414,7 +421,14 @@ class IndexingQueue:
 
             except Exception as e:
                 item.retry_count += 1
-                if item.retry_count >= self._config.max_retries:
+                # Deterministic failures should not be retried
+                non_retryable = (
+                    "File size too large" in str(e)
+                    or "Unsupported file format" in str(e)
+                    or "Too many chunks to summarize" in str(e)
+                    or "File too large to summarize" in str(e)
+                )
+                if non_retryable or item.retry_count >= self._config.max_retries:
                     async with self._lock:
                         self._items.pop(item.file_path, None)
                         self._cleanup_dest_map(item)

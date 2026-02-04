@@ -30,6 +30,8 @@ class SystemMetricsCollector:
         metrics["cpu_idle_seconds"] = await self._get_cpu_idle_seconds()
         metrics["cpu_temperature"] = await self._get_cpu_temperature()
         metrics["fan_speed"] = await self._get_fan_speed()
+        metrics["memory_usage"] = self._get_memory_usage()
+        metrics["gpu_usage"] = await self._get_gpu_usage()
         metrics["collected_at"] = time.time()
 
         return metrics
@@ -148,5 +150,46 @@ class SystemMetricsCollector:
                                 return float(parts[i - 1])
             except Exception as e:
                 logger.debug("istats failed", error=str(e))
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Memory
+    # ------------------------------------------------------------------
+
+    def _get_memory_usage(self) -> Optional[float]:
+        """Return system memory usage as a percentage (0-100)."""
+        try:
+            import psutil
+            return psutil.virtual_memory().percent
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # GPU (Apple Silicon)
+    # ------------------------------------------------------------------
+
+    async def _get_gpu_usage(self) -> Optional[float]:
+        """Return GPU utilization percentage on Apple Silicon via ioreg."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ioreg", "-r", "-d", "1", "-c", "IOAccelerator",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            # Look for "Device Utilization %" or "GPU Activity(%)"
+            import re
+            text = stdout.decode()
+            # Try "Device Utilization %" first (common on Apple Silicon)
+            match = re.search(r'"Device Utilization %"\s*=\s*(\d+)', text)
+            if match:
+                return float(match.group(1))
+            # Fallback: "GPU Activity(%)"
+            match = re.search(r'"GPU Activity\(%\)"\s*=\s*(\d+)', text)
+            if match:
+                return float(match.group(1))
+        except Exception as e:
+            logger.debug("GPU usage metric unavailable", error=str(e))
 
         return None

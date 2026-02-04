@@ -17,6 +17,7 @@ import base64
 import json
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
@@ -340,9 +341,11 @@ class BaseSummarizer(ABC):
         # Use optimized chunking
         chunks = await chunk_content(content, self.max_tokens, self.chunk_overlap, self.model)
         logger.info("Content chunked (noverify)", num_chunks=len(chunks))
-        
+
+        max_chunks = self.config.max_chunks
+
         # Use fast estimation for chunk statistics (sample a few chunks for accurate check)
-        if len(chunks) <= 5:
+        if len(chunks) <= max_chunks:
             # For small number of chunks, verify all with accurate tokenization
             accurate_chunk_tokens = [await estimate_tokens(chunk, self.model, use_fast=False) for chunk in chunks]
             avg_chunk_tokens = sum(accurate_chunk_tokens) // len(chunks)
@@ -357,9 +360,9 @@ class BaseSummarizer(ABC):
             avg_chunk_tokens = sum(fast_chunk_tokens) // len(chunks)
             max_chunk_tokens = max(accurate_sample_tokens)
             logger.info("Content chunked", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_sample=max_chunk_tokens)
-            
-        if len(chunks) > 5:
-            logger.warning("More than 5 chunks, will not summarize", chunks=len(chunks))
+
+        if len(chunks) > max_chunks:
+            logger.warning("Too many chunks, will not summarize", chunks=len(chunks), max_chunks=max_chunks)
             raise RuntimeError("Too many chunks to summarize")
         
         return chunks
@@ -425,25 +428,98 @@ class BaseSummarizer(ABC):
             ValueError: If response format is invalid
         """
         try:
-            data = json.loads(response_content.strip())
-            
+            # Strip invalid control characters that LLMs sometimes embed in string values
+            cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', response_content.strip())
+            data = json.loads(cleaned)
+
             title = data.get("title", "").strip()
             summary = data.get("summary", "").strip()
             keywords = data.get("keywords", [])
-            
+
+            # Fallback: treat "text" as an alias for "summary"
+            if not summary:
+                summary = data.get("text", "").strip()
+
+            # Fallback: if the model returned structured sections instead of a
+            # flat summary, synthesise a summary from the section names/items.
+            if not summary and "sections" in data:
+                sections = data["sections"]
+                if isinstance(sections, list):
+                    parts = []
+                    for sec in sections:
+                        if isinstance(sec, dict):
+                            sec_name = sec.get("name", "")
+                            items = sec.get("items", [])
+                            item_names = [
+                                it.get("name", "") for it in items
+                                if isinstance(it, dict) and it.get("name")
+                            ]
+                            if sec_name and item_names:
+                                parts.append(f"{sec_name} ({', '.join(item_names[:3])})")
+                            elif sec_name:
+                                parts.append(sec_name)
+                    if parts:
+                        summary = f"Covers {', '.join(parts[:4])}."
+                        # Extract item names as keywords when none provided
+                        if not keywords:
+                            keywords = []
+                            for sec in sections:
+                                if isinstance(sec, dict):
+                                    for it in sec.get("items", []):
+                                        if isinstance(it, dict) and it.get("name"):
+                                            keywords.append(it["name"])
+                    logger.warning("Recovered summary from structured sections response",
+                                   sections_count=len(sections))
+
             # Ensure keywords is a list of strings
             if not isinstance(keywords, list):
                 keywords = []
             keywords = [str(kw).strip() for kw in keywords if str(kw).strip()]
-            
+
             if not summary:
                 logger.error("Response did not contain a valid summary", response=response_content)
                 raise ValueError("Response did not contain a valid summary")
-            
+
             return title, summary, keywords
             
         except json.JSONDecodeError as e:
-            logger.error("Failed to parse AI response as JSON", response=response_content, error={str(e)})
+            logger.warning("Failed to parse AI response as JSON, attempting fallback extraction", error=str(e))
+
+            # Fallback: try to find a JSON block within the response (e.g. ```json ... ```)
+            json_match = re.search(r'\{[^{}]*"summary"\s*:\s*"[^"]+(?:"[^{}]*)\}', response_content, re.DOTALL)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group())
+                    title = data.get("title", "").strip()
+                    summary = data.get("summary", "").strip()
+                    keywords = data.get("keywords", [])
+                    if summary:
+                        if not isinstance(keywords, list):
+                            keywords = []
+                        keywords = [str(kw).strip() for kw in keywords if str(kw).strip()]
+                        logger.info("Recovered summary from embedded JSON in response")
+                        return title, summary, keywords
+                except json.JSONDecodeError:
+                    pass
+
+            # Final fallback: use the plain text response as the summary directly
+            plain_text = response_content.strip()
+            # Remove common LLM preambles
+            for prefix in ["Here is", "Here's", "I've summarized", "I cannot provide", "Please note"]:
+                if plain_text.startswith(prefix):
+                    break
+            else:
+                prefix = None
+
+            if len(plain_text) >= 20 and len(plain_text) <= 5000:
+                # Truncate to first ~3 sentences for a concise summary
+                sentences = re.split(r'(?<=[.!?])\s+', plain_text)
+                summary = " ".join(sentences[:3]).strip()
+                if summary:
+                    logger.info("Used plain text response as summary fallback", length=len(summary))
+                    return "", summary, []
+
+            logger.error("Failed to parse AI response as JSON and fallback failed", response=response_content[:200], error=str(e))
             raise ValueError(f"Invalid JSON response: {str(e)}")
             
     def _get_system_prompt(self, include_title: bool = False):
@@ -493,24 +569,31 @@ class BaseSummarizer(ABC):
             
             images = await self._prepare_images(file_metadata)
             
-            # Process each chunk
+            # Process each chunk with per-chunk retry
             total_chunks = len(content_chunks)
             for i, chunk in enumerate(content_chunks):
                 logger.info(f"Processing chunk {i+1}/{total_chunks}", length=len(chunk), images=len(images))
-                response = await self._get_ai_response(chunk, i, total_chunks, images, file_metadata.filename)
-                
-                if not response:
-                    logger.warning("Empty response for chunk", chunk_num=i+1)
-                    continue
-                
-                try:
-                    title, summary, keywords = self._parse_ai_response(response)
-                    chunk_summaries.append({"summary": summary, "keywords": keywords})
-                    if i == 0 and title:
-                        resolved_title = title
-                except ValueError as e:
-                    logger.warning("Failed to parse chunk response", chunk_num=i+1, error=str(e))
-                    continue
+                parsed = False
+                for attempt in range(3):
+                    response = await self._get_ai_response(chunk, i, total_chunks, images, file_metadata.filename)
+
+                    if not response:
+                        logger.warning("Empty response for chunk", chunk_num=i+1)
+                        break
+
+                    try:
+                        title, summary, keywords = self._parse_ai_response(response)
+                        chunk_summaries.append({"summary": summary, "keywords": keywords})
+                        if i == 0 and title:
+                            resolved_title = title
+                        parsed = True
+                        break
+                    except ValueError:
+                        if attempt < 2:
+                            logger.warning("Retrying chunk", chunk_num=i+1, attempt=attempt+1)
+
+                if not parsed:
+                    logger.warning("Skipping chunk after retries", chunk_num=i+1)
             
             if not chunk_summaries:
                 raise AIProviderError(f"No valid responses from {self.__class__.__name__}")
@@ -570,13 +653,29 @@ class OllamaSummarizer(BaseSummarizer):
 
         self.host = host or self.config.ollama.host
         
+        self._last_used_at: float = 0.0
+        self._model_loaded: bool = False
+
         try:
             self.client = ollama.AsyncClient(host=self.host)
             logger.info("Ollama summarizer initialized", host=self.host, model=self.model, max_tokens=self.max_tokens)
         except Exception as e:
             logger.error("Failed to initialize Ollama client", host=self.host, error=str(e))
             raise AIProviderError(f"Failed to initialize Ollama: {str(e)}")
-    
+
+    @property
+    def last_used_at(self) -> float:
+        return self._last_used_at
+
+    async def unload(self) -> None:
+        """Tell Ollama to unload the model from GPU/memory."""
+        try:
+            await self.client.generate(model=self.model, keep_alive="0")
+            self._model_loaded = False
+            logger.info("Ollama model unloaded", model=self.model)
+        except Exception as e:
+            logger.warning("Failed to unload Ollama model", model=self.model, error=str(e))
+
     async def is_available(self) -> bool:
         """Check if Ollama is available."""
         try:
@@ -585,6 +684,7 @@ class OllamaSummarizer(BaseSummarizer):
             if self.model and self.model not in (m.model for m in list.models):
                 logger.info("Ollama model not found, pulling", model=self.model)
                 await self.client.pull(self.model)
+            self._model_loaded = True
             return True
         except Exception as e:
             logger.debug(f"Ollama not available - error: {str(e)}")
@@ -595,7 +695,7 @@ class OllamaSummarizer(BaseSummarizer):
         user_message: dict[str, Any] = {"role": "user", "content": content}
         if images:
             user_message["images"] = images
-        
+
         raw_response = await self.client.chat(
             model=self.model,
             messages=[
@@ -610,7 +710,9 @@ class OllamaSummarizer(BaseSummarizer):
                 num_ctx=16_000,
             )
         )
-        
+
+        self._last_used_at = time.time()
+        self._model_loaded = True
         logger.info("AI response", summarizer=self.__class__.__name__, response=raw_response)
         return extract_json_from_response(raw_response['message']['content'])
 
@@ -923,17 +1025,33 @@ class AutoSummarizer:
     async def get_available_providers(self) -> List[str]:
         """Get list of available providers."""
         providers = []
-        
+
         if await self._get_llamacpp_summarizer():
             providers.append("llamacpp")
-        
+
         if await self._get_ollama_summarizer():
             providers.append("ollama")
-        
+
         if await self._get_online_summarizer():
             providers.append("online")
-        
+
         return providers
+
+    @property
+    def last_used_at(self) -> float:
+        """Return the most recent last_used_at across all active summarizers."""
+        latest = 0.0
+        for summarizer in self.summarizers.values():
+            if summarizer is not None and hasattr(summarizer, "last_used_at"):
+                latest = max(latest, summarizer.last_used_at)
+        return latest
+
+    async def unload_models(self) -> None:
+        """Unload models from memory for all providers that support it."""
+        for name, summarizer in self.summarizers.items():
+            if summarizer is not None and hasattr(summarizer, "unload"):
+                await summarizer.unload()
+                logger.info("Unloaded model", provider=name)
 
 
 # Convenience functions for easier usage

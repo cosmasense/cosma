@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Optional
@@ -17,6 +18,7 @@ from cosma_backend.utils.pubsub import Hub
 
 if TYPE_CHECKING:
     from cosma_backend.filter import FilterConfig
+    from cosma_backend.queue import IndexingQueue
 
 logger = get_logger(__name__)
 
@@ -116,7 +118,65 @@ class Pipeline:
         logger.info("Completed processing directory", directory=str(path))
         self._publish_update(Update.directory_processing_completed(str(path)))
 
-    
+    async def enqueue_directory(
+        self,
+        path: str | Path,
+        indexing_queue: "IndexingQueue",
+        filter_config: Optional["FilterConfig"] = None,
+    ) -> int:
+        """
+        Discover files in a directory and enqueue them for processing via the
+        IndexingQueue instead of processing inline.  This makes items visible
+        in the queue view and benefits from cooldown/debounce.
+
+        After enqueueing, schedules a deferred cleanup task to remove stale
+        files (files that no longer exist in the filesystem).
+
+        Returns the number of files enqueued.
+        """
+        from cosma_backend.queue import QueueAction
+
+        self._publish_update(Update.directory_processing_started(str(path)))
+
+        started_processing = datetime.now(timezone.utc)
+        enqueued = 0
+
+        for file in self.discoverer.files_in(path, filter_config=filter_config):
+            try:
+                # Touch the timestamp so stale-file cleanup knows this file still exists
+                await self.db.update_file_timestamp(file.file_path)
+
+                if await self._should_skip_file(file):
+                    self._publish_update(Update.file_skipped(
+                        file.file_path, file.filename, reason="already processed"
+                    ))
+                    continue
+
+                await indexing_queue.enqueue(file.file_path, QueueAction.INDEX)
+                enqueued += 1
+            except Exception:
+                logger.exception("Error enqueueing file", file_path=file.file_path)
+                continue
+
+        # Stale-file cleanup runs immediately after discovery (all existing
+        # files had their timestamps touched above).  Files that were NOT
+        # touched are no longer on disk and can be pruned from the DB now.
+        try:
+            rows = await self.db.delete_files_not_updated_since(started_processing, str(path))
+            if rows:
+                logger.info("Deleted stale files after enqueue", count=len(rows), directory=str(path))
+        except Exception:
+            logger.exception("Error during stale-file cleanup")
+
+        # NOTE: We intentionally do NOT publish directory_processing_completed
+        # here.  The queue items are still cooling down / processing.  The
+        # frontend uses queue-based progress tracking (queue_item_added /
+        # queue_item_completed SSE events) to compute the real progress and
+        # will mark the folder as complete when all queue items finish.
+
+        logger.info("Enqueued directory for processing", directory=str(path), enqueued=enqueued)
+        return enqueued
+
     async def process_file(self, file: File):
         """
         Process a single file through the pipeline.
@@ -177,6 +237,7 @@ class Pipeline:
             # Save failed state to DB if we have file_data
             file.status = ProcessingStatus.FAILED
             file.processing_error = str(e)
+            self._apply_fallback_indexing(file)
             await self._save_to_db(file)
                 
             raise e
@@ -216,6 +277,35 @@ class Pipeline:
             
         return saved_file.content_hash != file.content_hash
     
+    def _apply_fallback_indexing(self, file: File) -> None:
+        """Generate searchable title/summary/keywords from the filename so that
+        failed files are still discoverable via FTS5."""
+        stem = Path(file.filename).stem
+
+        # Title: replace separators with spaces, title-case
+        title = re.sub(r"[_\-.]", " ", stem)
+        # Split camelCase: insert space before uppercase letters preceded by lowercase
+        title = re.sub(r"([a-z])([A-Z])", r"\1 \2", title)
+        file.title = title.title()
+
+        file.summary = f"File: {file.filename} (processing failed, indexed by filename)"
+
+        # Keywords: split on separators and camelCase boundaries, deduplicate
+        tokens = re.split(r"[_\-.]", stem)
+        expanded: list[str] = []
+        for token in tokens:
+            # Split camelCase within each token
+            parts = re.sub(r"([a-z])([A-Z])", r"\1 \2", token).split()
+            expanded.extend(parts)
+        seen: set[str] = set()
+        keywords: list[str] = []
+        for t in expanded:
+            low = t.lower()
+            if low and low not in seen:
+                seen.add(low)
+                keywords.append(low)
+        file.keywords = keywords
+
     async def _save_to_db(self, file: File) -> None:
         """Save file data to database."""
         await self.db.upsert_file(file)

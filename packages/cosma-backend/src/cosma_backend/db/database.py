@@ -723,6 +723,35 @@ class Database:
             return rows
 
 
+    async def get_files_by_status(self, status: str, limit: int = 50, offset: int = 0) -> tuple[list[File], int]:
+        """
+        Get files filtered by processing status, ordered by updated_at DESC.
+
+        Args:
+            status: Processing status string (e.g. 'FAILED', 'COMPLETE')
+            limit: Maximum number of files to return
+            offset: Number of files to skip
+
+        Returns:
+            Tuple of (list of File objects, total count matching the status)
+        """
+        COUNT_SQL = "SELECT COUNT(*) as cnt FROM files WHERE status = ?"
+        SELECT_SQL = """
+            SELECT * FROM files
+            WHERE status = ?
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+        """
+
+        async with self.acquire() as conn:
+            count_row = await conn.fetchone(COUNT_SQL, (status,))
+            total_count = count_row["cnt"] if count_row else 0
+
+            rows = await conn.fetchall(SELECT_SQL, (status, limit, offset))
+            files = [File.from_row(row) for row in rows]
+
+        return files, total_count
+
     # ====== Queue Item Persistence ======
 
     async def upsert_queue_item(self, item: dict) -> None:

@@ -26,6 +26,7 @@ from cosma_backend.watcher import Watcher
 from cosma_backend.filter import FilterConfigManager
 from cosma_backend.queue import IndexingQueue
 from cosma_backend.queue.scheduler import Scheduler
+from cosma_backend.model_lifecycle import ModelLifecycleManager
 
 load_dotenv()
 
@@ -43,6 +44,7 @@ class App(Quart):
     dirs: PlatformDirs
     indexing_queue: IndexingQueue
     scheduler: Scheduler
+    model_lifecycle: ModelLifecycleManager
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -140,6 +142,12 @@ async def initialize_services():
     )
     app.scheduler.start()
 
+    app.model_lifecycle = ModelLifecycleManager(
+        summarizer=summarizer,
+        idle_unload_seconds=settings.summarizer.idle_unload_seconds,
+    )
+    app.model_lifecycle.start()
+
     app.watcher = Watcher(
         db=app.db,
         pipeline=app.pipeline,
@@ -221,7 +229,8 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
 
 @app.after_serving
 async def handle_shutdown():
-    logger.info("Stopping scheduler and indexing queue")
+    logger.info("Stopping model lifecycle manager, scheduler, and indexing queue")
+    await app.model_lifecycle.stop()
     await app.scheduler.stop()
     await app.indexing_queue.stop()
     logger.info("Closing DB")

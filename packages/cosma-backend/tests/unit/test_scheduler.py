@@ -195,6 +195,8 @@ class TestSystemMetricsCollector:
             "cpu_idle_seconds",
             "cpu_temperature",
             "fan_speed",
+            "memory_usage",
+            "gpu_usage",
             "collected_at",
         }
         assert set(metrics.keys()) == expected_keys

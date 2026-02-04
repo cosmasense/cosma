@@ -39,9 +39,19 @@ class IndexDirectoryResponse:
 @validate_request(IndexDirectoryRequest)
 @validate_response(IndexDirectoryResponse, 201)
 async def index_directory(data: IndexDirectoryRequest) -> tuple[IndexDirectoryResponse, int]:
-    """Index all files in a directory"""
-    current_app.submit_job(current_app.pipeline.process_directory(data.directory_path))
-    
+    """Index all files in a directory via the queue."""
+    # Route through the indexing queue so items are visible in the queue view
+    filter_config = current_app.filter_manager.get_config_for_directory(
+        data.directory_path
+    )
+    current_app.submit_job(
+        current_app.pipeline.enqueue_directory(
+            data.directory_path,
+            indexing_queue=current_app.indexing_queue,
+            filter_config=filter_config,
+        )
+    )
+
     return IndexDirectoryResponse(
         success=True,
         message=f"Started indexing directory: {data.directory_path}",

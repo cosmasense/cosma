@@ -58,6 +58,8 @@ class SummarizerConfig:
     provider: str = "auto"
     max_tokens_per_request: int = 100000
     chunk_overlap_tokens: int = 1000
+    max_chunks: int = 10
+    idle_unload_seconds: int = 60
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     online: OnlineConfig = field(default_factory=OnlineConfig)
     llamacpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
@@ -84,6 +86,7 @@ class ParserConfig:
     extraction_strategy: str = "spotlight_first"
     spotlight_enabled: bool = True
     spotlight_timeout_seconds: int = 5
+    max_file_size_mb: int = 200
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
 
 
