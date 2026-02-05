@@ -106,6 +106,83 @@ class SchedulerConfig:
     rules: list[SchedulerRuleConfig] = field(default_factory=list)
 
 
+# Registry describing each scheduler rule type's expected inputs.
+# The frontend uses this to render type-specific controls (toggles, sliders, time pickers).
+SCHEDULER_RULE_TYPES: dict[str, dict[str, Any]] = {
+    "power_source": {
+        "label": "Power Source",
+        "description": "Require AC power (plugged in)",
+        "value_type": "boolean",
+        "default_operator": "eq",
+        "boolean_labels": {"true": "Plugged in", "false": "On battery"},
+    },
+    "battery_level": {
+        "label": "Battery Level",
+        "description": "Minimum battery percentage required",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "gte",
+        "min": 0,
+        "max": 100,
+    },
+    "gpu_usage": {
+        "label": "GPU Usage",
+        "description": "Maximum GPU utilization allowed",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 100,
+    },
+    "memory_usage": {
+        "label": "Memory Usage",
+        "description": "Maximum memory utilization allowed",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 100,
+    },
+    "cpu_temperature": {
+        "label": "CPU Temperature",
+        "description": "Maximum CPU temperature allowed",
+        "value_type": "number",
+        "unit": "\u00b0C",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 120,
+    },
+    "fan_speed": {
+        "label": "Fan Speed",
+        "description": "Maximum fan speed allowed",
+        "value_type": "number",
+        "unit": "RPM",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 10000,
+    },
+    "cpu_idle": {
+        "label": "CPU Idle",
+        "description": "Require CPU to be idle (low usage)",
+        "value_type": "boolean",
+        "default_operator": "eq",
+        "boolean_labels": {"true": "Idle", "false": "Busy"},
+    },
+    "time_window": {
+        "label": "Time Window",
+        "description": "Only process during this time range",
+        "value_type": "time_range",
+    },
+    "queue_size": {
+        "label": "Queue Size",
+        "description": "Minimum items in queue before processing starts",
+        "value_type": "number",
+        "default_operator": "gte",
+        "min": 0,
+    },
+}
+
+
 @dataclass
 class QueueConfig:
     cooldown_seconds: int = 60
@@ -128,7 +205,15 @@ class Settings:
 
 def _coerce(value: Any, target_type: type) -> Any:
     """Coerce a value to the target type."""
-    if isinstance(value, target_type):
+    # Handle Any type - return value as-is
+    if target_type is Any:
+        return value
+    # Try isinstance check, but handle types that don't support it
+    try:
+        if isinstance(value, target_type):
+            return value
+    except TypeError:
+        # Some types (like Any) cannot be used with isinstance()
         return value
     if target_type is bool:
         if isinstance(value, str):
@@ -139,6 +224,15 @@ def _coerce(value: Any, target_type: type) -> Any:
     if target_type is str:
         return str(value)
     return value
+
+
+def _is_dataclass_type(t: Any) -> bool:
+    """Check if a type is a dataclass, safely handling Any and other special types."""
+    try:
+        return dataclasses.is_dataclass(t) and isinstance(t, type)
+    except TypeError:
+        # Some types like Any cannot be used with isinstance()
+        return False
 
 
 def _from_dict(cls: type, data: dict[str, Any]) -> Any:
@@ -154,11 +248,11 @@ def _from_dict(cls: type, data: dict[str, Any]) -> Any:
         origin = getattr(field_type, "__origin__", None)
         if origin is list and isinstance(raw, list):
             args = getattr(field_type, "__args__", ())
-            if args and dataclasses.is_dataclass(args[0]):
+            if args and _is_dataclass_type(args[0]):
                 kwargs[f.name] = [_from_dict(args[0], item) if isinstance(item, dict) else item for item in raw]
             else:
                 kwargs[f.name] = raw
-        elif dataclasses.is_dataclass(field_type) and isinstance(raw, dict):
+        elif _is_dataclass_type(field_type) and isinstance(raw, dict):
             kwargs[f.name] = _from_dict(field_type, raw)
         else:
             kwargs[f.name] = _coerce(raw, field_type)
@@ -203,7 +297,17 @@ def _set_by_path(obj: Any, path: str, value: Any) -> None:
 
     hints = get_type_hints(type(current))
     target_type = hints[leaf]
-    coerced = _coerce(value, target_type)
+
+    # Handle list[SomeDataclass] types - convert dicts to dataclass instances
+    origin = getattr(target_type, "__origin__", None)
+    if origin is list and isinstance(value, list):
+        args = getattr(target_type, "__args__", ())
+        if args and _is_dataclass_type(args[0]):
+            coerced = [_from_dict(args[0], item) if isinstance(item, dict) else item for item in value]
+        else:
+            coerced = value
+    else:
+        coerced = _coerce(value, target_type)
 
     # Validate if a rule exists for this (parent_name, leaf) pair
     parent_name = type(current).__name__.replace("Config", "").lower()

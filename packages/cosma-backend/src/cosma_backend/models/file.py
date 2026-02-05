@@ -1,12 +1,27 @@
+"""
+File Model
+
+Central domain model representing a file being indexed. The File object
+accumulates data as it progresses through the pipeline stages:
+
+1. DISCOVERED: Basic metadata (path, size, timestamps)
+2. PARSED: Extracted content (text/transcript)
+3. SUMMARIZED: AI-generated title, summary, keywords
+4. COMPLETE: Vector embedding for semantic search
+
+The same File instance flows through the entire pipeline, with each
+stage populating additional fields.
+"""
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import sqlite3
 from typing import Any, Optional, List, Self, TYPE_CHECKING
-from cosma_backend.logging import get_logger
 
 import numpy as np
 
+from cosma_backend.logging import get_logger
 from cosma_backend.models.status import ProcessingStatus
 
 if TYPE_CHECKING:
@@ -53,6 +68,10 @@ class File:
     # Meta
     status: ProcessingStatus = ProcessingStatus.DISCOVERED
     processing_error: Optional[str] = None
+
+    # Transient data (not persisted to DB)
+    # Used to pass video frames to the summarizer for vision analysis
+    extra_images: Optional[List[bytes]] = None  # JPEG-encoded frames
     
     @classmethod
     def from_path(cls, path: Path) -> Self:

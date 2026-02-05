@@ -1,62 +1,103 @@
+"""
+Cosma Backend Application
+
+Main Quart web application that orchestrates all backend services:
+- Database: SQLite with FTS5 for full-text search
+- Pipeline: File discovery → parsing → summarization → embedding
+- Searcher: Hybrid search combining semantic + full-text search
+- Watcher: File system monitoring for automatic re-indexing
+- Queue: Background processing with configurable scheduling
+- Model Lifecycle: Automatic unloading of idle AI models
+
+Application lifecycle:
+1. App instance created, config loaded from env vars + TOML
+2. `before_serving`: Initialize DB, services, start background tasks
+3. Request handling via API blueprints
+4. `after_serving`: Graceful shutdown of all services
+"""
+
 import asyncio
 import datetime
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Coroutine
 
 from dotenv import load_dotenv
-from platformdirs import PlatformDirs, user_config_dir
+from platformdirs import PlatformDirs
 from quart import Quart, request
-from quart_schema import QuartSchema, validate_request, validate_response
+from quart_schema import QuartSchema
 
 from cosma_backend import db
 from cosma_backend.api import api_blueprint
 from cosma_backend.db.database import Database
-from cosma_backend.logging import get_logger, configure_logging
-from cosma_backend.models.update import Update
-from cosma_backend.settings import SettingsManager
-from cosma_backend.utils.pubsub import Hub
-from cosma_backend.pipeline import Pipeline
-from cosma_backend.searcher import HybridSearcher
 from cosma_backend.discoverer import Discoverer
-from cosma_backend.parser import FileParser
-from cosma_backend.summarizer import AutoSummarizer
 from cosma_backend.embedder import AutoEmbedder
-from cosma_backend.watcher import Watcher
 from cosma_backend.filter import FilterConfigManager
+from cosma_backend.logging import get_logger, configure_logging
+from cosma_backend.model_lifecycle import ModelLifecycleManager
+from cosma_backend.models.update import Update
+from cosma_backend.parser import FileParser
+from cosma_backend.pipeline import Pipeline
 from cosma_backend.queue import IndexingQueue
 from cosma_backend.queue.scheduler import Scheduler
-from cosma_backend.model_lifecycle import ModelLifecycleManager
+from cosma_backend.searcher import HybridSearcher
+from cosma_backend.settings import SettingsManager
+from cosma_backend.summarizer import AutoSummarizer
+from cosma_backend.utils.pubsub import Hub
+from cosma_backend.watcher import Watcher
 
 load_dotenv()
 
 logger = get_logger(__name__)
 
 class App(Quart):
+    """
+    Extended Quart application with typed service attributes.
+
+    All services are initialized in `before_serving` hook after config is loaded.
+    Services are available as instance attributes for easy access in route handlers.
+    """
+
+    # Database connection
     db: Database
+
+    # Pub/sub hub for real-time updates (SSE)
     updates_hub: Hub[Update]
+
+    # Background tasks tracked for graceful shutdown
     jobs: set[asyncio.Task]
-    pipeline: Pipeline
-    searcher: HybridSearcher
-    watcher: Watcher
-    filter_manager: FilterConfigManager
-    settings_manager: SettingsManager
-    dirs: PlatformDirs
-    indexing_queue: IndexingQueue
-    scheduler: Scheduler
-    model_lifecycle: ModelLifecycleManager
+
+    # Core processing services
+    pipeline: Pipeline          # File processing pipeline
+    searcher: HybridSearcher    # Hybrid semantic + FTS search
+    watcher: Watcher            # File system change monitoring
+
+    # Configuration
+    filter_manager: FilterConfigManager  # Include/exclude patterns
+    settings_manager: SettingsManager    # Persistent TOML settings
+    dirs: PlatformDirs                   # Platform-specific directories
+
+    # Background processing
+    indexing_queue: IndexingQueue        # Async file processing queue
+    scheduler: Scheduler                 # Conditional queue processing
+    model_lifecycle: ModelLifecycleManager  # Auto-unload idle models
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self.updates_hub = Hub()
         self.jobs = set()
-        self.filter_manager = FilterConfigManager()      
+        self.filter_manager = FilterConfigManager()
 
-    def initialize_config(self):
+    def initialize_config(self) -> None:
+        """
+        Load configuration from environment variables and TOML file.
+
+        Config priority: env vars (COSMA_*) > TOML file > defaults
+        Must be called before `before_serving` hook.
+        """
+        logger.info("Loading config")
         self.config.from_prefixed_env("COSMA")
 
-        # Bootstrap-only settings (env vars only, needed before app starts)
+        # Bootstrap settings (env vars only, needed before app starts)
         self.config.setdefault("APP_NAME", "cosma")
         self.dirs = PlatformDirs(self.config["APP_NAME"], ensure_exists=True)
         log_path = Path(self.dirs.user_log_dir) / "cosma-backend.log"
@@ -68,20 +109,31 @@ class App(Quart):
         self.config.setdefault("PORT", 60534)
         self.config.setdefault("DATABASE_PATH", Path(self.dirs.user_data_dir) / "app.db")
 
-        # Load persistent settings from TOML
+        # Load persistent settings from TOML (model configs, queue settings, etc.)
         self.settings_manager = SettingsManager(self.dirs)
         self.settings_manager.load()
 
         logger.debug("Config loaded")
-        
+
     def submit_job(self, coro: Coroutine) -> asyncio.Task:
-        def remove_task_callback(task: asyncio.Task):
-            self.jobs.remove(task)
-        
+        """
+        Submit a background coroutine as a tracked task.
+
+        Tasks are automatically removed from the job set when complete.
+        Used for fire-and-forget operations that should be tracked.
+        """
+        def remove_task_callback(task: asyncio.Task) -> None:
+            self.jobs.discard(task)  # discard to avoid KeyError if already removed
+            # Log any unhandled exceptions
+            if not task.cancelled():
+                exc = task.exception()
+                if exc:
+                    logger.exception("Background job failed", exc_info=exc)
+
         task = asyncio.create_task(coro)
         self.jobs.add(task)
         task.add_done_callback(remove_task_callback)
-        
+
         return task
         
 
@@ -145,6 +197,7 @@ async def initialize_services():
     app.model_lifecycle = ModelLifecycleManager(
         summarizer=summarizer,
         idle_unload_seconds=settings.summarizer.idle_unload_seconds,
+        embedder=embedder,
     )
     app.model_lifecycle.start()
 
@@ -261,50 +314,8 @@ async def log_response(response):
         )
     return response
 
-@app.post("/echo")
-async def echo():
-    data = await request.get_json()
-    return {"input": data, "extra": True}
 
-# ====== Sample Database Usage ======
-
-@app.get("/get")
-async def get():
-    # I haven't implemented a get_files function yet for the db,
-    # but I can if/when we need it.
-    # For now I'm just running a SQL query directly
-    async with app.db.acquire() as conn:
-        files = await conn.fetchall("SELECT * FROM files;")
-
-    return [dict(file) for file in files]
-
-# ====== Main Indexing Route ======
-# Note: Indexing routes have been moved to backend/api/index.py
-# This endpoint remains for backward compatibility but will be deprecated
-
-@dataclass
-class IndexIn:
-    directory_path: str
-
-@dataclass
-class IndexOut:
-    success: bool
-
-@app.post("/index")  # type: ignore[return-value]
-@validate_request(IndexIn)
-@validate_response(IndexOut, 201)
-async def index(data: IndexIn) -> tuple[IndexOut, int]:
-    # TODO: extract, summarize, and db
-    # something like:
-    # for file in extract_files():
-    #    parsed_file = parse_file(file)
-    #    summarized_file = app.summarizer.summarize_file(parsed_file)
-    #    await app.db.insert_file(summarized_file)
-    
-    # Note: Use /api/index/directory instead (this route kept for compatibility)
-
-    return IndexOut(success=True), 201
-
+# ====== Application Entry Point ======
 
 def run() -> None:
     app.run(

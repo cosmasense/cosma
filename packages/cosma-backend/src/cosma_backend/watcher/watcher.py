@@ -98,7 +98,8 @@ class WatcherJob:
         
         self.observer = await watch(self.watched_dir.path, self.event_queue, recursive=self.watched_dir.recursive)
         self.task = asyncio.create_task(self.consumer_task())
-        asyncio.create_task(self.do_initial_processing())
+        initial_task = asyncio.create_task(self.do_initial_processing())
+        initial_task.add_done_callback(self._on_initial_processing_done)
         
     async def stop(self):
         self.closed = True
@@ -106,7 +107,15 @@ class WatcherJob:
             self.task.cancel()
         if self.observer is not None:
             self.observer.unschedule_all()
-        
+
+    def _on_initial_processing_done(self, task: asyncio.Task) -> None:
+        """Callback for initial processing task completion."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.exception("Initial processing failed", error=str(exc), exc_info=exc)
+
     def _should_include_file(self, file_path: Path) -> bool:
         """Check if file should be included based on filter config."""
         if self.filter_manager is None:

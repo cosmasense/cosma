@@ -1,8 +1,21 @@
 """
-API Blueprint Module
+REST API Module
 
-This module initializes and combines all API blueprints for the application.
-All API routes will be prefixed with /api when registered in app.py
+All API routes are prefixed with /api when registered.
+
+Blueprints:
+- /files    - File CRUD, listing, status filtering
+- /index    - Trigger directory/file indexing
+- /search   - Hybrid semantic + full-text search
+- /watch    - Manage watched directories
+- /updates  - SSE endpoint for real-time updates
+- /status   - Health check, stats, debug info
+- /filters  - Include/exclude pattern management
+- /settings - Persistent settings CRUD
+- /queue    - Indexing queue status and control
+
+Request/response models are defined in models.py using dataclasses.
+Validation is handled by quart-schema decorators.
 """
 
 from quart import Blueprint

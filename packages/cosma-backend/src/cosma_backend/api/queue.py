@@ -27,7 +27,7 @@ class QueueStatusResponse:
     scheduler_paused: bool
     total_items: int
     cooling_down: int
-    ready: int
+    waiting: int
     processing: int
 
 
@@ -165,13 +165,16 @@ async def scheduler_update() -> tuple[SchedulerResponse, int]:
     data = await request.get_json()
     scheduler = current_app.scheduler
     scheduler.update_config(data)
-    # Persist to settings
+    # Persist to settings (including rules)
     from dataclasses import asdict
     cfg = scheduler.config
-    current_app.settings_manager.set_by_path("scheduler.enabled", cfg.enabled)
-    current_app.settings_manager.set_by_path("scheduler.combine_mode", cfg.combine_mode)
-    current_app.settings_manager.set_by_path("scheduler.check_interval_seconds", cfg.check_interval_seconds)
     rules = [asdict(r) for r in cfg.rules]
+    current_app.settings_manager.update({
+        "scheduler.enabled": cfg.enabled,
+        "scheduler.combine_mode": cfg.combine_mode,
+        "scheduler.check_interval_seconds": cfg.check_interval_seconds,
+        "scheduler.rules": rules,
+    })
     return SchedulerResponse(
         enabled=cfg.enabled,
         combine_mode=cfg.combine_mode,
@@ -179,6 +182,13 @@ async def scheduler_update() -> tuple[SchedulerResponse, int]:
         rules=rules,
         conditions_met=scheduler.conditions_met,
     ), 200
+
+
+@queue_bp.get("/scheduler/rule-types")
+async def scheduler_rule_types() -> dict:
+    """Return metadata for each scheduler rule type so clients can build type-specific UIs."""
+    from cosma_backend.settings import SCHEDULER_RULE_TYPES
+    return {"rule_types": SCHEDULER_RULE_TYPES}
 
 
 # ------------------------------------------------------------------

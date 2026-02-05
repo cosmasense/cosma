@@ -14,6 +14,7 @@ from cosma_backend.models import File, ProcessingStatus
 from cosma_backend.parser.spotlight import spotlight_to_text
 from cosma_backend.parser.media import (
     extract_audio_transcript,
+    extract_video_content,
     extract_video_transcript,
     extract_image_info,
     is_supported_media_file
@@ -188,7 +189,7 @@ class FileParser:
             if not extracted_content:
                 is_media, media_type = await is_supported_media_file(path)
                 if is_media:
-                    extracted_content = await self._try_media_extraction(path, media_type)
+                    extracted_content = await self._try_media_extraction(path, media_type, file)
                     if extracted_content:
                         extraction_method = f"media_{media_type}"
                         self.extraction_stats["media_success"] += 1
@@ -278,14 +279,15 @@ class FileParser:
                             error=str(e))
             return None
 
-    async def _try_media_extraction(self, path: Path, media_type: str) -> str | None:
+    async def _try_media_extraction(self, path: Path, media_type: str, file: File | None = None) -> str | None:
         """
         Try extracting content from media files.
-        
+
         Args:
             path: Path to media file
             media_type: Type of media ('audio', 'video', 'image')
-            
+            file: Optional File object to attach extra data (e.g., video frames)
+
         Returns:
             Extracted content or None if failed
         """
@@ -293,7 +295,15 @@ class FileParser:
             if media_type == "audio":
                 content = await extract_audio_transcript(path, self.config)
             elif media_type == "video":
-                content = await extract_video_transcript(path)
+                # Extract both transcript and frames for vision analysis
+                video_content = await extract_video_content(path)
+                content = video_content.transcript
+                # Attach frames to file for summarizer vision analysis
+                if file is not None and video_content.frames:
+                    file.extra_images = video_content.frames
+                    logger.debug("Attached video frames for vision analysis",
+                                 path=str(path),
+                                 num_frames=len(video_content.frames))
             elif media_type == "image":
                 # For images, we'll let the summarization process handle vision analysis
                 # Just extract basic image info here

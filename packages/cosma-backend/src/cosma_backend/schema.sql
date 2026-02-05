@@ -321,12 +321,15 @@ INSERT OR IGNORE INTO processing_stats (
 -- =============================================================================
 -- Queue Items Table (persistence for IndexingQueue)
 -- =============================================================================
+-- Queue items are transient - they're regenerated when the watcher scans directories.
+-- We drop and recreate on startup to ensure schema is current.
 
-CREATE TABLE IF NOT EXISTS queue_items (
+DROP TABLE IF EXISTS queue_items;
+CREATE TABLE queue_items (
     id TEXT PRIMARY KEY,
     file_path TEXT NOT NULL,
-    action TEXT NOT NULL CHECK (action IN ('index', 'delete', 'move')),
-    status TEXT NOT NULL CHECK (status IN ('cooling_down', 'ready', 'processing')),
+    action TEXT NOT NULL CHECK (action IN ('index', 'delete', 'move', 'embed_fallback')),
+    status TEXT NOT NULL CHECK (status IN ('cooling_down', 'waiting', 'processing')),
     enqueued_at REAL NOT NULL,
     cooldown_expires_at REAL NOT NULL,
     dest_path TEXT,

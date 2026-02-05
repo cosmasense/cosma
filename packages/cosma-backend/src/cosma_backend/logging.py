@@ -1,15 +1,36 @@
+"""
+Structured Logging Configuration
+
+Provides structlog-based logging with automatic serialization of complex types.
+All log output is structured JSON-friendly for easy parsing and analysis.
+
+Usage:
+    from cosma_backend.logging import get_logger
+    logger = get_logger(__name__)
+    logger.info("Processing file", filename="test.pdf", size=1024)
+"""
+
 import logging
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import numpy as np
 import structlog
 
 
-def _serialize_value(value):
-    """Serialize special types to JSON-friendly representations."""
+def _serialize_value(value: Any) -> Any:
+    """
+    Serialize special types to JSON-friendly representations.
+
+    Handles types that aren't natively JSON-serializable:
+    - datetime/date/time → ISO format strings
+    - Path → string path
+    - numpy arrays → shape/dtype description (not full data)
+    - File model → dict with key fields only
+    """
     if isinstance(value, set):
         return list(value)
     if isinstance(value, datetime):
@@ -29,14 +50,16 @@ def _serialize_value(value):
     if isinstance(value, bytes):
         return value.decode('utf-8', errors='replace')
     if isinstance(value, np.ndarray):
+        # Don't serialize full array data (could be huge)
         return f"<ndarray shape={value.shape} dtype={value.dtype}>"
-    # Handle File model from cosma_backend.models
+    # Handle File model - serialize only key fields for logging
     if hasattr(value, '__class__') and value.__class__.__name__ == 'File':
+        status = getattr(value, 'status', None)
         return {
             'id': getattr(value, 'id', None),
             'filename': getattr(value, 'filename', None),
             'file_path': getattr(value, 'file_path', None),
-            'status': getattr(value, 'status', None).name if hasattr(getattr(value, 'status', None), 'name') else str(getattr(value, 'status', None)),
+            'status': status.name if hasattr(status, 'name') else str(status),
             'content_hash': getattr(value, 'content_hash', None)
         }
     return value

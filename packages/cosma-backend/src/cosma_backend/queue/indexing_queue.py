@@ -32,11 +32,12 @@ class QueueAction(enum.Enum):
     INDEX = "index"
     DELETE = "delete"
     MOVE = "move"
+    EMBED_FALLBACK = "embed_fallback"
 
 
 class QueueItemStatus(enum.Enum):
     COOLING_DOWN = "cooling_down"
-    READY = "ready"
+    WAITING = "waiting"
     PROCESSING = "processing"
 
 
@@ -232,7 +233,7 @@ class IndexingQueue:
                         existing.action = QueueAction.DELETE
                         existing.dest_path = None
                         existing.cooldown_expires_at = now
-                        existing.status = QueueItemStatus.READY
+                        existing.status = QueueItemStatus.WAITING
                         self._publish(Update.create(
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                         ))
@@ -291,13 +292,19 @@ class IndexingQueue:
 
     async def remove_items_under(self, directory: str | Path) -> int:
         """Remove all queued items whose path is under the given directory."""
-        prefix = str(Path(directory).resolve())
+        dir_path = Path(directory).resolve()
         removed = 0
         async with self._lock:
-            keys_to_remove = [
-                k for k in self._items
-                if k.startswith(prefix + "/") or k == prefix
-            ]
+            keys_to_remove = []
+            for k in self._items:
+                item_path = Path(k)
+                # Check if item_path is the directory itself or is inside it
+                try:
+                    item_path.relative_to(dir_path)
+                    keys_to_remove.append(k)
+                except ValueError:
+                    # Not under dir_path
+                    pass
             for key in keys_to_remove:
                 item = self._items.pop(key)
                 self._cleanup_dest_map(item)
@@ -307,10 +314,10 @@ class IndexingQueue:
                 removed += 1
         if removed and self._db is not None:
             try:
-                await self._db.delete_queue_items_under(prefix)
+                await self._db.delete_queue_items_under(str(dir_path))
             except Exception:
                 logger.exception("Failed to delete queue items under directory from DB")
-            logger.info("Removed items under directory", directory=prefix, count=removed)
+            logger.info("Removed items under directory", directory=str(dir_path), count=removed)
         return removed
 
     # ------------------------------------------------------------------
@@ -337,7 +344,7 @@ class IndexingQueue:
             "scheduler_paused": self._scheduler_paused,
             "total_items": len(items),
             "cooling_down": sum(1 for i in items if i.status == QueueItemStatus.COOLING_DOWN),
-            "ready": sum(1 for i in items if i.status == QueueItemStatus.READY),
+            "waiting": sum(1 for i in items if i.status == QueueItemStatus.WAITING),
             "processing": sum(1 for i in items if i.status == QueueItemStatus.PROCESSING),
         }
 
@@ -362,12 +369,12 @@ class IndexingQueue:
                             item.status == QueueItemStatus.COOLING_DOWN
                             and now >= item.cooldown_expires_at
                         ):
-                            item.status = QueueItemStatus.READY
+                            item.status = QueueItemStatus.WAITING
                             await self._save_item(item)
 
                     ready_items = [
                         i for i in self._items.values()
-                        if i.status == QueueItemStatus.READY
+                        if i.status == QueueItemStatus.WAITING
                     ]
 
                 if ready_items:
@@ -408,6 +415,8 @@ class IndexingQueue:
                     file = File.from_path(Path(item.file_path))
                     if await self._pipeline.is_supported(file):
                         await self._pipeline.process_file(file)
+                elif item.action == QueueAction.EMBED_FALLBACK:
+                    await self._pipeline.embed_fallback(item.file_path)
 
                 # Success — remove from queue
                 async with self._lock:
@@ -428,7 +437,9 @@ class IndexingQueue:
                     or "Too many chunks to summarize" in str(e)
                     or "File too large to summarize" in str(e)
                 )
-                if non_retryable or item.retry_count >= self._config.max_retries:
+                # EMBED_FALLBACK actions get a single attempt only
+                is_fallback = item.action == QueueAction.EMBED_FALLBACK
+                if is_fallback or non_retryable or item.retry_count >= self._config.max_retries:
                     async with self._lock:
                         self._items.pop(item.file_path, None)
                         self._cleanup_dest_map(item)
@@ -438,6 +449,18 @@ class IndexingQueue:
                         UpdateOpcode.QUEUE_ITEM_FAILED, **item_data
                     ))
                     await self._delete_item_from_db(item.id)
+
+                    # For INDEX failures, schedule a fallback embedding pass so
+                    # the file is still discoverable via semantic search.
+                    if item.action == QueueAction.INDEX:
+                        try:
+                            await self.enqueue(item.file_path, QueueAction.EMBED_FALLBACK)
+                            logger.info("Enqueued fallback embedding after permanent failure",
+                                        file_path=item.file_path)
+                        except Exception:
+                            logger.exception("Failed to enqueue fallback embedding",
+                                             file_path=item.file_path)
+
                     logger.error("Queue item failed permanently",
                                  file_path=item.file_path, error=str(e),
                                  retry_count=item.retry_count)
@@ -475,10 +498,11 @@ class IndexingQueue:
             rows = await self._db.get_queue_items()
             for row in rows:
                 action = QueueAction(row["action"])
-                # Restore PROCESSING items as READY so they get re-processed
+                # Restore PROCESSING items as WAITING so they get re-processed.
+                # Also map legacy "ready" values to WAITING.
                 raw_status = row["status"]
-                if raw_status == "processing":
-                    status = QueueItemStatus.READY
+                if raw_status in ("processing", "ready"):
+                    status = QueueItemStatus.WAITING
                 else:
                     status = QueueItemStatus(raw_status)
 

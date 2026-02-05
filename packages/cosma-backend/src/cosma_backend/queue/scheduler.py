@@ -139,7 +139,12 @@ class Scheduler:
 
     def _evaluate_rules(self, metrics: dict[str, Any]) -> bool:
         """Evaluate all enabled rules. Returns True if conditions allow processing."""
-        enabled_rules = [r for r in self._config.rules if r.enabled]
+        # Handle both dataclass and dict rules (for backwards compatibility)
+        enabled_rules = []
+        for r in self._config.rules:
+            is_enabled = r.enabled if hasattr(r, "enabled") else r.get("enabled", True)
+            if is_enabled:
+                enabled_rules.append(r)
         if not enabled_rules:
             return True
 
@@ -155,9 +160,22 @@ class Scheduler:
 
     def _evaluate_rule(self, rule: "SchedulerRuleConfig", metrics: dict[str, Any]) -> bool:
         """Evaluate a single rule against collected metrics. Returns True if the rule passes."""
-        metric_key = rule.rule
-        operator = rule.operator
-        value = rule.value
+        from cosma_backend.settings import SCHEDULER_RULE_TYPES
+
+        # Handle both dataclass and dict rules (for backwards compatibility)
+        if hasattr(rule, "rule"):
+            metric_key = rule.rule
+            operator = rule.operator
+            value = rule.value
+        else:
+            metric_key = rule.get("rule", "")
+            operator = rule.get("operator", "")
+            value = rule.get("value")
+
+        # Use the default operator from the rule type registry when none is specified
+        if not operator:
+            rule_meta = SCHEDULER_RULE_TYPES.get(metric_key, {})
+            operator = rule_meta.get("default_operator", "")
 
         if metric_key == "time_window":
             return self._evaluate_time_window(value)

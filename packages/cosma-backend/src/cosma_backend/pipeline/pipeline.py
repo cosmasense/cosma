@@ -1,3 +1,19 @@
+"""
+File Processing Pipeline
+
+Coordinates the four-stage indexing process:
+1. Discovery - Walk filesystem, apply include/exclude filters
+2. Parsing - Extract text via Spotlight, MarkItDown, or Whisper
+3. Summarization - AI-generated title, summary, keywords
+4. Embedding - Vector representation for semantic search
+
+Key behaviors:
+- Skips unchanged files (based on content hash)
+- Applies fallback indexing for failed files (filename → metadata)
+- Emits SSE updates at each stage for UI progress
+- Supports both directory-batch and single-file processing
+"""
+
 from __future__ import annotations
 
 import re
@@ -6,14 +22,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from cosma_backend.db import Database
+from cosma_backend.discoverer import Discoverer
+from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.models.status import ProcessingStatus
 from cosma_backend.models.update import Update
-from cosma_backend.discoverer import Discoverer
 from cosma_backend.parser import FileParser
 from cosma_backend.summarizer import AutoSummarizer
-from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.utils.pubsub import Hub
 
 if TYPE_CHECKING:
@@ -240,7 +256,7 @@ class Pipeline:
             self._apply_fallback_indexing(file)
             await self._save_to_db(file)
                 
-            raise e
+            raise
             
     async def is_supported(self, file: File) -> bool:
         """Check if a file is supported for processing"""
@@ -249,12 +265,14 @@ class Pipeline:
     async def _should_skip_file(self, file: File) -> bool:
         """Check if file should be skipped based on DB state."""
         if not await self.is_supported(file):
-            return False
-        
+            logger.debug("Skipping unsupported file", file=file.file_path)
+            return True
+
         saved_file = await self.db.get_file_by_path(file.file_path)
-        
+
+        # File not in DB or not yet fully processed - don't skip
         if not saved_file or saved_file.status not in (ProcessingStatus.COMPLETE, ProcessingStatus.FAILED):
-            logger.info("Should skip", file=file, status=saved_file.status if saved_file else "No saved file")
+            logger.debug("File needs processing", file=file.file_path, status=saved_file.status if saved_file else "not in DB")
             return False
             
         saved_modified = saved_file.modified.replace(microsecond=0)
@@ -305,6 +323,29 @@ class Pipeline:
                 seen.add(low)
                 keywords.append(low)
         file.keywords = keywords
+
+    async def embed_fallback(self, file_path: str) -> None:
+        """Generate embeddings for a failed file using its fallback title/summary/keywords.
+
+        This makes failed files discoverable via semantic search even though
+        full parsing/summarization failed.  The file's status stays FAILED.
+        """
+        file = await self.db.get_file_by_path(file_path)
+        if file is None:
+            logger.warning("embed_fallback: file not found in DB", file_path=file_path)
+            return
+        if not file.title and not file.summary:
+            logger.info("embed_fallback: no fallback content, skipping", file_path=file_path)
+            return
+
+        logger.info("Generating fallback embedding", file_path=file_path)
+        self._publish_update(Update.file_embedding(file.file_path, file.filename))
+        await self.embedder.embed(file)
+        # Keep the original FAILED status — this file is still incomplete
+        file.status = ProcessingStatus.FAILED
+        await self._save_embeddings(file)
+        self._publish_update(Update.file_embedded(file.file_path, file.filename))
+        logger.info("Fallback embedding complete", file_path=file_path)
 
     async def _save_to_db(self, file: File) -> None:
         """Save file data to database."""

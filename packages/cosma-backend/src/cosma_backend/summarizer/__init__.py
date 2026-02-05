@@ -1,44 +1,56 @@
-#!/usr/bin/env python
-# -*-coding:utf-8 -*-
-'''
-@File    :   __init__.py
-@Time    :   2025/07/06 10:43:12
-@Author  :   Ethan Pan 
-@Version :   1.0
-@Contact :   epan@cs.wisc.edu
-@License :   (C)Copyright 2025, Ethan Pan
-@Desc    :   Summarizer module for AI-powered file summarization
-'''
+"""
+Summarizer module for AI-powered file summarization.
 
-from .summarizer import (
-    AutoSummarizer,
-    OllamaSummarizer,
-    OnlineSummarizer,
+This module provides multiple summarizer implementations:
+- OllamaSummarizer: Local Ollama models
+- OnlineSummarizer: Online AI models via LiteLLM
+- LlamaCppSummarizer: Local llama.cpp models
+- AutoSummarizer: Automatic provider selection with fallback
+"""
+
+from .base import (
+    AIProviderError,
     BaseSummarizer,
     SummarizerError,
-    AIProviderError,
-    summarize_file,
+)
+from .providers import (
+    LlamaCppSummarizer,
+    OllamaSummarizer,
+    OnlineSummarizer,
+)
+from .auto import (
+    AutoSummarizer,
     get_available_providers,
     is_summarizer_available,
+    summarize_file,
+)
+from .tokenization import (
+    chunk_content,
+    estimate_tokens,
+    estimate_tokens_fast,
+    extract_json_from_response,
+    get_encoding_for_model,
 )
 
 __all__ = [
-    "AutoSummarizer",
-    "OllamaSummarizer",
-    "OnlineSummarizer",
+    # Base classes and exceptions
     "BaseSummarizer",
     "SummarizerError",
     "AIProviderError",
+    # Provider implementations
+    "OllamaSummarizer",
+    "OnlineSummarizer",
+    "LlamaCppSummarizer",
+    # Auto summarizer
+    "AutoSummarizer",
+    # Convenience functions
     "summarize_file",
     "get_available_providers",
     "is_summarizer_available",
+    # Token utilities
+    "estimate_tokens",
+    "estimate_tokens_fast",
+    "chunk_content",
+    "get_encoding_for_model",
+    "extract_json_from_response",
 ]
-
-# Put summarizing code in here.
-# Maybe expose a Summarizer class that contains all initialization logic
-# and has a method for summarizing a file?
-#
-# Something like:
-# summarizer = Summarizer(...)
-# summarizer.summarize_file(file)
-

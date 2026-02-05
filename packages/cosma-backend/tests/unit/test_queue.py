@@ -22,12 +22,13 @@ from cosma_backend.utils.pubsub import Hub
 
 @pytest.fixture
 def mock_pipeline():
-    """Mock pipeline with db.delete_file, process_file, is_supported."""
+    """Mock pipeline with db.delete_file, process_file, is_supported, embed_fallback."""
     pipeline = MagicMock()
     pipeline.db = MagicMock()
     pipeline.db.delete_file = AsyncMock(return_value=None)
     pipeline.process_file = AsyncMock(return_value=None)
     pipeline.is_supported = AsyncMock(return_value=True)
+    pipeline.embed_fallback = AsyncMock(return_value=None)
     return pipeline
 
 
@@ -80,12 +81,12 @@ class TestIndexingQueueEnqueue:
         key = str(item.file_path)
         assert key in queue._pending_reenqueue
 
-    async def test_delete_makes_item_ready_immediately(self, queue):
+    async def test_delete_makes_item_waiting_immediately(self, queue):
         item = await queue.enqueue("/tmp/test.txt", QueueAction.INDEX)
         assert item.status == QueueItemStatus.COOLING_DOWN
 
         item2 = await queue.enqueue("/tmp/test.txt", QueueAction.DELETE)
-        assert item2.status == QueueItemStatus.READY
+        assert item2.status == QueueItemStatus.WAITING
         assert item2.action == QueueAction.DELETE
 
     async def test_move_dest_to_src_mapping(self, queue):
@@ -150,7 +151,7 @@ class TestIndexingQueuePause:
         assert queue.is_scheduler_paused
 
     def test_or_semantics_both_paused(self, queue):
-        """Both paused → resume one → still paused."""
+        """Both paused -> resume one -> still paused."""
         queue.manual_pause()
         queue.scheduler_pause()
         assert queue.is_paused
@@ -169,7 +170,7 @@ class TestIndexingQueuePause:
 @pytest.mark.unit
 class TestIndexingQueueProcessing:
     async def test_processing_loop_transitions_items(self, queue, mock_pipeline):
-        """Items transition from COOLING_DOWN → READY → PROCESSING → removed."""
+        """Items transition from COOLING_DOWN -> WAITING -> PROCESSING -> removed."""
         item = await queue.enqueue("/tmp/test.txt", QueueAction.INDEX)
 
         # Wait for cooldown to expire
@@ -212,7 +213,7 @@ class TestIndexingQueueProcessing:
             assert items[0].retry_count > 0
 
     async def test_max_retries_exceeded_removes_item(self, queue, mock_pipeline):
-        """After max_retries, item is removed permanently."""
+        """After max_retries, item is removed and fallback embedding is enqueued."""
         mock_pipeline.process_file.side_effect = RuntimeError("parse error")
 
         item = await queue.enqueue("/tmp/fail.txt", QueueAction.INDEX)
@@ -223,7 +224,38 @@ class TestIndexingQueueProcessing:
         await asyncio.sleep(3)
         await queue.stop()
 
-        # Item should be removed after exhausting retries
+        # Original INDEX item removed; an EMBED_FALLBACK item may exist briefly
+        # but the important thing is the INDEX item is gone
+        items = await queue.get_items()
+        index_items = [i for i in items if i.action == QueueAction.INDEX]
+        assert len(index_items) == 0
+
+    async def test_embed_fallback_calls_pipeline(self, queue, mock_pipeline):
+        """EMBED_FALLBACK items call pipeline.embed_fallback."""
+        item = await queue.enqueue("/tmp/fallback.txt", QueueAction.EMBED_FALLBACK)
+
+        await asyncio.sleep(0.15)
+
+        await queue.start()
+        await asyncio.sleep(0.6)
+        await queue.stop()
+
+        assert queue.item_count == 0
+        mock_pipeline.embed_fallback.assert_called()
+
+    async def test_embed_fallback_no_retry(self, queue, mock_pipeline):
+        """EMBED_FALLBACK items should not retry on failure."""
+        mock_pipeline.embed_fallback.side_effect = RuntimeError("embed error")
+
+        item = await queue.enqueue("/tmp/nofb.txt", QueueAction.EMBED_FALLBACK)
+
+        await asyncio.sleep(0.15)
+
+        await queue.start()
+        await asyncio.sleep(0.6)
+        await queue.stop()
+
+        # Should be removed immediately (no retries for fallback)
         assert queue.item_count == 0
 
 
@@ -240,6 +272,6 @@ class TestIndexingQueueStatus:
         status = await queue.get_status()
         assert status["total_items"] == 2
         assert status["cooling_down"] == 2
-        assert status["ready"] == 0
+        assert status["waiting"] == 0
         assert status["processing"] == 0
         assert status["paused"] is False
