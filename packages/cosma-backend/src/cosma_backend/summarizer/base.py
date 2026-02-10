@@ -106,11 +106,6 @@ class BaseSummarizer(ABC):
         if estimated_tokens <= self.max_tokens:
             return [content]
 
-        # Content is too large, need to chunk
-        if estimated_tokens >= 200_000:
-            logger.warning("Content exceeds max token limit, will not summarize", estimated_tokens=estimated_tokens)
-            raise RuntimeError("File too large to summarize")
-
         logger.info("Content exceeds token limit, chunking required", estimated_tokens=estimated_tokens, max_tokens=self.max_tokens)
 
         # Use optimized chunking

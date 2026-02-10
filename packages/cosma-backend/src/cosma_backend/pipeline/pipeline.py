@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from cosma_backend.db import Database
+from cosma_backend.db.errors import DatabaseClosingError
 from cosma_backend.discoverer import Discoverer
 from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.logging import get_logger
@@ -120,14 +121,19 @@ class Pipeline:
                 
                 # Process the file through the pipeline
                 await self.process_file(file)
-                
+
+            except DatabaseClosingError:
+                logger.debug("Skipping file processing (DB closing during shutdown)")
+                return
             except Exception:
                 continue
-        
+
         try:
             logger.info("Deleting files no longer present in filesystem", started_processing=started_processing, path=str(path))
             rows = await self.db.delete_files_not_updated_since(started_processing, str(path))
             logger.info("Deleted unused files", count=len(rows))
+        except DatabaseClosingError:
+            logger.debug("Skipped stale-file cleanup (DB closing during shutdown)")
         except Exception as e:
             logger.error("Error while deleting unused files", error=str(e))
 
@@ -170,6 +176,9 @@ class Pipeline:
 
                 await indexing_queue.enqueue(file.file_path, QueueAction.INDEX)
                 enqueued += 1
+            except DatabaseClosingError:
+                logger.debug("Skipping enqueue (DB closing during shutdown)")
+                return enqueued
             except Exception:
                 logger.exception("Error enqueueing file", file_path=file.file_path)
                 continue
@@ -181,6 +190,8 @@ class Pipeline:
             rows = await self.db.delete_files_not_updated_since(started_processing, str(path))
             if rows:
                 logger.info("Deleted stale files after enqueue", count=len(rows), directory=str(path))
+        except DatabaseClosingError:
+            logger.debug("Skipped stale-file cleanup (DB closing during shutdown)")
         except Exception:
             logger.exception("Error during stale-file cleanup")
 
@@ -238,24 +249,27 @@ class Pipeline:
             # Mark as complete
             self._publish_update(Update.file_complete(file.file_path, file.filename))
             
+        except DatabaseClosingError:
+            logger.debug("Skipping file processing (DB closing during shutdown)")
+            raise
         except Exception as e:
             # result.failed += 1
             # result.errors.append((str(file_path), str(e)))
             logger.error("Pipeline failed for file", file=file, error=e)
-            
+
             # Publish failure update
             self._publish_update(Update.file_failed(
-                file.file_path, 
-                file.filename, 
+                file.file_path,
+                file.filename,
                 error=str(e)
             ))
-            
+
             # Save failed state to DB if we have file_data
             file.status = ProcessingStatus.FAILED
             file.processing_error = str(e)
             self._apply_fallback_indexing(file)
             await self._save_to_db(file)
-                
+
             raise
             
     async def is_supported(self, file: File) -> bool:

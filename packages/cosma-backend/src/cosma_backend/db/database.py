@@ -26,6 +26,7 @@ import asqlite
 import numpy as np
 import sqlite_vec
 
+from cosma_backend.db.errors import DatabaseClosingError
 from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.models.watch import WatchedDirectory
@@ -79,8 +80,8 @@ class Database:
         
     async def close(self) -> None:
         """Close the connection pool."""
-        await self.pool.close()
         self._closed = True
+        await self.pool.close()
 
     async def __aenter__(self) -> Self:
         """Async context manager entry."""
@@ -94,13 +95,15 @@ class Database:
     ) -> None:
         """Async context manager exit - close pool if not already closed."""
         if not self._closed:
-            await self.pool.close()
             self._closed = True
+            await self.pool.close()
 
     # ====== Helper Functions ======
 
     def acquire(self) -> asqlite._AcquireProxyContextManager:
         """Acquire a connection from the pool."""
+        if self._closed:
+            raise DatabaseClosingError()
         return self.pool.acquire()
 
     # ====== File Operations ======

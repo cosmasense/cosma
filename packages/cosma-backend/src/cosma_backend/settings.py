@@ -143,6 +143,15 @@ SCHEDULER_RULE_TYPES: dict[str, dict[str, Any]] = {
         "min": 0,
         "max": 100,
     },
+    "memory_pressure": {
+        "label": "Memory Pressure",
+        "description": "Maximum memory pressure allowed (active+wired %)",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 100,
+    },
     "cpu_temperature": {
         "label": "CPU Temperature",
         "description": "Maximum CPU temperature allowed",
@@ -167,6 +176,13 @@ SCHEDULER_RULE_TYPES: dict[str, dict[str, Any]] = {
         "value_type": "boolean",
         "default_operator": "eq",
         "boolean_labels": {"true": "Idle", "false": "Busy"},
+    },
+    "low_power_mode": {
+        "label": "Low Power Mode",
+        "description": "Pause when macOS Low Power Mode is active",
+        "value_type": "boolean",
+        "default_operator": "eq",
+        "boolean_labels": {"true": "Active", "false": "Inactive"},
     },
     "time_window": {
         "label": "Time Window",

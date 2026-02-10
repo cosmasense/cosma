@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from cosma_backend.db.errors import DatabaseClosingError
 from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.models.update import Update, UpdateOpcode
@@ -384,6 +385,9 @@ class IndexingQueue:
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 raise
+            except DatabaseClosingError:
+                logger.debug("Queue loop stopping (DB closing during shutdown)")
+                return
             except Exception:
                 logger.exception("Error in queue processing loop")
                 await asyncio.sleep(1)
@@ -428,6 +432,9 @@ class IndexingQueue:
                 await self._delete_item_from_db(item.id)
                 logger.info("Queue item completed", file_path=item.file_path, action=item.action.value)
 
+            except DatabaseClosingError:
+                logger.debug("Queue worker stopping (DB closing during shutdown)")
+                return
             except Exception as e:
                 item.retry_count += 1
                 # Deterministic failures should not be retried

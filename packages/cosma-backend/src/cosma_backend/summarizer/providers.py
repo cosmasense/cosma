@@ -277,7 +277,8 @@ class LlamaCppSummarizer(BaseSummarizer):
             logger.info("Unloading llama.cpp model")
             del self.llm
             self.llm = None
-            gc.collect()
+            from cosma_backend.utils.memory import release_memory
+            release_memory()
 
     async def is_available(self) -> bool:
         """Check if llama.cpp is available (doesn't load model)."""

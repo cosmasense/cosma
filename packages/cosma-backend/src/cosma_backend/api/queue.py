@@ -29,6 +29,7 @@ class QueueStatusResponse:
     cooling_down: int
     waiting: int
     processing: int
+    failing_rules: list[str]
 
 
 @dataclass
@@ -52,6 +53,8 @@ class SchedulerResponse:
     check_interval_seconds: int
     rules: list[dict[str, Any]]
     conditions_met: bool
+    warnings: list[str]
+    rule_results: list[dict[str, Any]]
 
 
 @dataclass
@@ -81,6 +84,7 @@ class ReindexResponse:
 @dataclass
 class MetricsResponse:
     metrics: dict[str, Any]
+    models: list[dict[str, Any]]
 
 
 # ------------------------------------------------------------------
@@ -91,7 +95,14 @@ class MetricsResponse:
 @validate_response(QueueStatusResponse, 200)
 async def queue_status() -> tuple[QueueStatusResponse, int]:
     status = await current_app.indexing_queue.get_status()
-    return QueueStatusResponse(**status), 200
+
+    failing_rules: list[str] = []
+    if status.get("scheduler_paused") and hasattr(current_app, "scheduler"):
+        for r in getattr(current_app.scheduler, "_last_rule_results", []):
+            if not r.get("passed", True):
+                failing_rules.append(r.get("rule", "unknown"))
+
+    return QueueStatusResponse(**status, failing_rules=failing_rules), 200
 
 
 @queue_bp.post("/pause")
@@ -156,6 +167,8 @@ async def scheduler_status() -> tuple[SchedulerResponse, int]:
         check_interval_seconds=cfg.check_interval_seconds,
         rules=rules,
         conditions_met=scheduler.conditions_met,
+        warnings=scheduler.warnings,
+        rule_results=scheduler.last_rule_results,
     ), 200
 
 
@@ -164,7 +177,7 @@ async def scheduler_status() -> tuple[SchedulerResponse, int]:
 async def scheduler_update() -> tuple[SchedulerResponse, int]:
     data = await request.get_json()
     scheduler = current_app.scheduler
-    scheduler.update_config(data)
+    await scheduler.update_config(data)
     # Persist to settings (including rules)
     from dataclasses import asdict
     cfg = scheduler.config
@@ -181,7 +194,29 @@ async def scheduler_update() -> tuple[SchedulerResponse, int]:
         check_interval_seconds=cfg.check_interval_seconds,
         rules=rules,
         conditions_met=scheduler.conditions_met,
+        warnings=scheduler.warnings,
+        rule_results=scheduler.last_rule_results,
     ), 200
+
+
+@queue_bp.post("/scheduler/test")
+async def scheduler_test() -> dict:
+    """Evaluate current scheduler rules against live metrics (dry-run)."""
+    scheduler = current_app.scheduler
+    from cosma_backend.queue.metrics import SystemMetricsCollector
+    collector = SystemMetricsCollector()
+    metrics = await collector.collect()
+
+    # Evaluate rules against fresh metrics
+    async with scheduler._config_lock:
+        met = scheduler._evaluate_rules(metrics)
+        rule_results = scheduler._last_rule_results.copy()
+
+    return {
+        "conditions_met": met,
+        "rule_results": rule_results,
+        "metrics": {k: v for k, v in metrics.items() if k != "collected_at"},
+    }
 
 
 @queue_bp.get("/scheduler/rule-types")
@@ -201,7 +236,12 @@ async def system_metrics() -> tuple[MetricsResponse, int]:
     from cosma_backend.queue.metrics import SystemMetricsCollector
     collector = SystemMetricsCollector()
     metrics = await collector.collect()
-    return MetricsResponse(metrics=metrics), 200
+
+    models: list[dict[str, Any]] = []
+    if hasattr(current_app, "model_lifecycle"):
+        models = current_app.model_lifecycle.get_model_status()
+
+    return MetricsResponse(metrics=metrics, models=models), 200
 
 
 # ------------------------------------------------------------------

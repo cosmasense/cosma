@@ -98,8 +98,8 @@ class ModelLifecycleManager:
                         )
                         await self._summarizer.unload_models()
 
-                # Check embedder idle time
-                if self._embedder is not None:
+                # Check embedder idle time (only if model is actually loaded)
+                if self._embedder is not None and self._embedder.is_model_loaded():
                     emb_last_used = self._embedder.last_used_at
                     if emb_last_used > 0:
                         emb_idle = now - emb_last_used
@@ -133,3 +133,69 @@ class ModelLifecycleManager:
             except Exception:
                 logger.exception("Error in model lifecycle monitor loop")
                 await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+    def get_model_status(self) -> list[dict]:
+        """Return loaded/unloaded status for each managed model."""
+        now = time.time()
+        models = []
+
+        # Summarizer
+        for name, summarizer in self._summarizer.summarizers.items():
+            if summarizer is None:
+                models.append({
+                    "name": f"summarizer ({name})",
+                    "loaded": False,
+                    "idle_seconds": None,
+                })
+                continue
+            loaded = False
+            if hasattr(summarizer, "_model_loaded"):
+                loaded = summarizer._model_loaded
+            elif hasattr(summarizer, "llm"):
+                loaded = summarizer.llm is not None
+            elif name == "online":
+                loaded = True  # online providers are always "loaded"
+
+            last_used = summarizer.last_used_at if hasattr(summarizer, "last_used_at") else 0.0
+            idle = round(now - last_used, 1) if last_used > 0 else None
+            models.append({
+                "name": f"summarizer ({name})",
+                "loaded": loaded,
+                "idle_seconds": idle,
+            })
+
+        # Embedder
+        if self._embedder is not None:
+            local = self._embedder.embedders.get("local")
+            if local is not None:
+                loaded = hasattr(local, "model") and local.model is not None
+                last_used = local.last_used_at if hasattr(local, "last_used_at") else 0.0
+                idle = round(now - last_used, 1) if last_used > 0 else None
+                models.append({
+                    "name": "embedder (local)",
+                    "loaded": loaded,
+                    "idle_seconds": idle,
+                })
+            online = self._embedder.embedders.get("online")
+            if online is not None:
+                models.append({
+                    "name": "embedder (online)",
+                    "loaded": True,
+                    "idle_seconds": None,
+                })
+
+        # Whisper
+        try:
+            from cosma_backend.parser.media import get_whisper_last_used_at, _whisper_model
+            whisper_loaded = _whisper_model is not None
+            whisper_last = get_whisper_last_used_at()
+            whisper_idle = round(now - whisper_last, 1) if whisper_last else None
+            models.append({
+                "name": "whisper",
+                "loaded": whisper_loaded,
+                "idle_seconds": whisper_idle,
+            })
+        except Exception:
+            pass
+
+        return models

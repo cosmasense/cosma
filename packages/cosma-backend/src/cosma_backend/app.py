@@ -47,6 +47,10 @@ from cosma_backend.watcher import Watcher
 
 load_dotenv()
 
+import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+configure_logging()
 logger = get_logger(__name__)
 
 class App(Quart):

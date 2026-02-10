@@ -192,7 +192,9 @@ class LocalEmbedder(BaseEmbedder):
         if self.model is not None:
             del self.model
             self.model = None
-            gc.collect()
+            self.last_used_at = 0.0
+            from cosma_backend.utils.memory import release_memory
+            release_memory()
             logger.info("Local embedding model unloaded", model=self.model_name)
 
     def is_available(self) -> bool:

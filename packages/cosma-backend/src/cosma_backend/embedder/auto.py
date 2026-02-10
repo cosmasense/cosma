@@ -239,6 +239,11 @@ class AutoEmbedder:
             return local.last_used_at
         return 0.0
 
+    def is_model_loaded(self) -> bool:
+        """Check if the local embedding model is currently loaded in memory."""
+        local = self.embedders.get("local")
+        return local is not None and hasattr(local, "model") and local.model is not None
+
     async def unload_models(self) -> None:
         """Unload local embedding model to free memory."""
         local = self.embedders.get("local")

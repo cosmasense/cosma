@@ -681,7 +681,8 @@ def unload_whisper_model() -> None:
         _whisper_model = None
         _whisper_model_name = None
         _whisper_last_used_at = None
-        gc.collect()
+        from cosma_backend.utils.memory import release_memory
+        release_memory()
 
 
 # Local vision processing is now integrated into the summarization system

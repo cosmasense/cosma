@@ -19,6 +19,7 @@ def mock_queue():
     q = MagicMock()
     q.scheduler_pause = MagicMock()
     q.scheduler_resume = MagicMock()
+    q.queue_size = 0
     return q
 
 
@@ -159,16 +160,16 @@ class TestSchedulerCombineMode:
 
 @pytest.mark.unit
 class TestSchedulerUpdateConfig:
-    def test_update_enabled(self, scheduler):
-        scheduler.update_config({"enabled": False})
+    async def test_update_enabled(self, scheduler):
+        await scheduler.update_config({"enabled": False})
         assert scheduler._config.enabled is False
 
-    def test_update_combine_mode(self, scheduler):
-        scheduler.update_config({"combine_mode": "any"})
+    async def test_update_combine_mode(self, scheduler):
+        await scheduler.update_config({"combine_mode": "any"})
         assert scheduler._config.combine_mode == "ANY"
 
-    def test_update_rules_from_dict(self, scheduler):
-        scheduler.update_config({
+    async def test_update_rules_from_dict(self, scheduler):
+        await scheduler.update_config({
             "rules": [
                 {"rule": "battery_level", "operator": "gt", "value": 30, "enabled": True},
                 {"rule": "cpu_temperature", "operator": "lt", "value": 80, "enabled": False},
@@ -196,7 +197,9 @@ class TestSystemMetricsCollector:
             "cpu_temperature",
             "fan_speed",
             "memory_usage",
+            "memory_pressure",
             "gpu_usage",
+            "low_power_mode",
             "collected_at",
         }
         assert set(metrics.keys()) == expected_keys

@@ -44,6 +44,9 @@ class Scheduler:
         self._task: Optional[asyncio.Task] = None
         self._conditions_met = True
         self._last_metrics: dict[str, Any] = {}
+        self._last_rule_results: list[dict[str, Any]] = []
+        self._warnings: list[str] = []
+        self._config_lock = asyncio.Lock()
 
     @property
     def config(self) -> "SchedulerConfig":
@@ -56,6 +59,14 @@ class Scheduler:
     @property
     def last_metrics(self) -> dict[str, Any]:
         return self._last_metrics
+
+    @property
+    def last_rule_results(self) -> list[dict[str, Any]]:
+        return self._last_rule_results
+
+    @property
+    def warnings(self) -> list[str]:
+        return self._warnings
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -81,25 +92,120 @@ class Scheduler:
     # Config updates
     # ------------------------------------------------------------------
 
-    def update_config(self, data: dict[str, Any]) -> None:
+    async def update_config(self, data: dict[str, Any]) -> None:
         """Update scheduler config from a dict (e.g. from the API)."""
         from cosma_backend.settings import SchedulerRuleConfig
 
-        if "enabled" in data:
-            self._config.enabled = bool(data["enabled"])
-        if "combine_mode" in data:
-            self._config.combine_mode = str(data["combine_mode"]).upper()
-        if "check_interval_seconds" in data:
-            self._config.check_interval_seconds = int(data["check_interval_seconds"])
-        if "rules" in data and isinstance(data["rules"], list):
-            self._config.rules = []
-            for r in data["rules"]:
-                self._config.rules.append(SchedulerRuleConfig(
-                    rule=r.get("rule", ""),
-                    operator=r.get("operator", ""),
-                    value=r.get("value"),
-                    enabled=r.get("enabled", True),
-                ))
+        async with self._config_lock:
+            if "enabled" in data:
+                self._config.enabled = bool(data["enabled"])
+            if "combine_mode" in data:
+                self._config.combine_mode = str(data["combine_mode"]).upper()
+            if "check_interval_seconds" in data:
+                self._config.check_interval_seconds = int(data["check_interval_seconds"])
+            if "rules" in data and isinstance(data["rules"], list):
+                self._config.rules = []
+                for r in data["rules"]:
+                    self._config.rules.append(SchedulerRuleConfig(
+                        rule=r.get("rule", ""),
+                        operator=r.get("operator", ""),
+                        value=r.get("value"),
+                        enabled=r.get("enabled", True),
+                    ))
+
+            self.validate_rules()
+
+    def validate_rules(self) -> list[str]:
+        """Detect contradictory or tautological rule configurations.
+
+        Returns a list of human-readable warning strings.
+        """
+        warnings: list[str] = []
+        enabled_rules = [
+            r for r in self._config.rules
+            if (r.enabled if hasattr(r, "enabled") else r.get("enabled", True))
+        ]
+        if not enabled_rules:
+            return warnings
+
+        # Group numeric rules by metric key
+        numeric_groups: dict[str, list[tuple[str, float]]] = {}
+        for r in enabled_rules:
+            key = r.rule if hasattr(r, "rule") else r.get("rule", "")
+            op = r.operator if hasattr(r, "operator") else r.get("operator", "")
+            val = r.value if hasattr(r, "value") else r.get("value")
+            if key in ("time_window", "power_source", "cpu_idle", "low_power_mode"):
+                continue
+            try:
+                numeric_groups.setdefault(key, []).append((op, float(val)))
+            except (TypeError, ValueError):
+                continue
+
+        mode = self._config.combine_mode
+
+        for key, ops in numeric_groups.items():
+            if len(ops) < 2:
+                continue
+
+            # In ALL mode, check for impossible combinations
+            if mode == "ALL":
+                lower_bounds = []  # gte/gt thresholds
+                upper_bounds = []  # lte/lt thresholds
+                for op, val in ops:
+                    if op in ("gte", "gt"):
+                        lower_bounds.append((op, val))
+                    elif op in ("lte", "lt"):
+                        upper_bounds.append((op, val))
+
+                if lower_bounds and upper_bounds:
+                    max_lower = max(v for _, v in lower_bounds)
+                    min_upper = min(v for _, v in upper_bounds)
+                    if max_lower > min_upper:
+                        warnings.append(
+                            f"Contradictory rules on '{key}': requires "
+                            f">= {max_lower} AND <= {min_upper} (impossible, queue will never start)"
+                        )
+                    elif max_lower == min_upper:
+                        lower_strict = any(op == "gt" for op, v in lower_bounds if v == max_lower)
+                        upper_strict = any(op == "lt" for op, v in upper_bounds if v == min_upper)
+                        if lower_strict or upper_strict:
+                            warnings.append(
+                                f"Contradictory rules on '{key}': strict inequality at "
+                                f"{max_lower} makes the range empty (queue will never start)"
+                            )
+
+            # In ANY mode, check for tautological rules
+            if mode == "ANY":
+                for op, val in ops:
+                    if op == "gte" and val <= 0 and key in (
+                        "battery_level", "gpu_usage", "memory_usage", "queue_size",
+                    ):
+                        warnings.append(
+                            f"Tautological rule on '{key}': >= {val} is always true "
+                            f"(queue will never be paused by this rule)"
+                        )
+                    if op == "lte" and val >= 100 and key in (
+                        "battery_level", "gpu_usage", "memory_usage",
+                    ):
+                        warnings.append(
+                            f"Tautological rule on '{key}': <= {val} is always true "
+                            f"(queue will never be paused by this rule)"
+                        )
+
+        # Duplicate rule types
+        seen_keys: dict[str, int] = {}
+        for r in enabled_rules:
+            key = r.rule if hasattr(r, "rule") else r.get("rule", "")
+            seen_keys[key] = seen_keys.get(key, 0) + 1
+        for key, count in seen_keys.items():
+            if count > 1:
+                warnings.append(
+                    f"Duplicate rule type '{key}' ({count} instances) - "
+                    f"this may cause unexpected behaviour"
+                )
+
+        self._warnings = warnings
+        return warnings
 
     # ------------------------------------------------------------------
     # Monitor loop
@@ -108,11 +214,17 @@ class Scheduler:
     async def _monitor_loop(self) -> None:
         while True:
             try:
-                if self._config.enabled and self._config.rules:
+                async with self._config_lock:
+                    enabled = self._config.enabled
+                    has_rules = bool(self._config.rules)
+                    interval = self._config.check_interval_seconds
+
+                if enabled and has_rules:
                     metrics = await self._collector.collect()
                     self._last_metrics = metrics
 
-                    met = self._evaluate_rules(metrics)
+                    async with self._config_lock:
+                        met = self._evaluate_rules(metrics)
 
                     if met != self._conditions_met:
                         self._conditions_met = met
@@ -126,7 +238,7 @@ class Scheduler:
                         self._conditions_met = True
                         self._queue.scheduler_resume()
 
-                await asyncio.sleep(self._config.check_interval_seconds)
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -146,12 +258,27 @@ class Scheduler:
             if is_enabled:
                 enabled_rules.append(r)
         if not enabled_rules:
+            self._last_rule_results = []
             return True
 
         # Inject queue_size into metrics so rules can reference it
         metrics["queue_size"] = self._queue.queue_size
 
-        results = [self._evaluate_rule(r, metrics) for r in enabled_rules]
+        rule_results: list[dict[str, Any]] = []
+        results: list[bool] = []
+        for r in enabled_rules:
+            key = r.rule if hasattr(r, "rule") else r.get("rule", "")
+            passed = self._evaluate_rule(r, metrics)
+            results.append(passed)
+            # Check if the metric for this rule is available
+            metric_available = self._is_metric_available(key, metrics)
+            rule_results.append({
+                "rule": key,
+                "passed": passed,
+                "metric_available": metric_available,
+            })
+
+        self._last_rule_results = rule_results
 
         if self._config.combine_mode == "ANY":
             return any(results)
@@ -184,6 +311,14 @@ class Scheduler:
             actual = metrics.get("power_source_plugged")
             if actual is None:
                 logger.debug("power_source metric unavailable, rule passes by default")
+                return True
+            expected = _to_bool(value)
+            return actual == expected
+
+        if metric_key == "low_power_mode":
+            actual = metrics.get("low_power_mode")
+            if actual is None:
+                logger.debug("low_power_mode metric unavailable, rule passes by default")
                 return True
             expected = _to_bool(value)
             return actual == expected
@@ -229,7 +364,15 @@ class Scheduler:
         """Check if current time is within [start, end] window.
 
         ``value`` should be a list of two strings like ``["02:00", "04:00"]``.
+        Also accepts a hyphen-separated string like ``"02:00-04:00"`` for
+        backwards compatibility.
         """
+        # Normalise legacy "HH:MM-HH:MM" string into a list
+        if isinstance(value, str) and "-" in value:
+            parts = value.split("-", 1)
+            if len(parts) == 2:
+                value = parts
+
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             return True
 
@@ -244,6 +387,26 @@ class Scheduler:
             return now >= start or now <= end
         except (ValueError, TypeError):
             return True
+
+    @staticmethod
+    def _is_metric_available(rule_key: str, metrics: dict[str, Any]) -> bool:
+        """Check if the metric for a rule is currently available."""
+        if rule_key == "time_window":
+            return True  # time is always available
+        metric_map = {
+            "battery_level": "battery_level",
+            "power_source": "power_source_plugged",
+            "cpu_idle": "cpu_idle_seconds",
+            "cpu_temperature": "cpu_temperature",
+            "fan_speed": "fan_speed",
+            "memory_usage": "memory_usage",
+            "memory_pressure": "memory_pressure",
+            "gpu_usage": "gpu_usage",
+            "queue_size": "queue_size",
+            "low_power_mode": "low_power_mode",
+        }
+        metric_key = metric_map.get(rule_key, rule_key)
+        return metrics.get(metric_key) is not None
 
 
 def _to_bool(v: Any) -> bool:
