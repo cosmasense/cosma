@@ -63,6 +63,9 @@ class Database:
     @classmethod
     async def from_path(cls, path: str) -> Self:
         def init_conn(conn: Sqlite3Connection):
+            # WAL mode: crash-safe journaling that survives sudden termination
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
             # initialize sqlite_vec in each connection
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)

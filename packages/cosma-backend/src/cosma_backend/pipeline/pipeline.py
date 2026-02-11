@@ -227,12 +227,16 @@ class Pipeline:
             if not await self._has_file_changed(file):
                 logger.info("Skipping processing file, hashed not changed", file=file)
                 self._publish_update(Update.file_skipped(
-                    file.file_path, 
-                    file.filename, 
+                    file.file_path,
+                    file.filename,
                     reason="content not changed"
                 ))
                 return
-            
+
+            # Delete any existing partial data so a crash-recovery retry
+            # starts from a clean slate (cascades to embeddings, keywords, FTS).
+            await self.db.delete_file(file.file_path)
+
             # Stage 2: Summarize
             self._publish_update(Update.file_summarizing(file.file_path, file.filename))
             await self.summarizer.summarize(file)
