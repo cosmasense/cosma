@@ -71,9 +71,12 @@ class OllamaSummarizer(BaseSummarizer):
 
     async def unload(self) -> None:
         """Tell Ollama to unload the model from GPU/memory."""
+        if not self._model_loaded:
+            return
         try:
             await self.client.generate(model=self.model, keep_alive="0")
             self._model_loaded = False
+            self._last_used_at = 0.0
             logger.info("Ollama model unloaded", model=self.model)
         except Exception as e:
             logger.warning("Failed to unload Ollama model", model=self.model, error=str(e))

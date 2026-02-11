@@ -86,17 +86,18 @@ class ModelLifecycleManager:
 
                 now = time.time()
 
-                # Check summarizer idle time
-                last_used = self._summarizer.last_used_at
-                if last_used > 0:
-                    idle_time = now - last_used
-                    if idle_time > self._idle_unload_seconds:
-                        logger.info(
-                            "Summarizer idle, unloading",
-                            idle_seconds=round(idle_time, 1),
-                            threshold=self._idle_unload_seconds,
-                        )
-                        await self._summarizer.unload_models()
+                # Check summarizer idle time (only if a model is loaded)
+                if self._summarizer.is_any_model_loaded():
+                    last_used = self._summarizer.last_used_at
+                    if last_used > 0:
+                        idle_time = now - last_used
+                        if idle_time > self._idle_unload_seconds:
+                            logger.info(
+                                "Summarizer idle, unloading",
+                                idle_seconds=round(idle_time, 1),
+                                threshold=self._idle_unload_seconds,
+                            )
+                            await self._summarizer.unload_models()
 
                 # Check embedder idle time (only if model is actually loaded)
                 if self._embedder is not None and self._embedder.is_model_loaded():

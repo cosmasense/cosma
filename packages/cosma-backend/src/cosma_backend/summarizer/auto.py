@@ -172,6 +172,17 @@ class AutoSummarizer:
                 latest = max(latest, summarizer.last_used_at)
         return latest
 
+    def is_any_model_loaded(self) -> bool:
+        """Check if any summarizer model is currently loaded."""
+        for summarizer in self.summarizers.values():
+            if summarizer is None:
+                continue
+            if hasattr(summarizer, "_model_loaded") and summarizer._model_loaded:
+                return True
+            if hasattr(summarizer, "llm") and summarizer.llm is not None:
+                return True
+        return False
+
     async def unload_models(self) -> None:
         """Unload models from memory for all providers that support it."""
         for name, summarizer in self.summarizers.items():
