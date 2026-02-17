@@ -1,10 +1,11 @@
 import logging
-import structlog
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
+
 import numpy as np
+import structlog
 
 
 def _serialize_value(value):
@@ -48,21 +49,48 @@ def _serialize_event_dict(logger, method_name, event_dict):
     return event_dict
 
 
-def configure_logging():
-    """Configure structlog with default pretty console output."""
+def configure_logging(log_path: Path | None = None) -> None:
+    """Configure structlog with console output and optional file logging."""
+    pre_chain = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.dev.set_exc_info,
+        structlog.processors.TimeStamper(fmt="iso"),
+        _serialize_event_dict,
+    ]
+
+    console_formatter = structlog.stdlib.ProcessorFormatter(
+        processor=structlog.dev.ConsoleRenderer(),
+        foreign_pre_chain=pre_chain,
+    )
+
+    handlers: list[logging.Handler] = []
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(console_formatter)
+    handlers.append(console_handler)
+
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_formatter = structlog.stdlib.ProcessorFormatter(
+            processor=structlog.processors.JSONRenderer(),
+            foreign_pre_chain=pre_chain,
+        )
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(file_formatter)
+        handlers.append(file_handler)
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+    for handler in handlers:
+        root_logger.addHandler(handler)
+
     structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-            structlog.dev.set_exc_info,
-            structlog.processors.TimeStamper(fmt="iso"),
-            _serialize_event_dict,
-            structlog.dev.ConsoleRenderer(),
-        ],
+        processors=pre_chain + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
 

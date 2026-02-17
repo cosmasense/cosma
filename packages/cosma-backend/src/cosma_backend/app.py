@@ -27,7 +27,6 @@ from cosma_backend.filter import FilterConfigManager
 
 load_dotenv()
 
-configure_logging()
 logger = get_logger(__name__)
 
 class App(Quart):
@@ -49,12 +48,16 @@ class App(Quart):
         self.filter_manager = FilterConfigManager()      
 
     def initialize_config(self):
-        logger.info("Loading config")
         self.config.from_prefixed_env("COSMA")
 
         # Bootstrap-only settings (env vars only, needed before app starts)
         self.config.setdefault("APP_NAME", "cosma")
         self.dirs = PlatformDirs(self.config["APP_NAME"], ensure_exists=True)
+        log_path = Path(self.dirs.user_log_dir) / "cosma-backend.log"
+        configure_logging(log_path=log_path)
+        global logger
+        logger = get_logger(__name__)
+        logger.info("Loading config")
         self.config.setdefault("HOST", '127.0.0.1')
         self.config.setdefault("PORT", 60534)
         self.config.setdefault("DATABASE_PATH", Path(self.dirs.user_data_dir) / "app.db")
