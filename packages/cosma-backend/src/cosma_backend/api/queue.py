@@ -98,7 +98,7 @@ async def queue_status() -> tuple[QueueStatusResponse, int]:
 
     failing_rules: list[str] = []
     if status.get("scheduler_paused") and hasattr(current_app, "scheduler"):
-        for r in getattr(current_app.scheduler, "_last_rule_results", []):
+        for r in current_app.scheduler.last_rule_results:
             if not r.get("passed", True):
                 failing_rules.append(r.get("rule", "unknown"))
 
@@ -142,6 +142,7 @@ async def queue_items() -> tuple[QueueItemsResponse, int]:
 
 
 @queue_bp.delete("/items/<item_id>")
+@validate_response(QueueActionResponse, 404)
 @validate_response(QueueActionResponse, 200)
 async def queue_remove_item(item_id: str) -> tuple[QueueActionResponse, int]:
     removed = await current_app.indexing_queue.remove_item(item_id)
@@ -202,21 +203,7 @@ async def scheduler_update() -> tuple[SchedulerResponse, int]:
 @queue_bp.post("/scheduler/test")
 async def scheduler_test() -> dict:
     """Evaluate current scheduler rules against live metrics (dry-run)."""
-    scheduler = current_app.scheduler
-    from cosma_backend.queue.metrics import SystemMetricsCollector
-    collector = SystemMetricsCollector()
-    metrics = await collector.collect()
-
-    # Evaluate rules against fresh metrics
-    async with scheduler._config_lock:
-        met = scheduler._evaluate_rules(metrics)
-        rule_results = scheduler._last_rule_results.copy()
-
-    return {
-        "conditions_met": met,
-        "rule_results": rule_results,
-        "metrics": {k: v for k, v in metrics.items() if k != "collected_at"},
-    }
+    return await current_app.scheduler.test_rules()
 
 
 @queue_bp.get("/scheduler/rule-types")
@@ -293,6 +280,7 @@ async def queue_recent_files() -> tuple[FileListResponse, int]:
 
 
 @queue_bp.post("/reindex")
+@validate_response(ReindexResponse, 400)
 @validate_response(ReindexResponse, 200)
 async def queue_reindex_file() -> tuple[ReindexResponse, int]:
     from cosma_backend.queue import QueueAction

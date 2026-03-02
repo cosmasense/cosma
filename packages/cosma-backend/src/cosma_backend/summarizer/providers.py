@@ -175,7 +175,7 @@ class OnlineSummarizer(BaseSummarizer):
         if images:
             user_message["images"] = images
 
-        response = litellm.completion(
+        response = await litellm.acompletion(
             model=self.model,
             messages=[
                 {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},

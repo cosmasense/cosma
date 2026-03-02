@@ -130,6 +130,10 @@ class IndexingQueue:
         """Return the count of active (non-completed) items in the queue."""
         return len(self._items)
 
+    @property
+    def initial_cooldown_seconds(self) -> float:
+        return self._config.initial_cooldown_seconds
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -188,8 +192,14 @@ class IndexingQueue:
         file_path: str | Path,
         action: QueueAction,
         dest_path: Optional[str | Path] = None,
+        cooldown_seconds: Optional[float] = None,
     ) -> QueueItem:
-        """Add or update an item in the queue with debounce."""
+        """Add or update an item in the queue with debounce.
+
+        ``cooldown_seconds`` overrides the default cooldown for this enqueue
+        call (e.g. shorter cooldown for initial directory scans).
+        """
+        cooldown = cooldown_seconds if cooldown_seconds is not None else self._config.cooldown_seconds
         key = str(Path(file_path).resolve())
         dest_key = str(Path(dest_path).resolve()) if dest_path else None
         now = time.time()
@@ -204,7 +214,7 @@ class IndexingQueue:
                 if src_key is not None:
                     move_item = self._items.get(src_key)
                     if move_item is not None and move_item.status == QueueItemStatus.COOLING_DOWN:
-                        move_item.cooldown_expires_at = now + self._config.cooldown_seconds
+                        move_item.cooldown_expires_at = now + cooldown
                         self._publish(Update.create(
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **move_item.to_dict()
                         ))
@@ -244,7 +254,7 @@ class IndexingQueue:
 
                     # Otherwise reset the cooldown timer
                     existing.action = action
-                    existing.cooldown_expires_at = now + self._config.cooldown_seconds
+                    existing.cooldown_expires_at = now + cooldown
                     existing.dest_path = dest_key if dest_key else existing.dest_path
                     # Update dest mapping
                     if action == QueueAction.MOVE and existing.dest_path:
@@ -256,6 +266,25 @@ class IndexingQueue:
                     logger.info("Queue item cooldown reset", file_path=key)
                     return existing
 
+                if existing.status == QueueItemStatus.WAITING:
+                    # Item is ready but hasn't been dispatched yet; reset it
+                    # back to COOLING_DOWN so the new event is debounced.
+                    if existing.action == QueueAction.MOVE and existing.dest_path:
+                        self._dest_to_src.pop(existing.dest_path, None)
+                    existing.action = action
+                    existing.status = QueueItemStatus.COOLING_DOWN
+                    existing.cooldown_expires_at = now + cooldown
+                    existing.dest_path = dest_key if dest_key else existing.dest_path
+                    if action == QueueAction.MOVE and existing.dest_path:
+                        self._dest_to_src[existing.dest_path] = key
+                    self._publish(Update.create(
+                        UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
+                    ))
+                    await self._save_item(existing)
+                    logger.info("Queue item reset from WAITING to cooldown",
+                                file_path=key, action=action.value)
+                    return existing
+
             # New item
             item = QueueItem(
                 id=str(uuid.uuid4()),
@@ -263,7 +292,7 @@ class IndexingQueue:
                 action=action,
                 status=QueueItemStatus.COOLING_DOWN,
                 enqueued_at=now,
-                cooldown_expires_at=now + self._config.cooldown_seconds,
+                cooldown_expires_at=now + cooldown,
                 dest_path=dest_key,
             )
             self._items[key] = item
@@ -377,6 +406,12 @@ class IndexingQueue:
                         i for i in self._items.values()
                         if i.status == QueueItemStatus.WAITING
                     ]
+                    # Mark PROCESSING under the lock so concurrent enqueue()
+                    # calls see the correct status while items wait for the
+                    # semaphore.
+                    for item in ready_items:
+                        item.status = QueueItemStatus.PROCESSING
+                        await self._save_item(item)
 
                 if ready_items:
                     tasks = [self._process_item(item) for item in ready_items]
@@ -396,11 +431,13 @@ class IndexingQueue:
         """Process a single queue item through the pipeline."""
         async with self._semaphore:
             async with self._lock:
-                # Item may have been removed while waiting for the semaphore
-                if item.file_path not in self._items:
+                # Item may have been removed or re-enqueued while waiting
+                # for the semaphore.  The loop already set status to
+                # PROCESSING under the lock, but if the item was removed
+                # (or replaced by a new enqueue) we should bail out.
+                current = self._items.get(item.file_path)
+                if current is not item:
                     return
-                item.status = QueueItemStatus.PROCESSING
-                await self._save_item(item)
 
             self._publish(Update.create(
                 UpdateOpcode.QUEUE_ITEM_PROCESSING, **item.to_dict()

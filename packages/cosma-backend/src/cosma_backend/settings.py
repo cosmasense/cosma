@@ -11,7 +11,7 @@ import dataclasses
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any, Callable, get_type_hints
 
 from platformdirs import PlatformDirs
 
@@ -202,6 +202,7 @@ SCHEDULER_RULE_TYPES: dict[str, dict[str, Any]] = {
 @dataclass
 class QueueConfig:
     cooldown_seconds: int = 60
+    initial_cooldown_seconds: int = 5
     max_concurrency: int = 2
     max_retries: int = 3
 
@@ -288,8 +289,9 @@ def _get_by_path(obj: Any, path: str) -> Any:
     return current
 
 
-_VALIDATIONS: dict[tuple[str, str], tuple[callable, str]] = {
+_VALIDATIONS: dict[tuple[str, str], tuple[Callable[[Any], bool], str]] = {
     ("queue", "cooldown_seconds"): (lambda v: v >= 1, "cooldown_seconds must be >= 1"),
+    ("queue", "initial_cooldown_seconds"): (lambda v: v >= 0, "initial_cooldown_seconds must be >= 0"),
     ("queue", "max_concurrency"): (lambda v: v >= 1, "max_concurrency must be >= 1"),
     ("queue", "max_retries"): (lambda v: v >= 0, "max_retries must be >= 0"),
     ("scheduler", "check_interval_seconds"): (lambda v: v >= 5, "check_interval_seconds must be >= 5"),

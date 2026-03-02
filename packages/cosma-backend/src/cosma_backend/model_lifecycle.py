@@ -7,8 +7,9 @@ reduce memory usage when models aren't actively being used.
 
 Monitored models:
 - Summarizer (Ollama, LlamaCpp, or online)
-- Embedder (local SentenceTransformer)
 - Whisper (audio transcription)
+
+The embedder is kept loaded permanently for instant search.
 
 Each model tracks its last_used_at timestamp. When idle time
 exceeds the threshold, the model is unloaded to free resources.
@@ -99,18 +100,7 @@ class ModelLifecycleManager:
                             )
                             await self._summarizer.unload_models()
 
-                # Check embedder idle time (only if model is actually loaded)
-                if self._embedder is not None and self._embedder.is_model_loaded():
-                    emb_last_used = self._embedder.last_used_at
-                    if emb_last_used > 0:
-                        emb_idle = now - emb_last_used
-                        if emb_idle > self._idle_unload_seconds:
-                            logger.info(
-                                "Embedder idle, unloading",
-                                idle_seconds=round(emb_idle, 1),
-                                threshold=self._idle_unload_seconds,
-                            )
-                            await self._embedder.unload_models()
+                # Embedder stays loaded permanently for instant search.
 
                 # Check whisper model idle time
                 from cosma_backend.parser.media import (

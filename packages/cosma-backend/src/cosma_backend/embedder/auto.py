@@ -47,57 +47,54 @@ class AutoEmbedder:
         logger.debug("Preferred provider", og=preferred_provider, provider=self.preferred_provider)
         self.embedders: dict = {}
 
-        logger.info("AutoEmbedder initializing",
-                   preferred_provider=self.preferred_provider)
+        logger.debug("AutoEmbedder initializing",
+                    preferred_provider=self.preferred_provider)
 
         # Eagerly initialize models based on preferred provider
         self._eagerly_initialize_models()
 
     def _eagerly_initialize_models(self) -> None:
         """Initialize embedding models based on provider preference - eager for local, lazy for online."""
-        logger.info("Initializing embedding models")
+        logger.debug("Initializing embedding models")
 
         if self.preferred_provider == "local":
-            # Create local embedder instance (model loads lazily on first use)
-            logger.info("Initializing local embedding provider (model loads on first use)")
+            # Create local embedder and load model immediately for instant search
+            logger.debug("Initializing local embedding provider (eager load)")
             local_embedder = self._get_local_embedder()
             if local_embedder:
-                logger.info("Local embedder ready (lazy)",
-                           model=local_embedder.model_name,
-                           dimensions=local_embedder.dimensions)
+                local_embedder._ensure_loaded()
+                logger.debug("Local embedder loaded",
+                            model=local_embedder.model_name,
+                            dimensions=local_embedder.dimensions)
             else:
                 logger.warning("Local embedder failed to initialize")
 
             # Check online availability but don't initialize (lazy loading)
-            logger.info("Checking online embedding provider availability (lazy loading)")
+            logger.debug("Checking online embedding provider availability (lazy loading)")
             online_available = self._check_online_availability()
             if online_available:
-                logger.info("Online embedder available as fallback (will load on first use)")
+                logger.debug("Online embedder available as fallback (will load on first use)")
             else:
                 logger.warning("Online embedder not available - check API keys")
         else:
             # For online preference, check availability but don't initialize (lazy loading)
-            logger.info("Checking online embedding provider availability (lazy loading)")
+            logger.debug("Checking online embedding provider availability (lazy loading)")
             online_available = self._check_online_availability()
             if online_available:
-                logger.info("Online embedder ready (will load on first use)",
-                           provider="online")
+                logger.debug("Online embedder ready (will load on first use)",
+                            provider="online")
             else:
                 logger.warning("Online embedder not available - check API keys")
 
             # Skip local model initialization when user explicitly chose online
-            logger.info("Skipping local embedding model initialization (online provider preferred)")
+            logger.debug("Skipping local embedding model initialization (online provider preferred)")
             logger.info("To use local models as fallback, set EMBEDDING_PROVIDER=local")
 
         # Summary of initialization strategy
         if self.preferred_provider == "local":
-            logger.info("AutoEmbedder configured: LOCAL models preloaded, ONLINE models lazy-loaded")
+            logger.info("AutoEmbedder configured: LOCAL model loaded, ONLINE models lazy-loaded")
         else:
             logger.info("AutoEmbedder configured: ONLINE models only (LOCAL models skipped)")
-
-        logger.info("AutoEmbedder initialization complete",
-                   preferred_provider=self.preferred_provider,
-                   strategy="eager_local_lazy_online" if self.preferred_provider == "local" else "online_only")
 
     def _check_online_availability(self) -> bool:
         """Check if online embedder is available without initializing it."""
@@ -178,8 +175,8 @@ class AutoEmbedder:
         for embedder in providers:
             if embedder:
                 try:
-                    logger.info("Attempting embedding generation",
-                               provider=type(embedder).__name__)
+                    logger.debug("Attempting embedding generation",
+                                provider=type(embedder).__name__)
                     return embedder.embed_text(text)
                 except Exception as e:
                     logger.warning("Embedder failed, trying next provider",
@@ -218,8 +215,8 @@ class AutoEmbedder:
         for embedder in providers:
             if embedder:
                 try:
-                    logger.info("Attempting async embedding generation",
-                               provider=type(embedder).__name__)
+                    logger.debug("Attempting async embedding generation",
+                                provider=type(embedder).__name__)
                     return await embedder.embed_text_async(text)
                 except Exception as e:
                     logger.warning("Async embedder failed, trying next provider",

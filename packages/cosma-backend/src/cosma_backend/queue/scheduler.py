@@ -207,6 +207,25 @@ class Scheduler:
         self._warnings = warnings
         return warnings
 
+    async def test_rules(self) -> dict[str, Any]:
+        """Evaluate rules against live metrics (dry-run).
+
+        Returns conditions_met, rule_results, and the collected metrics.
+        Note: this *does* update last_rule_results as a side-effect, matching
+        the behaviour of the normal monitor loop.
+        """
+        metrics = await self._collector.collect()
+
+        async with self._config_lock:
+            conditions_met = self._evaluate_rules(metrics)
+            rule_results = self._last_rule_results.copy()
+
+        return {
+            "conditions_met": conditions_met,
+            "rule_results": rule_results,
+            "metrics": {k: v for k, v in metrics.items() if k != "collected_at"},
+        }
+
     # ------------------------------------------------------------------
     # Monitor loop
     # ------------------------------------------------------------------

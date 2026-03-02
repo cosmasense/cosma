@@ -1,50 +1,6 @@
-# CosmaSense Backend Development Guide for AI Agents
+# Cosma Backend Development Guide
 
-Use this skill when modifying the CosmaSense backend codebase, adding new API endpoints, or extending the processing pipeline.
-
-## Project Structure
-
-```
-cosma/packages/cosma-backend/src/cosma_backend/
-├── app.py                  # App class (Quart), service wiring, startup/shutdown
-├── settings.py             # SettingsManager, all *Config dataclasses
-├── api/                    # REST API blueprints
-│   ├── __init__.py         # Blueprint registration (api_blueprint)
-│   ├── models.py           # Shared response dataclasses (FileResponse, etc.)
-│   ├── files.py            # /api/files/*
-│   ├── index.py            # /api/index/*
-│   ├── search.py           # /api/search/*
-│   ├── status.py           # /api/status/
-│   ├── watch.py            # /api/watch/*
-│   ├── queue.py            # /api/queue/*
-│   ├── filters.py          # /api/filters/*
-│   ├── settings.py         # /api/settings/*
-│   └── updates.py          # /api/updates/ (SSE)
-├── models/                 # Core data models
-│   ├── file.py             # File dataclass (all pipeline stages)
-│   ├── update.py           # UpdateOpcode enum, Update dataclass (SSE events)
-│   ├── status.py           # ProcessingStatus enum
-│   └── watch.py            # WatchedDirectory dataclass
-├── pipeline/               # File processing pipeline
-│   ├── pipeline.py         # Pipeline class (process_file, process_directory)
-│   ├── discoverer.py       # File discovery and metadata extraction
-│   ├── parser.py           # FileParser (MarkItDown, Spotlight)
-│   ├── summarizer.py       # AutoSummarizer (Ollama/LiteLLM)
-│   └── embedder.py         # AutoEmbedder (local/OpenAI)
-├── queue/                  # Indexing queue with debounce
-│   ├── __init__.py
-│   ├── indexing_queue.py   # IndexingQueue class
-│   ├── scheduler.py        # Scheduler + rule engine
-│   └── metrics.py          # SystemMetricsCollector (psutil + macOS CLIs)
-├── watcher/                # Filesystem monitoring
-│   └── watcher.py          # Watcher, WatcherJob (watchdog integration)
-├── db/                     # Database layer
-│   ├── database.py         # Database class (async SQLite + sqlite-vec)
-│   └── schema.sql          # DDL for tables, FTS5, vec0
-├── search/                 # Search engine
-│   └── searcher.py         # HybridSearcher (semantic + FTS5)
-└── hub.py                  # Pub/sub for SSE events
-```
+Use this skill when modifying the Cosma backend codebase, adding new API endpoints, or extending the processing pipeline.
 
 ## How to Add a New API Endpoint
 

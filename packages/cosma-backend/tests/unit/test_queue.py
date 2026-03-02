@@ -275,3 +275,112 @@ class TestIndexingQueueStatus:
         assert status["waiting"] == 0
         assert status["processing"] == 0
         assert status["paused"] is False
+
+
+# ---------------------------------------------------------------------------
+# Race condition: items marked PROCESSING under lock
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestIndexingQueueRaceCondition:
+    async def test_items_marked_processing_under_lock(self, queue, mock_pipeline):
+        """Ready items should be PROCESSING before the lock is released in the loop."""
+        item = await queue.enqueue("/tmp/race.txt", QueueAction.INDEX)
+
+        # Let cooldown expire
+        await asyncio.sleep(0.15)
+
+        # Manually run a single loop-like pass: acquire lock, transition, collect
+        now = time.time()
+        async with queue._lock:
+            for it in queue._items.values():
+                if it.status == QueueItemStatus.COOLING_DOWN and now >= it.cooldown_expires_at:
+                    it.status = QueueItemStatus.WAITING
+
+            ready = [i for i in queue._items.values() if i.status == QueueItemStatus.WAITING]
+            assert len(ready) == 1
+
+            # After the loop's collection logic, items must be PROCESSING
+            for it in ready:
+                it.status = QueueItemStatus.PROCESSING
+
+        # Outside the lock, item should already be PROCESSING
+        assert item.status == QueueItemStatus.PROCESSING
+
+    async def test_enqueue_during_waiting_resets_to_cooldown(self, queue):
+        """Enqueue on a WAITING item should reset it to COOLING_DOWN, not create a new item."""
+        item = await queue.enqueue("/tmp/wait.txt", QueueAction.INDEX)
+        original_id = item.id
+
+        # Manually set to WAITING to simulate the transition
+        item.status = QueueItemStatus.WAITING
+
+        item2 = await queue.enqueue("/tmp/wait.txt", QueueAction.INDEX)
+        assert item2.id == original_id  # same item, not a new one
+        assert item2.status == QueueItemStatus.COOLING_DOWN
+
+    async def test_enqueue_during_processing_stores_pending(self, queue):
+        """Enqueue on a PROCESSING item should store a pending re-enqueue."""
+        item = await queue.enqueue("/tmp/proc.txt", QueueAction.INDEX)
+        item.status = QueueItemStatus.PROCESSING
+
+        item2 = await queue.enqueue("/tmp/proc.txt", QueueAction.INDEX)
+        assert item2.id == item.id
+        assert item.file_path in queue._pending_reenqueue
+
+    async def test_process_item_skips_replaced_item(self, queue, mock_pipeline):
+        """If an item is replaced in _items, _process_item should bail out."""
+        item = await queue.enqueue("/tmp/replaced.txt", QueueAction.INDEX)
+        item.status = QueueItemStatus.PROCESSING
+
+        # Replace with a different item at the same key
+        new_item = QueueItem(
+            id="new-id",
+            file_path=item.file_path,
+            action=QueueAction.INDEX,
+            status=QueueItemStatus.COOLING_DOWN,
+            enqueued_at=time.time(),
+            cooldown_expires_at=time.time() + 10,
+        )
+        queue._items[item.file_path] = new_item
+
+        # _process_item should detect the mismatch and return early
+        await queue._process_item(item)
+
+        # The new item should still be in the queue untouched
+        assert queue._items[item.file_path] is new_item
+        mock_pipeline.process_file.assert_not_called()
+
+    async def test_no_item_loss_with_semaphore_contention(self, queue_config, mock_pipeline, mock_hub):
+        """With max_concurrency=1, an enqueue during semaphore wait should not lose items."""
+        config = QueueConfig(cooldown_seconds=0.05, max_concurrency=1, max_retries=3)
+        queue = IndexingQueue(pipeline=mock_pipeline, updates_hub=mock_hub, config=config)
+
+        # Enqueue two items so one must wait on the semaphore
+        await queue.enqueue("/tmp/a.txt", QueueAction.INDEX)
+        await queue.enqueue("/tmp/b.txt", QueueAction.INDEX)
+
+        await asyncio.sleep(0.1)  # let cooldowns expire
+
+        with patch("cosma_backend.queue.indexing_queue.File") as MockFile:
+            # Make processing slow so one item blocks the semaphore
+            async def slow_process(f):
+                await asyncio.sleep(0.3)
+            mock_pipeline.process_file.side_effect = slow_process
+            MockFile.from_path.return_value = MagicMock()
+
+            await queue.start()
+            await asyncio.sleep(0.1)  # let the loop pick up items
+
+            # Both should be PROCESSING (set under the lock)
+            items = list(queue._items.values())
+            processing = [i for i in items if i.status == QueueItemStatus.PROCESSING]
+            assert len(processing) == 2
+
+            # Now enqueue a new event for /tmp/b.txt while it waits on semaphore
+            await queue.enqueue("/tmp/b.txt", QueueAction.INDEX)
+            # Should be stored as pending re-enqueue since status is PROCESSING
+            assert any("/tmp/b.txt" in k for k in queue._pending_reenqueue)
+
+            await asyncio.sleep(1)  # let everything finish
+            await queue.stop()

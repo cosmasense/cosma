@@ -174,7 +174,10 @@ class Pipeline:
                     ))
                     continue
 
-                await indexing_queue.enqueue(file.file_path, QueueAction.INDEX)
+                await indexing_queue.enqueue(
+                    file.file_path, QueueAction.INDEX,
+                    cooldown_seconds=indexing_queue.initial_cooldown_seconds,
+                )
                 enqueued += 1
             except DatabaseClosingError:
                 logger.debug("Skipping enqueue (DB closing during shutdown)")

@@ -335,6 +335,95 @@ class Client:
         except niquests.exceptions.ConnectionError:
             raise ServerNotRunningError(self.base_url)
 
+    async def get_queue_items(self, offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+        """List items in the indexing queue"""
+        try:
+            response = await self.session.get(
+                self._url("/api/queue/items"),
+                params={"offset": offset, "limit": limit},
+            )
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def remove_queue_item(self, item_id: str) -> Dict[str, Any]:
+        """Remove an item from the indexing queue"""
+        try:
+            response = await self.session.delete(
+                self._url(f"/api/queue/items/{item_id}")
+            )
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def get_failed_files(self, offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+        """List files that failed processing"""
+        try:
+            response = await self.session.get(
+                self._url("/api/queue/failed"),
+                params={"offset": offset, "limit": limit},
+            )
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def get_recent_files(self, offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+        """List recently completed files"""
+        try:
+            response = await self.session.get(
+                self._url("/api/queue/recent"),
+                params={"offset": offset, "limit": limit},
+            )
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def reindex_file(self, file_path: str) -> Dict[str, Any]:
+        """Delete and re-queue a file for indexing"""
+        try:
+            response = await self.session.post(
+                self._url("/api/queue/reindex"),
+                data=json.dumps({"file_path": file_path}),
+            )
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def get_queue_metrics(self) -> Dict[str, Any]:
+        """Get system metrics and model status"""
+        try:
+            response = await self.session.get(self._url("/api/queue/metrics"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def get_scheduler(self) -> Dict[str, Any]:
+        """Get scheduler configuration and status"""
+        try:
+            response = await self.session.get(self._url("/api/queue/scheduler"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def update_scheduler(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Update scheduler configuration"""
+        try:
+            response = await self.session.put(
+                self._url("/api/queue/scheduler"),
+                data=json.dumps(config),
+            )
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
+    async def test_scheduler(self) -> Dict[str, Any]:
+        """Dry-run scheduler rules against live metrics"""
+        try:
+            response = await self.session.post(self._url("/api/queue/scheduler/test"))
+            return self._handle_response(response)
+        except niquests.exceptions.ConnectionError:
+            raise ServerNotRunningError(self.base_url)
+
     # =========================================================================
     # Settings API
     # =========================================================================

@@ -10,6 +10,7 @@ from .cli.commands.watch import watch_group
 from .cli.commands.files import files_group
 from .cli.commands.filters import filters_group
 from .cli.commands.settings import settings_group
+from .cli.commands.queue import queue_group
 from .cli.commands.updates import updates_command
 from .cli.commands.serve import serve_command
 from .cli.commands.tui import tui_command
@@ -70,6 +71,7 @@ cli.add_command(watch_group, name="watch")
 cli.add_command(files_group, name="files")
 cli.add_command(filters_group, name="filters")
 cli.add_command(settings_group, name="settings")
+cli.add_command(queue_group, name="queue")
 cli.add_command(updates_command, name="updates")
 cli.add_command(serve_command, name="serve")
 cli.add_command(tui_command, name="tui")

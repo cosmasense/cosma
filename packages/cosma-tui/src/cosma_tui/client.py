@@ -3,7 +3,7 @@ import json
 from typing import Optional, Dict, Any, List, AsyncIterator
 from urllib.parse import urljoin
 
-from .models import Update, UpdateOpcode
+from cosma_client.models import Update, UpdateOpcode
 
 class Client:
     session: niquests.AsyncSession
