@@ -317,13 +317,13 @@ class TestQueueItemCrud:
         await temp_db.upsert_queue_item(item)
 
         # Update status
-        item["status"] = "ready"
+        item["status"] = "waiting"
         item["retry_count"] = 2
         await temp_db.upsert_queue_item(item)
 
         items = await temp_db.get_queue_items()
         assert len(items) == 1
-        assert items[0]["status"] == "ready"
+        assert items[0]["status"] == "waiting"
         assert items[0]["retry_count"] == 2
 
     async def test_delete_queue_item(self, temp_db: Database):
@@ -331,7 +331,7 @@ class TestQueueItemCrud:
             "id": "test-id-3",
             "file_path": "/tmp/test3.txt",
             "action": "delete",
-            "status": "ready",
+            "status": "waiting",
             "enqueued_at": 1000.0,
             "cooldown_expires_at": 1000.0,
             "dest_path": None,

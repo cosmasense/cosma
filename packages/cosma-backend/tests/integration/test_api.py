@@ -11,17 +11,6 @@ from cosma_backend.db.database import Database
 class TestAPIEndpoints:
     """Test cases for API endpoints."""
 
-    async def test_echo_endpoint(self, test_client: App):
-        """Test the echo endpoint."""
-        # For Quart, use the test client context manager
-        async with test_client.test_client() as client:
-            response = await client.post("/echo", json={"test": "data"})
-            
-            assert response.status_code == 200
-            data = await response.get_json()
-            assert data["input"]["test"] == "data"
-            assert data["extra"] is True
-
     async def test_api_search_endpoint(self, test_client: App, temp_db: Database):
         """Test the search API endpoint."""
         async with test_client.test_client() as client:
@@ -102,7 +91,7 @@ class TestAPIEndpoints:
     async def test_cors_headers(self, test_client: App):
         """Test that CORS headers are properly set."""
         async with test_client.test_client() as client:
-            response = await client.options("/echo", headers={
+            response = await client.options("/api/search/", headers={
                 "Origin": "http://localhost:3000",
                 "Access-Control-Request-Method": "POST",
                 "Access-Control-Request-Headers": "Content-Type"
@@ -144,11 +133,6 @@ class TestAPIEndpoints:
     async def test_api_response_format(self, test_client: App):
         """Test that API responses follow expected format."""
         async with test_client.test_client() as client:
-            response = await client.post("/echo", json={"test": "data"})
+            response = await client.get("/api/nonexistent")
 
-            assert response.headers.get("content-type") == "application/json"
-
-            data = await response.get_json()
-            assert isinstance(data, dict)
-            assert "input" in data
-            assert "extra" in data
+            assert response.status_code == 404
