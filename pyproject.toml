@@ -13,6 +13,11 @@ dependencies = [
 ]
 license = "MIT"
 
+[project.optional-dependencies]
+llamacpp = [
+    "cosma-backend[llamacpp]",
+]
+
 [project.urls]
 Homepage = "https://github.com/cosmasense/cosma"
 Repository = "https://github.com/cosmasense/cosma"

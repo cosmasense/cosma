@@ -48,14 +48,17 @@ class AutoSummarizer:
         """Get or create llama.cpp summarizer if available."""
         if "llamacpp" not in self.summarizers:
             try:
-                logger.info("llama.cpp summarizer initalizing")
+                logger.info("llama.cpp summarizer initializing")
                 summarizer = LlamaCppSummarizer(config=self.config)
                 if await summarizer.is_available():
                     self.summarizers["llamacpp"] = summarizer
                     logger.info("llama.cpp summarizer available")
                 else:
                     self.summarizers["llamacpp"] = None
-                    logger.debug("llama.cpp summarizer not available")
+                    logger.warning(
+                        "llama.cpp summarizer not available: llama-cpp-python is not installed. "
+                        "Install with: uv pip install -e \"packages/cosma-backend[llamacpp]\""
+                    )
                     return None
             except Exception as e:
                 logger.warning("Failed to create llama.cpp summarizer", error=str(e))
@@ -115,34 +118,38 @@ class AutoSummarizer:
         Raises:
             SummarizerError: If no summarizers are available or all fail
         """
-        # Get all available providers in priority order
+        # When a specific provider is requested (not "auto"), try only that provider
+        _provider_getters = {
+            "llamacpp": self._get_llamacpp_summarizer,
+            "ollama": self._get_ollama_summarizer,
+            "online": self._get_online_summarizer,
+        }
+
+        if self.preferred_provider in _provider_getters:
+            provider = await _provider_getters[self.preferred_provider]()
+            if not provider or not await provider.is_available():
+                raise SummarizerError(
+                    f"Summarizer provider '{self.preferred_provider}' is not available. "
+                    f"Check that the required package is installed and configured."
+                )
+            logger.info("Attempting summarization", provider=type(provider).__name__)
+            return await provider.summarize(file_metadata)
+
+        # "auto" mode: try all providers in priority order with fallback
         providers = [
             await self._get_llamacpp_summarizer(),
             await self._get_ollama_summarizer(),
             await self._get_online_summarizer()
         ]
 
-        # Sort providers based on preference
-        if self.preferred_provider == "online":
-            providers.reverse()
-        elif self.preferred_provider == "ollama":
-            # Move Ollama to front
-            providers = [p for p in providers if isinstance(p, OllamaSummarizer)] + \
-                       [p for p in providers if not isinstance(p, OllamaSummarizer)]
-        elif self.preferred_provider == "llamacpp":
-            # Move llama.cpp to front (already first by default)
-            pass
-
-        summarizer = None
         for provider in providers:
             if provider and await provider.is_available():
-                summarizer = provider
                 try:
-                    logger.info("Attempting summarization", provider=type(summarizer).__name__)
-                    return await summarizer.summarize(file_metadata)
+                    logger.info("Attempting summarization", provider=type(provider).__name__)
+                    return await provider.summarize(file_metadata)
                 except Exception as e:
-                    logger.warning("Summarizer failed, trying next provider", provider=type(summarizer).__name__, error=str(e))
-                    continue  # Try next provider
+                    logger.warning("Summarizer failed, trying next provider", provider=type(provider).__name__, error=str(e))
+                    continue
 
         error_msg = "All AI summarizers failed or are unavailable"
         logger.error("All AI summarizers failed or are unavailable", preferred_provider=self.preferred_provider)

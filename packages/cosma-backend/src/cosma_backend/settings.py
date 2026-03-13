@@ -43,14 +43,20 @@ class OnlineConfig:
 
 @dataclass
 class LlamaCppConfig:
-    context_length: int = 8192
-    n_ctx: int = 8192
+    context_length: int = 10000
+    n_ctx: int = 16384
     n_threads: int = 4
-    n_gpu_layers: int = 0
+    n_gpu_layers: int = -1
     verbose: bool = False
     model_path: str = ""
-    repo_id: str = ""
-    filename: str = ""
+    repo_id: str = "unsloth/Qwen3.5-2B-GGUF"
+    filename: str = "*Q4_K_M.gguf"
+    clip_model_path: str = ""
+    clip_repo_id: str = "unsloth/Qwen3.5-2B-GGUF"
+    clip_filename: str = "mmproj-F16.gguf"
+    chat_handler: str = "qwen3.5"
+    enable_thinking: bool = False
+    image_min_tokens: int = 1024
 
 
 @dataclass

@@ -66,7 +66,11 @@ markers = [
 ]
 
 [tool.uv.sources]
-llama-cpp-python = { git = "https://github.com/JamePeng/llama-cpp-python" }
+llama-cpp-python = [
+    { url = "https://github.com/cosmasense/llama-cpp-python/releases/download/v0.3.32-metal/llama_cpp_python-0.3.32-cp313-cp313-macosx_11_0_arm64.whl", marker = "python_version >= '3.13' and sys_platform == 'darwin'" },
+    { url = "https://github.com/cosmasense/llama-cpp-python/releases/download/v0.3.32-metal/llama_cpp_python-0.3.32-cp312-cp312-macosx_11_0_arm64.whl", marker = "python_version >= '3.12' and python_version < '3.13' and sys_platform == 'darwin'" },
+    { git = "https://github.com/cosmasense/llama-cpp-python", marker = "sys_platform != 'darwin'" },
+]
 
 [build-system]
 requires = ["uv_build>=0.9.8,<0.10.0"]
