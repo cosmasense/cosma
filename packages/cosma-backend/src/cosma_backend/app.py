@@ -98,6 +98,7 @@ class App(Quart):
         Config priority: env vars (COSMA_*) > TOML file > defaults
         Must be called before `before_serving` hook.
         """
+        global logger
         logger.info("Loading config")
         self.config.from_prefixed_env("COSMA")
 
@@ -106,9 +107,7 @@ class App(Quart):
         self.dirs = PlatformDirs(self.config["APP_NAME"], ensure_exists=True)
         log_path = Path(self.dirs.user_log_dir) / "cosma-backend.log"
         configure_logging(log_path=log_path)
-        global logger
         logger = get_logger(__name__)
-        logger.info("Loading config")
         self.config.setdefault("HOST", '127.0.0.1')
         self.config.setdefault("PORT", 60534)
         self.config.setdefault("DATABASE_PATH", Path(self.dirs.user_data_dir) / "app.db")
