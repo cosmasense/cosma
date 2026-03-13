@@ -1,0 +1,773 @@
+{
+	"info": {
+		"_postman_id": "cosmasense-api-collection",
+		"name": "CosmaSense API",
+		"description": "Complete API collection for CosmaSense backend (http://localhost:60534). 25 endpoints across 9 blueprints: Status, Watch, Index, Search, Files, Queue, Filters, Settings, and Updates (SSE).",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:60534",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Status",
+			"item": [
+				{
+					"name": "Get Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/status/",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "status", ""]
+						},
+						"description": "Returns the number of active watch jobs."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"jobs\": 1\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Watch & Index",
+			"item": [
+				{
+					"name": "Watch Directory",
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"directory_path\": \"/Users/yourname/Downloads\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/watch/",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "watch", ""]
+						},
+						"description": "Start watching a directory. Creates a watch job, starts file system watcher, and begins initial indexing."
+					},
+					"response": [
+						{
+							"name": "201 Created",
+							"status": "Created",
+							"code": 201,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Started watching directory: /Users/yourname/Downloads\",\n  \"files_indexed\": 0\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "List Watch Jobs",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/watch/jobs",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "watch", "jobs"]
+						},
+						"description": "List all watched directories (active and inactive)."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"jobs\": [\n    {\n      \"id\": 1,\n      \"path\": \"/Users/yourname/Downloads\",\n      \"is_active\": true,\n      \"recursive\": true,\n      \"file_pattern\": null,\n      \"last_scan\": \"2025-01-15T10:30:00\",\n      \"created_at\": \"2025-01-15T10:30:00\",\n      \"updated_at\": \"2025-01-15T14:22:00\"\n    }\n  ]\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Delete Watch Job",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/watch/jobs/1",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "watch", "jobs", "1"]
+						},
+						"description": "Stop watching a directory and remove all its indexed files. Replace '1' with the job ID."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Successfully deleted watched directory: /Users/yourname/Downloads\",\n  \"job_id\": 1\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						},
+						{
+							"name": "404 Not Found",
+							"status": "Not Found",
+							"code": 404,
+							"body": "{\n  \"success\": false,\n  \"message\": \"Watched directory with ID 99 not found\",\n  \"job_id\": 99\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Index Directory",
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"directory_path\": \"/Users/yourname/Documents\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/index/directory",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "index", "directory"]
+						},
+						"description": "Trigger indexing of all files in a directory (without creating a persistent watch job)."
+					},
+					"response": [
+						{
+							"name": "201 Created",
+							"status": "Created",
+							"code": 201,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Started indexing directory: /Users/yourname/Documents\",\n  \"files_indexed\": 0\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Index Single File",
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"file_path\": \"/Users/yourname/Documents/report.pdf\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/index/file",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "index", "file"]
+						},
+						"description": "Index a single file through the full pipeline (parse → summarize → embed)."
+					},
+					"response": [
+						{
+							"name": "201 Created",
+							"status": "Created",
+							"code": 201,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Successfully indexed file: /Users/yourname/Documents/report.pdf\",\n  \"file_id\": null\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Search & Files",
+			"item": [
+				{
+					"name": "Search Files",
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"meeting notes about project roadmap\",\n  \"limit\": 10,\n  \"directory\": null,\n  \"filters\": null\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/search/",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "search", ""]
+						},
+						"description": "Hybrid semantic + keyword search across all indexed files. Supports optional directory scoping and filters."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"results\": [\n    {\n      \"file\": {\n        \"file_path\": \"/Users/yourname/Downloads/report.pdf\",\n        \"filename\": \"report.pdf\",\n        \"extension\": \".pdf\",\n        \"created\": \"2025-01-10T09:00:00\",\n        \"modified\": \"2025-01-14T16:30:00\",\n        \"accessed\": \"2025-01-15T10:00:00\",\n        \"title\": \"Q4 Project Roadmap\",\n        \"summary\": \"Quarterly roadmap covering milestones...\",\n        \"keywords\": [\"roadmap\", \"project\", \"milestones\"]\n      },\n      \"relevance_score\": 0.85\n    }\n  ]\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Get File Stats",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/files/stats",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "files", "stats"]
+						},
+						"description": "Get aggregate statistics about indexed files."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"total_files\": 400,\n  \"total_size\": 0,\n  \"file_types\": {\n    \".pdf\": 45,\n    \".docx\": 12,\n    \".jpg\": 200\n  },\n  \"last_indexed\": \"2025-01-15T14:22:00\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Get File by ID",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/files/1",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "files", "1"]
+						},
+						"description": "Retrieve a single file's metadata by its database ID. Replace '1' with the file ID."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"id\": 1,\n  \"filename\": \"report.pdf\",\n  \"extension\": \".pdf\",\n  \"created\": \"2025-01-10T09:00:00\",\n  \"modified\": \"2025-01-14T16:30:00\",\n  \"summary\": \"Quarterly roadmap...\",\n  \"keywords\": [\"roadmap\", \"project\"]\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						},
+						{
+							"name": "404 Not Found",
+							"status": "Not Found",
+							"code": 404,
+							"body": "{\n  \"error\": \"File not found\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Queue & Scheduler",
+			"item": [
+				{
+					"name": "Get Queue Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/status",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "status"]
+						},
+						"description": "Get current queue state: pause status, item counts by state."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"paused\": false,\n  \"manually_paused\": false,\n  \"scheduler_paused\": false,\n  \"total_items\": 0,\n  \"cooling_down\": 0,\n  \"ready\": 0,\n  \"processing\": 0\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Pause Queue",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/pause",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "pause"]
+						},
+						"description": "Manually pause the indexing queue. Items stay queued but won't be processed."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Queue paused\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Resume Queue",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/resume",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "resume"]
+						},
+						"description": "Resume a manually paused queue. Note: queue stays paused if scheduler conditions aren't met."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Queue resumed\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "List Queue Items",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/items",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "items"]
+						},
+						"description": "List all items currently in the indexing queue with their status and cooldown timers."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"items\": [\n    {\n      \"id\": \"abc-123\",\n      \"file_path\": \"/Users/yourname/Downloads/doc.pdf\",\n      \"action\": \"INDEX\",\n      \"status\": \"COOLING_DOWN\",\n      \"enqueued_at\": 1705312200.0,\n      \"cooldown_expires_at\": 1705312260.0,\n      \"dest_path\": null,\n      \"retry_count\": 0\n    }\n  ]\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Remove Queue Item",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/items/abc-123",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "items", "abc-123"]
+						},
+						"description": "Remove a specific item from the queue by its UUID. Replace 'abc-123' with the item ID."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Item removed from queue\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						},
+						{
+							"name": "404 Not Found",
+							"status": "Not Found",
+							"code": 404,
+							"body": "{\n  \"success\": false,\n  \"message\": \"Item not found\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Get Scheduler Config",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/scheduler",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "scheduler"]
+						},
+						"description": "Get the scheduler configuration including rules and whether conditions are currently met."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"enabled\": false,\n  \"combine_mode\": \"ALL\",\n  \"check_interval_seconds\": 30,\n  \"rules\": [],\n  \"conditions_met\": true\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Update Scheduler Config",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"enabled\": true,\n  \"combine_mode\": \"ALL\",\n  \"check_interval_seconds\": 30,\n  \"rules\": [\n    {\n      \"type\": \"battery_level\",\n      \"operator\": \"gt\",\n      \"value\": 50,\n      \"enabled\": true\n    },\n    {\n      \"type\": \"power_source\",\n      \"operator\": \"eq\",\n      \"value\": true,\n      \"enabled\": true\n    }\n  ]\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/scheduler",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "scheduler"]
+						},
+						"description": "Update scheduler configuration. Rule types: battery_level, power_source, cpu_idle, time_window, cpu_temperature, fan_speed. Operators: gt, lt, eq, between."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"enabled\": true,\n  \"combine_mode\": \"ALL\",\n  \"check_interval_seconds\": 30,\n  \"rules\": [\n    {\n      \"type\": \"battery_level\",\n      \"operator\": \"gt\",\n      \"value\": 50,\n      \"enabled\": true\n    },\n    {\n      \"type\": \"power_source\",\n      \"operator\": \"eq\",\n      \"value\": true,\n      \"enabled\": true\n    }\n  ],\n  \"conditions_met\": true\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Get System Metrics",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/queue/metrics",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "queue", "metrics"]
+						},
+						"description": "Get current system metrics (battery, CPU, temperature, fan speed) used by the scheduler."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"metrics\": {\n    \"battery_level\": 72,\n    \"power_source_plugged\": true,\n    \"cpu_percent\": 34.5,\n    \"cpu_idle_seconds\": 300.0,\n    \"cpu_temperature\": null,\n    \"fan_speed\": null,\n    \"collected_at\": 1705312200.0\n  }\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Filters",
+			"item": [
+				{
+					"name": "Get Filter Config",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/config",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "config"]
+						},
+						"description": "Get the current filter configuration including mode (blacklist/whitelist) and all patterns."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"version\": 2,\n  \"mode\": \"blacklist\",\n  \"exclude\": [\"*.tmp\", \"node_modules/**\"],\n  \"include\": [],\n  \"blacklist_exclude\": [\"*.tmp\", \"node_modules/**\"],\n  \"blacklist_include\": [],\n  \"whitelist_include\": [\"*.pdf\", \"*.docx\"],\n  \"whitelist_exclude\": [],\n  \"config_path\": \"/Users/username/Library/Application Support/cosma/filter.json\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Update Filter Config",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"mode\": \"blacklist\",\n  \"blacklist_exclude\": [\"*.tmp\", \"*.log\", \"node_modules/**\"],\n  \"apply_immediately\": true\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/config",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "config"]
+						},
+						"description": "Update filter configuration. All fields are optional. Set apply_immediately to true to remove newly-excluded files from the index right away."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Filter configuration updated successfully\",\n  \"config\": { \"...\" : \"...\" },\n  \"removed_count\": 15\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Add Filter Pattern",
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"pattern\": \"*.log\",\n  \"pattern_type\": \"exclude\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/pattern",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "pattern"]
+						},
+						"description": "Add a single glob pattern to the filter config. pattern_type can be 'exclude' or 'include'."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Added exclude pattern: *.log\",\n  \"removed_count\": 3\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Remove Filter Pattern",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"pattern\": \"*.log\",\n  \"pattern_type\": \"exclude\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/pattern",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "pattern"]
+						},
+						"description": "Remove a glob pattern from the filter config."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Removed exclude pattern: *.log\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Test Filter Patterns",
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"patterns\": [\"*.pdf\", \"*.log\"],\n  \"file_paths\": [\"/tmp/doc.pdf\", \"/tmp/app.log\", \"/tmp/image.png\"],\n  \"mode\": \"whitelist\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/test",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "test"]
+						},
+						"description": "Test how filter patterns would apply to a list of file paths without changing the config."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"results\": [\n    {\"file_path\": \"/tmp/doc.pdf\", \"included\": true, \"matched_pattern\": \"*.pdf\"},\n    {\"file_path\": \"/tmp/app.log\", \"included\": true, \"matched_pattern\": \"*.log\"},\n    {\"file_path\": \"/tmp/image.png\", \"included\": false, \"matched_pattern\": null}\n  ]\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Apply Filter Changes",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/apply",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "apply"]
+						},
+						"description": "Trigger cleanup of excluded files from the index. Use after updating config with apply_immediately: false."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Filter changes applied: 0 files removed from index\",\n  \"config\": { \"...\" : \"...\" },\n  \"removed_count\": 0\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Get Default Filters",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/defaults",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "defaults"]
+						},
+						"description": "Returns the default filter patterns without loading from the config file."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"version\": 2,\n  \"mode\": \"blacklist\",\n  \"exclude\": [\".*\", \".git/\", \"node_modules/\", \"*.pyc\"],\n  \"include\": [\".gitignore\", \".env.example\"],\n  \"blacklist_exclude\": [\".*\", \".git/\"],\n  \"blacklist_include\": [\".gitignore\"],\n  \"whitelist_include\": [\"*.pdf\", \"*.docx\"],\n  \"whitelist_exclude\": [],\n  \"config_path\": \"\"\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Reset Filters to Defaults",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/filters/reset",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "filters", "reset"]
+						},
+						"description": "Reset filter config to defaults and clean up excluded files from the index."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"success\": true,\n  \"message\": \"Filter configuration reset to defaults\",\n  \"config\": { \"...\" : \"...\" },\n  \"removed_count\": 5\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Settings",
+			"item": [
+				{
+					"name": "Get All Settings",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/settings/",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "settings", ""]
+						},
+						"description": "Returns all settings grouped by section (summarizer, queue, scheduler, embedder, parser)."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"summarizer\": {\n    \"provider\": \"ollama\",\n    \"ollama\": { \"model\": \"llama3\", \"host\": \"http://localhost:11434\" }\n  },\n  \"queue\": {\n    \"cooldown_seconds\": 60,\n    \"max_concurrency\": 2,\n    \"max_retries\": 3\n  },\n  \"scheduler\": {\n    \"enabled\": false,\n    \"combine_mode\": \"ALL\",\n    \"check_interval_seconds\": 30,\n    \"rules\": []\n  },\n  \"embedder\": {\n    \"provider\": \"local\",\n    \"local_model\": \"intfloat/e5-base-v2\"\n  },\n  \"parser\": {\n    \"extraction_strategy\": \"spotlight_first\",\n    \"spotlight_enabled\": true\n  }\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Update Settings",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"queue.cooldown_seconds\": 30,\n  \"queue.max_concurrency\": 4\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/settings/",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "settings", ""]
+						},
+						"description": "Partial update of settings using dotted TOML paths. Returns the full updated settings object."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"summarizer\": { \"...\" : \"...\" },\n  \"queue\": {\n    \"cooldown_seconds\": 30,\n    \"max_concurrency\": 4,\n    \"max_retries\": 3\n  },\n  \"scheduler\": { \"...\" : \"...\" }\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				},
+				{
+					"name": "Get Default Settings",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/settings/defaults",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "settings", "defaults"]
+						},
+						"description": "Returns the default values for all settings."
+					},
+					"response": [
+						{
+							"name": "200 Success",
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"summarizer\": { \"provider\": \"auto\" },\n  \"queue\": { \"cooldown_seconds\": 60, \"max_concurrency\": 2, \"max_retries\": 3 },\n  \"scheduler\": { \"enabled\": false, \"combine_mode\": \"ALL\" }\n}",
+							"header": [{"key": "Content-Type", "value": "application/json"}]
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Real-time Updates",
+			"item": [
+				{
+					"name": "SSE Updates Stream",
+					"request": {
+						"method": "GET",
+						"header": [
+							{"key": "Accept", "value": "text/event-stream"}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/updates/",
+							"host": ["{{baseUrl}}"],
+							"path": ["api", "updates", ""]
+						},
+						"description": "Long-lived Server-Sent Events connection for real-time processing updates. Events include file processing stages, queue changes, scheduler state, and file system events. Keep-alive comments sent every 15 seconds."
+					},
+					"response": [
+						{
+							"name": "200 SSE Stream",
+							"status": "OK",
+							"code": 200,
+							"body": "event: update\ndata: {\"opcode\": \"file_parsing\", \"data\": {\"path\": \"/path/to/file.txt\", \"filename\": \"file.txt\"}}\n\nevent: update\ndata: {\"opcode\": \"queue_item_added\", \"data\": {\"id\": \"abc-123\", \"file_path\": \"/path/to/file.txt\", \"action\": \"INDEX\", \"status\": \"COOLING_DOWN\"}}\n",
+							"header": [{"key": "Content-Type", "value": "text/event-stream"}, {"key": "Cache-Control", "value": "no-cache"}]
+						}
+					]
+				}
+			]
+		}
+	]
+}

@@ -1,8 +1,21 @@
 """
-API Blueprint Module
+REST API Module
 
-This module initializes and combines all API blueprints for the application.
-All API routes will be prefixed with /api when registered in app.py
+All API routes are prefixed with /api when registered.
+
+Blueprints:
+- /files    - File CRUD, listing, status filtering
+- /index    - Trigger directory/file indexing
+- /search   - Hybrid semantic + full-text search
+- /watch    - Manage watched directories
+- /updates  - SSE endpoint for real-time updates
+- /status   - Health check, stats, debug info
+- /filters  - Include/exclude pattern management
+- /settings - Persistent settings CRUD
+- /queue    - Indexing queue status and control
+
+Request/response models are defined in models.py using dataclasses.
+Validation is handled by quart-schema decorators.
 """
 
 from quart import Blueprint
@@ -15,6 +28,7 @@ from .updates import updates_bp
 from .status import status_bp
 from .filters import filters_bp
 from .settings import settings_bp
+from .queue import queue_bp
 
 # Create the main API blueprint
 api_blueprint = Blueprint('api', __name__)
@@ -28,6 +42,7 @@ api_blueprint.register_blueprint(updates_bp, url_prefix='/updates')
 api_blueprint.register_blueprint(status_bp, url_prefix='/status')
 api_blueprint.register_blueprint(filters_bp, url_prefix='/filters')
 api_blueprint.register_blueprint(settings_bp, url_prefix='/settings')
+api_blueprint.register_blueprint(queue_bp, url_prefix='/queue')
 
 
 __all__ = ['api_blueprint']

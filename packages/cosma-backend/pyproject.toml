@@ -19,6 +19,7 @@ dependencies = [
     "tomli-w>=1.0.0",
     "uvicorn>=0.38.0",
     "watchdog>=6.0.0",
+    "psutil>=7.0.0",
 ]
 
 [project.optional-dependencies]

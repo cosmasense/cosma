@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 
 from cosma_backend.db.database import Database
-from cosma_backend.embedder.embedder import AutoEmbedder
+from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.searcher.rrf import merge_with_rrf

@@ -1,10 +1,20 @@
+"""
+API Response Models
+
+Dataclass definitions for API responses. These are used by quart-schema
+for automatic serialization and OpenAPI documentation generation.
+
+Domain models (File, WatchedDirectory) have .to_response() methods
+that convert them to these API models.
+"""
+
 from dataclasses import dataclass
 from datetime import datetime
 
 
 @dataclass
 class FileResponse:
-    """Shared API response model for file metadata across endpoints"""
+    """API response model for file metadata"""
     file_path: str
     filename: str
     extension: str
@@ -13,6 +23,7 @@ class FileResponse:
     accessed: datetime
     title: str | None
     summary: str | None
+    keywords: list[str] | None = None
 
 
 @dataclass

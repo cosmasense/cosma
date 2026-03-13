@@ -1,3 +1,19 @@
+"""
+Database Implementation
+
+Async SQLite database with:
+- Connection pooling via asqlite
+- sqlite-vec extension for vector similarity search
+- FTS5 for full-text search with BM25 ranking
+- Automatic schema migrations
+
+Usage:
+    db = await connect("/path/to/app.db")
+    async with db.acquire() as conn:
+        await conn.execute(...)
+    await db.close()
+"""
+
 from __future__ import annotations
 
 import datetime
@@ -5,10 +21,12 @@ from sqlite3 import Row
 import struct
 from types import TracebackType
 from typing import TYPE_CHECKING, Optional, Self, Type
-import asqlite
-import sqlite_vec
-import numpy as np
 
+import asqlite
+import numpy as np
+import sqlite_vec
+
+from cosma_backend.db.errors import DatabaseClosingError
 from cosma_backend.logging import get_logger
 from cosma_backend.models import File
 from cosma_backend.models.watch import WatchedDirectory
@@ -17,8 +35,12 @@ from cosma_backend.utils.bundled import get_bundled_file_text
 if TYPE_CHECKING:
     from sqlite3 import Connection as Sqlite3Connection
 
-# The schema file is bundled with the distribution
+# Schema file bundled with the package
 SCHEMA_FILE = "./schema.sql"
+
+# All embeddings are normalized to this dimension for consistent storage
+# This allows mixing different embedding models (e.g., 768-dim local, 512-dim OpenAI)
+EMBEDDING_STORAGE_DIMENSIONS = 1536
 
 logger = get_logger(__name__)
 
@@ -41,6 +63,9 @@ class Database:
     @classmethod
     async def from_path(cls, path: str) -> Self:
         def init_conn(conn: Sqlite3Connection):
+            # WAL mode: crash-safe journaling that survives sudden termination
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
             # initialize sqlite_vec in each connection
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
@@ -56,11 +81,14 @@ class Database:
 
         return cls(pool)
         
-    async def close(self):
+    async def close(self) -> None:
+        """Close the connection pool."""
+        self._closed = True
         await self.pool.close()
 
-    async def __aenter__(self, ):
-        pass
+    async def __aenter__(self) -> Self:
+        """Async context manager entry."""
+        return self
 
     async def __aexit__(
         self,
@@ -68,32 +96,21 @@ class Database:
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> None:
-        if self._closed is False:
-            await self.pool.close()
+        """Async context manager exit - close pool if not already closed."""
+        if not self._closed:
             self._closed = True
+            await self.pool.close()
 
     # ====== Helper Functions ======
+
     def acquire(self) -> asqlite._AcquireProxyContextManager:
+        """Acquire a connection from the pool."""
+        if self._closed:
+            raise DatabaseClosingError()
         return self.pool.acquire()
 
-    # ====== Database Logic ======
-    async def insert_file(self, file: File):
-        SQL = """INSERT INTO files (filename, extension, created, modified, summary)
-                 VALUES (?, ?, ?, ?, ?)
-                 RETURNING id;
-              """
+    # ====== File Operations ======
 
-        async with self.acquire() as conn:
-            await conn.execute(SQL, (
-                file.filename,
-                file.extension,
-                file.created,
-                file.modified,
-                file.summary,
-            ))
-            
-    # Add these methods to your Database class:
-    
     async def get_file_by_path(self, file_path: str) -> Optional[File]:
         """Get file by its path."""
         SQL = "SELECT * FROM files WHERE file_path = ?"
@@ -202,7 +219,7 @@ class Database:
         values = struct.unpack(f"{dimensions}f", blob)
         return np.array(values, dtype=np.float32)
 
-    def _normalize_embedding_dimensions(self, embedding: np.ndarray, target_dimensions: int = 1536) -> np.ndarray:
+    def _normalize_embedding_dimensions(self, embedding: np.ndarray, target_dimensions: int = EMBEDDING_STORAGE_DIMENSIONS) -> np.ndarray:
         """
         Normalize embedding to target dimensions by padding with zeros or truncating.
 
@@ -237,46 +254,25 @@ class Database:
         """
         logger.debug("Inserting embedding", file_id=file.id, model=file.embedding_model, dimensions=file.embedding_dimensions)
 
-        # Normalize embedding to 1536 dimensions for consistent storage
+        # Normalize embedding to standard storage dimensions for consistent vector search
         normalized_embedding = self._normalize_embedding_dimensions(file.embedding)
-
-        # Serialize embedding
         embedding_blob = self._serialize_vector(normalized_embedding)
 
         async with self.acquire() as conn:
-            # Check if embedding already exists
-            existing = await conn.fetchone(
-                "SELECT 1 FROM file_embeddings WHERE file_id = ?",
-                (file.id,)
-            )
-
-            # Always delete existing embeddings first (vec0 virtual tables don't support INSERT OR REPLACE)
+            # vec0 virtual tables don't support INSERT OR REPLACE, so delete first
             await conn.execute(
                 "DELETE FROM file_embeddings WHERE file_id = ?",
                 (file.id,)
             )
-            # await conn.execute(
-            #     "DELETE FROM embedding_metadata WHERE file_id = ?",
-            #     (file.id,)
-            # )
 
-            # Insert into vec0 table (using normalized dimensions)
+            # Insert into vec0 table with normalized dimensions
             await conn.execute(
                 """
                 INSERT INTO file_embeddings(file_id, embedding_model, embedding_dimensions, embedding)
                 VALUES (?, ?, ?, ?)
                 """,
-                (file.id, file.embedding_model, 1536, embedding_blob)
+                (file.id, file.embedding_model, EMBEDDING_STORAGE_DIMENSIONS, embedding_blob)
             )
-
-            # Insert metadata
-            # await conn.execute(
-            #     """
-            #     INSERT INTO embedding_metadata(file_id, model_name, model_dimensions)
-            #     VALUES (?, ?, ?)
-            #     """,
-            #     (file.id, file.embedding_model, file.embedding_dimensions)
-            # )
 
             logger.info("Embedding inserted successfully", file_id=file.id)
             
@@ -340,24 +336,20 @@ class Database:
             logger.info("Found similar files", count=len(results))
             return results
 
-    async def get_file_embedding(self, file_id: str) -> tuple[np.ndarray, str, int] | None:
+    async def get_file_embedding(self, file_id: int) -> tuple[np.ndarray, str, int] | None:
         """
         Get embedding vector for a file.
 
         Args:
-            file_id: ID of the file
+            file_id: ID of the file (integer)
 
         Returns:
-            Tuple of (embedding, model_name, dimensions) or None
+            Tuple of (embedding, model_name, dimensions) or None if not found
         """
         SQL = """
-        SELECT
-            fe.embedding,
-            em.model_name,
-            em.model_dimensions
-        FROM file_embeddings fe
-        INNER JOIN embedding_metadata em ON fe.file_id = em.file_id
-        WHERE fe.file_id = ?
+        SELECT embedding, embedding_model, embedding_dimensions
+        FROM file_embeddings
+        WHERE file_id = ?
         """
 
         async with self.acquire() as conn:
@@ -366,23 +358,22 @@ class Database:
             if not row:
                 return None
 
-            # Deserialize embedding using normalized dimensions (1536) since that's how it's stored
-            # The vector was normalized to 1536 dimensions before storage in line 514
-            embedding = self._deserialize_vector(row["embedding"], 1536)
-            
+            # Deserialize embedding using storage dimensions
+            embedding = self._deserialize_vector(row["embedding"], EMBEDDING_STORAGE_DIMENSIONS)
+
             # Truncate back to original model dimensions if needed
-            original_dimensions = row["model_dimensions"]
-            if original_dimensions < 1536:
+            original_dimensions = row["embedding_dimensions"]
+            if original_dimensions < EMBEDDING_STORAGE_DIMENSIONS:
                 embedding = embedding[:original_dimensions]
 
-            return (embedding, row["model_name"], row["model_dimensions"])
+            return (embedding, row["embedding_model"], row["embedding_dimensions"])
 
-    async def delete_embedding(self, file_id: str) -> bool:
+    async def delete_embedding(self, file_id: int) -> bool:
         """
         Delete embedding for a file.
 
         Args:
-            file_id: ID of the file
+            file_id: ID of the file (integer)
 
         Returns:
             True if deleted, False if not found
@@ -394,8 +385,6 @@ class Database:
             rows_affected = cursor.get_cursor().rowcount
 
             if rows_affected > 0:
-                # Also delete metadata
-                # await conn.execute("DELETE FROM embedding_metadata WHERE file_id = ?", (file_id,))
                 logger.info("Embedding deleted", file_id=file_id)
                 return True
 
@@ -721,6 +710,77 @@ class Database:
             
             logger.info("Deleted stale files", count=len(rows), timestamp=timestamp, directory=directory_path)
             return rows
+
+
+    async def get_files_by_status(self, status: str, limit: int = 50, offset: int = 0) -> tuple[list[File], int]:
+        """
+        Get files filtered by processing status, ordered by updated_at DESC.
+
+        Args:
+            status: Processing status string (e.g. 'FAILED', 'COMPLETE')
+            limit: Maximum number of files to return
+            offset: Number of files to skip
+
+        Returns:
+            Tuple of (list of File objects, total count matching the status)
+        """
+        COUNT_SQL = "SELECT COUNT(*) as cnt FROM files WHERE status = ?"
+        SELECT_SQL = """
+            SELECT * FROM files
+            WHERE status = ?
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+        """
+
+        async with self.acquire() as conn:
+            count_row = await conn.fetchone(COUNT_SQL, (status,))
+            total_count = count_row["cnt"] if count_row else 0
+
+            rows = await conn.fetchall(SELECT_SQL, (status, limit, offset))
+            files = [File.from_row(row) for row in rows]
+
+        return files, total_count
+
+    # ====== Queue Item Persistence ======
+
+    async def upsert_queue_item(self, item: dict) -> None:
+        """Insert or replace a queue item."""
+        SQL = """
+            INSERT OR REPLACE INTO queue_items
+                (id, file_path, action, status, enqueued_at, cooldown_expires_at, dest_path, retry_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        async with self.acquire() as conn:
+            await conn.execute(SQL, (
+                item["id"],
+                item["file_path"],
+                item["action"],
+                item["status"],
+                item["enqueued_at"],
+                item["cooldown_expires_at"],
+                item.get("dest_path"),
+                item.get("retry_count", 0),
+            ))
+
+    async def get_queue_items(self) -> list[dict]:
+        """Get all persisted queue items."""
+        SQL = "SELECT * FROM queue_items"
+        async with self.acquire() as conn:
+            rows = await conn.fetchall(SQL)
+            return [dict(row) for row in rows]
+
+    async def delete_queue_item(self, item_id: str) -> None:
+        """Delete a queue item by id."""
+        SQL = "DELETE FROM queue_items WHERE id = ?"
+        async with self.acquire() as conn:
+            await conn.execute(SQL, (item_id,))
+
+    async def delete_queue_items_under(self, directory: str) -> int:
+        """Delete queue items whose file_path is under the given directory."""
+        SQL = "DELETE FROM queue_items WHERE file_path LIKE ? || '/%' OR file_path = ?"
+        async with self.acquire() as conn:
+            cursor = await conn.execute(SQL, (directory, directory))
+            return cursor.get_cursor().rowcount
 
 
 async def connect(path: str) -> Database:

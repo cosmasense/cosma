@@ -25,6 +25,7 @@ class SearchRequest:
     filters: dict[str, str] | None = None
     limit: int = 50
     directory: str | None = None
+    offset: int = 0
 
 
 @dataclass
@@ -38,6 +39,7 @@ class SearchResultItem:
 class SearchResponse:
     """Response for search queries"""
     results: list[SearchResultItem]
+    total_count: int = 0
 
 
 @search_bp.post("/")  # type: ignore[return-value]
@@ -51,13 +53,16 @@ async def search(data: SearchRequest) -> tuple[SearchResponse, int]:
     # 3. Rank results by relevance
     # 4. Return sorted results
     results = await current_app.searcher.search(data.query, directory=data.directory)
-    
+    total_count = len(results)
+    paginated = results[data.offset:data.offset + data.limit]
+
     return SearchResponse(
         results=[
             SearchResultItem(
                 r.file_metadata.to_response(), r.combined_score
-            ) 
-            for r in results],
+            )
+            for r in paginated],
+        total_count=total_count,
     ), 200
 
 

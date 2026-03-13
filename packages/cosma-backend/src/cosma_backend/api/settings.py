@@ -29,8 +29,15 @@ async def update_settings():
 
     try:
         updated = current_app.settings_manager.update(data)
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
         return {"error": str(e)}, 400
+
+    # Propagate live setting changes to running services
+    if "summarizer.idle_unload_seconds" in data:
+        if hasattr(current_app, "model_lifecycle"):
+            current_app.model_lifecycle.idle_unload_seconds = (
+                current_app.settings_manager.settings.summarizer.idle_unload_seconds
+            )
 
     return current_app.settings_manager.to_dict()
 

@@ -25,7 +25,7 @@ updates_bp = Blueprint('updates', __name__)
 logger = get_logger(__name__)
 
 
-@updates_bp.get("/")  # type: ignore[return-value]
+@updates_bp.get("/", strict_slashes=False)  # type: ignore[return-value]
 async def updates():
     """Stream real-time updates via Server-Sent Events"""
     if "text/event-stream" not in request.accept_mimetypes:

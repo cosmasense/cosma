@@ -196,6 +196,48 @@ class SyncClient:
         """Reset filter configuration to defaults"""
         return self._run_with_client(lambda c: c.reset_filters())
 
+    def get_queue_items(self, offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+        """List items in the indexing queue"""
+        return self._run_with_client(
+            lambda c: c.get_queue_items(offset, limit)
+        )
+
+    def remove_queue_item(self, item_id: str) -> Dict[str, Any]:
+        """Remove an item from the indexing queue"""
+        return self._run_with_client(lambda c: c.remove_queue_item(item_id))
+
+    def get_failed_files(self, offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+        """List files that failed processing"""
+        return self._run_with_client(
+            lambda c: c.get_failed_files(offset, limit)
+        )
+
+    def get_recent_files(self, offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+        """List recently completed files"""
+        return self._run_with_client(
+            lambda c: c.get_recent_files(offset, limit)
+        )
+
+    def reindex_file(self, file_path: str) -> Dict[str, Any]:
+        """Delete and re-queue a file for indexing"""
+        return self._run_with_client(lambda c: c.reindex_file(file_path))
+
+    def get_queue_metrics(self) -> Dict[str, Any]:
+        """Get system metrics and model status"""
+        return self._run_with_client(lambda c: c.get_queue_metrics())
+
+    def get_scheduler(self) -> Dict[str, Any]:
+        """Get scheduler configuration and status"""
+        return self._run_with_client(lambda c: c.get_scheduler())
+
+    def update_scheduler(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Update scheduler configuration"""
+        return self._run_with_client(lambda c: c.update_scheduler(config))
+
+    def test_scheduler(self) -> Dict[str, Any]:
+        """Dry-run scheduler rules against live metrics"""
+        return self._run_with_client(lambda c: c.test_scheduler())
+
     # =========================================================================
     # Settings API
     # =========================================================================

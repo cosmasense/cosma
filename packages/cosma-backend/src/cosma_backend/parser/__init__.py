@@ -1,27 +1,33 @@
-#!/usr/bin/env python
-# -*-coding:utf-8 -*-
-'''
-@File    :   __init__.py
-@Time    :   2025/01/10 14:30:00
-@Author  :   Ethan Pan 
-@Version :   1.0
-@Contact :   epan@cs.wisc.edu
-@License :   (C)Copyright 2025, Ethan Pan
-@Desc    :   Parser module for multi-format file parsing
-'''
+"""
+Parser Module
+
+Extracts text content from various file formats using a hybrid strategy:
+
+1. macOS Spotlight (fast, pre-indexed content if available)
+2. Media extraction (audio transcription, video frames)
+3. MarkItDown fallback (supports 20+ formats)
+
+Supported formats:
+- Documents: PDF, DOCX, PPTX, XLSX, EPUB
+- Images: PNG, JPG, HEIC, etc. (metadata + vision analysis)
+- Audio: MP3, WAV, AAC (Whisper transcription)
+- Video: MP4, AVI, MOV (transcript + frame extraction)
+- Web: HTML, XML, JSON
+- Archives: ZIP (extracts and processes contents)
+
+Usage:
+    parser = FileParser()
+    file = await parser.parse_file(file_metadata)
+"""
 
 from .parser import (
     FileParser,
-    # parse_file,
-    # parse_directory,
     get_supported_extensions,
     is_supported_file,
 )
 
 __all__ = [
     "FileParser",
-    # "parse_file", 
-    # "parse_directory",
     "get_supported_extensions",
     "is_supported_file",
 ]

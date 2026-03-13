@@ -217,3 +217,59 @@ class TestSettingsManager:
         assert data["summarizer"]["ollama"]["model"] == "custom-model"
         assert "embedder" in data
         assert "parser" in data
+
+
+@pytest.mark.unit
+class TestSettingsValidation:
+    """Test value validation for settings with range constraints."""
+
+    def test_cooldown_seconds_zero_raises(self):
+        s = Settings()
+        with pytest.raises(ValueError, match="cooldown_seconds"):
+            _set_by_path(s, "queue.cooldown_seconds", 0)
+
+    def test_cooldown_seconds_negative_raises(self):
+        s = Settings()
+        with pytest.raises(ValueError):
+            _set_by_path(s, "queue.cooldown_seconds", -5)
+
+    def test_cooldown_seconds_valid(self):
+        s = Settings()
+        _set_by_path(s, "queue.cooldown_seconds", 1)
+        assert s.queue.cooldown_seconds == 1
+
+    def test_max_concurrency_zero_raises(self):
+        s = Settings()
+        with pytest.raises(ValueError, match="max_concurrency"):
+            _set_by_path(s, "queue.max_concurrency", 0)
+
+    def test_max_concurrency_valid(self):
+        s = Settings()
+        _set_by_path(s, "queue.max_concurrency", 4)
+        assert s.queue.max_concurrency == 4
+
+    def test_max_retries_negative_raises(self):
+        s = Settings()
+        with pytest.raises(ValueError, match="max_retries"):
+            _set_by_path(s, "queue.max_retries", -1)
+
+    def test_max_retries_zero_valid(self):
+        s = Settings()
+        _set_by_path(s, "queue.max_retries", 0)
+        assert s.queue.max_retries == 0
+
+    def test_check_interval_seconds_too_low_raises(self):
+        s = Settings()
+        with pytest.raises(ValueError, match="check_interval_seconds"):
+            _set_by_path(s, "scheduler.check_interval_seconds", 3)
+
+    def test_check_interval_seconds_valid(self):
+        s = Settings()
+        _set_by_path(s, "scheduler.check_interval_seconds", 10)
+        assert s.scheduler.check_interval_seconds == 10
+
+    def test_unvalidated_field_accepts_any_value(self):
+        """Fields without validation rules should accept any value."""
+        s = Settings()
+        _set_by_path(s, "embedder.dimensions", 1)
+        assert s.embedder.dimensions == 1

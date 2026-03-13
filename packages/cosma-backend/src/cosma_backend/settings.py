@@ -11,7 +11,7 @@ import dataclasses
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any, Callable, get_type_hints
 
 from platformdirs import PlatformDirs
 
@@ -58,6 +58,8 @@ class SummarizerConfig:
     provider: str = "auto"
     max_tokens_per_request: int = 100000
     chunk_overlap_tokens: int = 1000
+    max_chunks: int = 10
+    idle_unload_seconds: int = 60
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     online: OnlineConfig = field(default_factory=OnlineConfig)
     llamacpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
@@ -84,7 +86,125 @@ class ParserConfig:
     extraction_strategy: str = "spotlight_first"
     spotlight_enabled: bool = True
     spotlight_timeout_seconds: int = 5
+    max_file_size_mb: int = 200
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
+
+
+@dataclass
+class SchedulerRuleConfig:
+    rule: str = ""
+    operator: str = ""
+    value: Any = None
+    enabled: bool = True
+
+
+@dataclass
+class SchedulerConfig:
+    enabled: bool = False
+    combine_mode: str = "ALL"
+    check_interval_seconds: int = 30
+    rules: list[SchedulerRuleConfig] = field(default_factory=list)
+
+
+# Registry describing each scheduler rule type's expected inputs.
+# The frontend uses this to render type-specific controls (toggles, sliders, time pickers).
+SCHEDULER_RULE_TYPES: dict[str, dict[str, Any]] = {
+    "power_source": {
+        "label": "Power Source",
+        "description": "Require AC power (plugged in)",
+        "value_type": "boolean",
+        "default_operator": "eq",
+        "boolean_labels": {"true": "Plugged in", "false": "On battery"},
+    },
+    "battery_level": {
+        "label": "Battery Level",
+        "description": "Minimum battery percentage required",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "gte",
+        "min": 0,
+        "max": 100,
+    },
+    "gpu_usage": {
+        "label": "GPU Usage",
+        "description": "Maximum GPU utilization allowed",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 100,
+    },
+    "memory_usage": {
+        "label": "Memory Usage",
+        "description": "Maximum memory utilization allowed",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 100,
+    },
+    "memory_pressure": {
+        "label": "Memory Pressure",
+        "description": "Maximum memory pressure allowed (active+wired %)",
+        "value_type": "percentage",
+        "unit": "%",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 100,
+    },
+    "cpu_temperature": {
+        "label": "CPU Temperature",
+        "description": "Maximum CPU temperature allowed",
+        "value_type": "number",
+        "unit": "\u00b0C",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 120,
+    },
+    "fan_speed": {
+        "label": "Fan Speed",
+        "description": "Maximum fan speed allowed",
+        "value_type": "number",
+        "unit": "RPM",
+        "default_operator": "lte",
+        "min": 0,
+        "max": 10000,
+    },
+    "cpu_idle": {
+        "label": "CPU Idle",
+        "description": "Require CPU to be idle (low usage)",
+        "value_type": "boolean",
+        "default_operator": "eq",
+        "boolean_labels": {"true": "Idle", "false": "Busy"},
+    },
+    "low_power_mode": {
+        "label": "Low Power Mode",
+        "description": "Pause when macOS Low Power Mode is active",
+        "value_type": "boolean",
+        "default_operator": "eq",
+        "boolean_labels": {"true": "Active", "false": "Inactive"},
+    },
+    "time_window": {
+        "label": "Time Window",
+        "description": "Only process during this time range",
+        "value_type": "time_range",
+    },
+    "queue_size": {
+        "label": "Queue Size",
+        "description": "Minimum items in queue before processing starts",
+        "value_type": "number",
+        "default_operator": "gte",
+        "min": 0,
+    },
+}
+
+
+@dataclass
+class QueueConfig:
+    cooldown_seconds: int = 60
+    initial_cooldown_seconds: int = 5
+    max_concurrency: int = 2
+    max_retries: int = 3
 
 
 @dataclass
@@ -92,6 +212,8 @@ class Settings:
     embedder: EmbedderConfig = field(default_factory=EmbedderConfig)
     summarizer: SummarizerConfig = field(default_factory=SummarizerConfig)
     parser: ParserConfig = field(default_factory=ParserConfig)
+    queue: QueueConfig = field(default_factory=QueueConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +222,15 @@ class Settings:
 
 def _coerce(value: Any, target_type: type) -> Any:
     """Coerce a value to the target type."""
-    if isinstance(value, target_type):
+    # Handle Any type - return value as-is
+    if target_type is Any:
+        return value
+    # Try isinstance check, but handle types that don't support it
+    try:
+        if isinstance(value, target_type):
+            return value
+    except TypeError:
+        # Some types (like Any) cannot be used with isinstance()
         return value
     if target_type is bool:
         if isinstance(value, str):
@@ -113,6 +243,15 @@ def _coerce(value: Any, target_type: type) -> Any:
     return value
 
 
+def _is_dataclass_type(t: Any) -> bool:
+    """Check if a type is a dataclass, safely handling Any and other special types."""
+    try:
+        return dataclasses.is_dataclass(t) and isinstance(t, type)
+    except TypeError:
+        # Some types like Any cannot be used with isinstance()
+        return False
+
+
 def _from_dict(cls: type, data: dict[str, Any]) -> Any:
     """Recursively build a dataclass instance from a (possibly partial) dict."""
     hints = get_type_hints(cls)
@@ -122,7 +261,15 @@ def _from_dict(cls: type, data: dict[str, Any]) -> Any:
             continue
         raw = data[f.name]
         field_type = hints[f.name]
-        if dataclasses.is_dataclass(field_type) and isinstance(raw, dict):
+        # Handle list[SomeDataclass] types
+        origin = getattr(field_type, "__origin__", None)
+        if origin is list and isinstance(raw, list):
+            args = getattr(field_type, "__args__", ())
+            if args and _is_dataclass_type(args[0]):
+                kwargs[f.name] = [_from_dict(args[0], item) if isinstance(item, dict) else item for item in raw]
+            else:
+                kwargs[f.name] = raw
+        elif _is_dataclass_type(field_type) and isinstance(raw, dict):
             kwargs[f.name] = _from_dict(field_type, raw)
         else:
             kwargs[f.name] = _coerce(raw, field_type)
@@ -142,6 +289,15 @@ def _get_by_path(obj: Any, path: str) -> Any:
     return current
 
 
+_VALIDATIONS: dict[tuple[str, str], tuple[Callable[[Any], bool], str]] = {
+    ("queue", "cooldown_seconds"): (lambda v: v >= 1, "cooldown_seconds must be >= 1"),
+    ("queue", "initial_cooldown_seconds"): (lambda v: v >= 0, "initial_cooldown_seconds must be >= 0"),
+    ("queue", "max_concurrency"): (lambda v: v >= 1, "max_concurrency must be >= 1"),
+    ("queue", "max_retries"): (lambda v: v >= 0, "max_retries must be >= 0"),
+    ("scheduler", "check_interval_seconds"): (lambda v: v >= 5, "check_interval_seconds must be >= 5"),
+}
+
+
 def _set_by_path(obj: Any, path: str, value: Any) -> None:
     """Walk a dotted path on a dataclass tree and set the leaf value with type coercion."""
     parts = path.split(".")
@@ -159,7 +315,27 @@ def _set_by_path(obj: Any, path: str, value: Any) -> None:
 
     hints = get_type_hints(type(current))
     target_type = hints[leaf]
-    setattr(current, leaf, _coerce(value, target_type))
+
+    # Handle list[SomeDataclass] types - convert dicts to dataclass instances
+    origin = getattr(target_type, "__origin__", None)
+    if origin is list and isinstance(value, list):
+        args = getattr(target_type, "__args__", ())
+        if args and _is_dataclass_type(args[0]):
+            coerced = [_from_dict(args[0], item) if isinstance(item, dict) else item for item in value]
+        else:
+            coerced = value
+    else:
+        coerced = _coerce(value, target_type)
+
+    # Validate if a rule exists for this (parent_name, leaf) pair
+    parent_name = type(current).__name__.replace("Config", "").lower()
+    validation_key = (parent_name, leaf)
+    if validation_key in _VALIDATIONS:
+        check_fn, msg = _VALIDATIONS[validation_key]
+        if not check_fn(coerced):
+            raise ValueError(msg)
+
+    setattr(current, leaf, coerced)
 
 
 # ---------------------------------------------------------------------------

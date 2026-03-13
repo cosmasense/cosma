@@ -4,10 +4,13 @@
 
 There are four codebases:
 
-- `cosma-backend` (packages/cosma-backend)
-- `cosma-client` (packages/cosma-client)
-- `cosma-tui` (packages/cosma-tui)
-- `cosma` (root)
+- `cosma-backend` (packages/cosma-backend) - Quart async web server + SQLite + AI pipeline
+- `cosma-client` (packages/cosma-client) - Shared Python client library
+- `cosma-tui` (packages/cosma-tui) - Textual terminal UI
+- `cosma` (root) - Click CLI orchestrator
+
+Frontend (separate repo):
+- `fileSearchForntend/` - macOS SwiftUI app
 
 ## Testing
 - Run all tests: `uv run pytest`
@@ -17,6 +20,6 @@ There are four codebases:
 
 ## Development
 
-- In cosma-backend: use structured logging via `sm`
-  Example: `logger.info(sm("Processed file", path=file.path))`
 - Do not use emojis in logs or otherwise unless explicitly stated
+- Backend runs on `localhost:60534`
+- API collection for manual testing: `postman.json` in this repo

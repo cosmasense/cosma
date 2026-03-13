@@ -34,6 +34,24 @@ class UpdateOpcode(enum.Enum):
     DIRECTORY_PROCESSING_STARTED = "directory_processing_started"
     DIRECTORY_PROCESSING_COMPLETED = "directory_processing_completed"
 
+    # Directory system events (from watcher)
+    DIRECTORY_DELETED = "directory_deleted"
+    DIRECTORY_MOVED = "directory_moved"
+
+    # Queue updates
+    QUEUE_ITEM_ADDED = "queue_item_added"
+    QUEUE_ITEM_UPDATED = "queue_item_updated"
+    QUEUE_ITEM_PROCESSING = "queue_item_processing"
+    QUEUE_ITEM_COMPLETED = "queue_item_completed"
+    QUEUE_ITEM_FAILED = "queue_item_failed"
+    QUEUE_ITEM_REMOVED = "queue_item_removed"
+    QUEUE_PAUSED = "queue_paused"
+    QUEUE_RESUMED = "queue_resumed"
+
+    # Scheduler updates
+    SCHEDULER_PAUSED = "scheduler_paused"
+    SCHEDULER_RESUMED = "scheduler_resumed"
+
     # General updates
     STATUS_UPDATE = "status_update"
     ERROR = "error"
@@ -199,6 +217,54 @@ class Update:
 
         elif self.opcode == UpdateOpcode.WATCH_STARTED:
             return "Started watching for changes"
+
+        # Directory events
+        elif self.opcode == UpdateOpcode.DIRECTORY_DELETED:
+            path = self.data.get('path', 'Unknown path')
+            return f"Directory deleted: {path}"
+
+        elif self.opcode == UpdateOpcode.DIRECTORY_MOVED:
+            src = self.data.get('src_path', 'Unknown source')
+            dst = self.data.get('dest_path', 'Unknown destination')
+            return f"Directory moved: {src} -> {dst}"
+
+        # Queue updates
+        elif self.opcode == UpdateOpcode.QUEUE_ITEM_ADDED:
+            path = self.data.get('file_path', 'Unknown file')
+            return f"Queued: {path}"
+
+        elif self.opcode == UpdateOpcode.QUEUE_ITEM_UPDATED:
+            path = self.data.get('file_path', 'Unknown file')
+            return f"Queue updated: {path}"
+
+        elif self.opcode == UpdateOpcode.QUEUE_ITEM_PROCESSING:
+            path = self.data.get('file_path', 'Unknown file')
+            return f"Processing: {path}"
+
+        elif self.opcode == UpdateOpcode.QUEUE_ITEM_COMPLETED:
+            path = self.data.get('file_path', 'Unknown file')
+            return f"Completed: {path}"
+
+        elif self.opcode == UpdateOpcode.QUEUE_ITEM_FAILED:
+            path = self.data.get('file_path', 'Unknown file')
+            error = self.data.get('error', 'Unknown error')
+            return f"Failed: {path}: {error}"
+
+        elif self.opcode == UpdateOpcode.QUEUE_ITEM_REMOVED:
+            path = self.data.get('file_path', 'Unknown file')
+            return f"Removed from queue: {path}"
+
+        elif self.opcode == UpdateOpcode.QUEUE_PAUSED:
+            return "Queue paused"
+
+        elif self.opcode == UpdateOpcode.QUEUE_RESUMED:
+            return "Queue resumed"
+
+        elif self.opcode == UpdateOpcode.SCHEDULER_PAUSED:
+            return "Scheduler paused queue"
+
+        elif self.opcode == UpdateOpcode.SCHEDULER_RESUMED:
+            return "Scheduler resumed queue"
 
         # General updates
         elif self.opcode == UpdateOpcode.STATUS_UPDATE:

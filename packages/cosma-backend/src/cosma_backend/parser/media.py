@@ -1,17 +1,35 @@
-#!/usr/bin/env python
 """
-@File    :   media.py
-@Time    :   2025/08/04
-@Author  :   Phase 2 Implementation  
-@Version :   2.0
-@Desc    :   Audio/video transcription and image captioning with multi-provider support
+Media Processing Module
+
+Handles audio transcription, video frame extraction, and image metadata.
+
+Audio Transcription:
+- OpenAI Whisper API (online, fast, requires API key)
+- Local Whisper Python model (offline, uses GPU/CPU)
+- Supports partial transcript recovery on timeout
+
+Video Processing:
+- Extracts audio track via FFmpeg for transcription
+- Extracts evenly-spaced frames for vision analysis
+- Parallel transcript + frame extraction
+
+Image Processing:
+- Basic metadata extraction (dimensions, format)
+- Images are passed to summarizer for vision analysis
+
+Model Lifecycle:
+- Whisper model is lazy-loaded on first use
+- Tracks last_used_at for automatic unloading
+- Use unload_whisper_model() to free memory
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional, Dict, TYPE_CHECKING
 
@@ -22,6 +40,20 @@ if TYPE_CHECKING:
 
 # Configure structured logger
 logger = get_logger(__name__)
+
+# Timeout settings (seconds)
+WHISPER_TIMEOUT_SECONDS = 30  # Max time for transcription
+FFMPEG_EXTRACT_TIMEOUT_SECONDS = 60  # Max time for audio extraction from video
+FRAME_EXTRACT_TIMEOUT_SECONDS = 30  # Max time for frame extraction
+
+# Video frame extraction settings
+DEFAULT_NUM_FRAMES = 4  # Number of frames to extract from videos
+MAX_FRAME_DIMENSION = 512  # Max width/height for extracted frames (saves memory)
+
+# Global whisper model cache with lifecycle tracking
+_whisper_model: Any = None
+_whisper_model_name: str | None = None
+_whisper_last_used_at: float | None = None
 
 
 async def extract_audio_transcript(path: Path, config: ParserConfig | None = None, backend: str | None = None) -> str | None:
@@ -70,42 +102,252 @@ async def extract_audio_transcript(path: Path, config: ParserConfig | None = Non
         return None
 
 
-async def extract_video_transcript(path: Path, backend: str | None = None) -> str | None:
+from dataclasses import dataclass, field
+
+
+@dataclass
+class VideoContent:
+    """Content extracted from a video file."""
+    transcript: str | None = None
+    frames: list[bytes] = field(default_factory=list)  # JPEG-encoded frames
+
+
+async def extract_video_content(
+    path: Path,
+    backend: str | None = None,
+    num_frames: int = DEFAULT_NUM_FRAMES,
+    extract_frames: bool = True,
+) -> VideoContent:
     """
-    Extract transcript from video file by extracting audio first.
-    
+    Extract transcript and key frames from video file.
+
     Args:
         path: Path to video file
         backend: Backend to use ('openai' | 'local' | None for auto)
-        
+        num_frames: Number of frames to extract (evenly spaced)
+        extract_frames: Whether to extract frames for vision analysis
+
+    Returns:
+        VideoContent with transcript and frames
+    """
+    result = VideoContent()
+
+    if not path.exists():
+        logger.warning("Video file not found", path=str(path))
+        return result
+
+    logger.info("Extracting video content",
+               path=str(path),
+               backend=backend,
+               num_frames=num_frames if extract_frames else 0)
+
+    # Extract frames and audio in parallel
+    tasks = []
+
+    if extract_frames:
+        tasks.append(asyncio.create_task(_extract_video_frames(path, num_frames)))
+
+    tasks.append(asyncio.create_task(_extract_and_transcribe_audio(path, backend)))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Process results
+    if extract_frames:
+        frames_result = results[0]
+        transcript_result = results[1]
+        if isinstance(frames_result, list):
+            result.frames = frames_result
+        elif isinstance(frames_result, Exception):
+            logger.warning("Frame extraction failed", error=str(frames_result))
+    else:
+        transcript_result = results[0]
+
+    if isinstance(transcript_result, str):
+        result.transcript = transcript_result
+    elif isinstance(transcript_result, Exception):
+        logger.warning("Transcript extraction failed", error=str(transcript_result))
+
+    logger.info("Video content extracted",
+               path=str(path),
+               has_transcript=result.transcript is not None,
+               num_frames=len(result.frames))
+
+    return result
+
+
+async def _extract_and_transcribe_audio(path: Path, backend: str | None = None) -> str | None:
+    """Extract audio and transcribe it."""
+    audio_path = await _extract_audio_from_video(path)
+    if not audio_path:
+        return None
+
+    try:
+        transcript = await extract_audio_transcript(audio_path, backend=backend)
+        return transcript
+    finally:
+        # Clean up temporary audio file
+        audio_path.unlink(missing_ok=True)
+
+
+async def _extract_video_frames(path: Path, num_frames: int = DEFAULT_NUM_FRAMES) -> list[bytes]:
+    """
+    Extract evenly-spaced frames from a video using ffmpeg.
+
+    Args:
+        path: Path to video file
+        num_frames: Number of frames to extract
+
+    Returns:
+        List of JPEG-encoded frame bytes
+    """
+    frames: list[bytes] = []
+
+    try:
+        # First, get video duration
+        duration = await _get_video_duration(path)
+        if duration is None or duration <= 0:
+            logger.warning("Could not determine video duration", path=str(path))
+            return frames
+
+        # Calculate timestamps for evenly-spaced frames
+        # Avoid very start and end (often black frames)
+        start_offset = min(0.5, duration * 0.05)
+        end_offset = min(0.5, duration * 0.05)
+        usable_duration = duration - start_offset - end_offset
+
+        if usable_duration <= 0:
+            timestamps = [duration / 2]  # Just get middle frame
+        else:
+            timestamps = [
+                start_offset + (usable_duration * i / (num_frames - 1)) if num_frames > 1
+                else start_offset + usable_duration / 2
+                for i in range(num_frames)
+            ]
+
+        # Extract each frame
+        for i, ts in enumerate(timestamps):
+            frame_data = await _extract_single_frame(path, ts)
+            if frame_data:
+                frames.append(frame_data)
+                logger.debug("Extracted frame", index=i, timestamp=ts)
+
+        logger.info("Frames extracted from video",
+                   path=str(path),
+                   requested=num_frames,
+                   extracted=len(frames))
+
+    except Exception as e:
+        logger.exception("Frame extraction failed", path=str(path), error=str(e))
+
+    return frames
+
+
+async def _get_video_duration(path: Path) -> float | None:
+    """Get video duration in seconds using ffprobe."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+
+        if process.returncode == 0:
+            duration_str = stdout.decode().strip()
+            return float(duration_str)
+
+    except (asyncio.TimeoutError, ValueError, FileNotFoundError) as e:
+        logger.warning("Failed to get video duration", path=str(path), error=str(e))
+
+    return None
+
+
+async def _extract_single_frame(path: Path, timestamp: float) -> bytes | None:
+    """Extract a single frame at the given timestamp."""
+    try:
+        # Use ffmpeg to extract frame as JPEG
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-ss", str(timestamp),
+            "-i", str(path),
+            "-vframes", "1",
+            "-vf", f"scale='min({MAX_FRAME_DIMENSION},iw)':'min({MAX_FRAME_DIMENSION},ih)':force_original_aspect_ratio=decrease",
+            "-f", "image2",
+            "-c:v", "mjpeg",
+            "-q:v", "3",  # Quality (2-31, lower is better)
+            "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=FRAME_EXTRACT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.warning("Frame extraction timed out", timestamp=timestamp)
+            return None
+
+        if process.returncode == 0 and stdout:
+            return stdout
+
+        logger.debug("Failed to extract frame", timestamp=timestamp, stderr=stderr.decode()[:200])
+        return None
+
+    except FileNotFoundError:
+        logger.warning("ffmpeg not available for frame extraction")
+        return None
+    except Exception as e:
+        logger.warning("Frame extraction error", timestamp=timestamp, error=str(e))
+        return None
+
+
+async def extract_video_transcript(path: Path, backend: str | None = None) -> str | None:
+    """
+    Extract transcript from video file by extracting audio first.
+
+    Args:
+        path: Path to video file
+        backend: Backend to use ('openai' | 'local' | None for auto)
+
     Returns:
         Transcript text or None if extraction failed
+
+    Note: Use extract_video_content() to also get frames for vision analysis.
     """
     if not path.exists():
         logger.warning("Video file not found", path=str(path))
         return None
-        
-    logger.info("Extracting video transcript", 
-               path=str(path), 
+
+    logger.info("Extracting video transcript",
+               path=str(path),
                backend=backend)
-    
+
     try:
         # Extract audio from video using ffmpeg
         audio_path = await _extract_audio_from_video(path)
         if not audio_path:
             return None
-            
+
         # Transcribe the extracted audio
         transcript = await extract_audio_transcript(audio_path, backend=backend)
-        
+
         # Clean up temporary audio file
         audio_path.unlink(missing_ok=True)
-        
+
         return transcript
-        
+
     except Exception as e:
-        logger.exception("Video transcription failed", 
-                        path=str(path), 
+        logger.exception("Video transcription failed",
+                        path=str(path),
                         error=str(e))
         return None
 
@@ -235,13 +477,16 @@ async def _transcribe_with_local_whisper(audio_path: Path) -> str | None:
 
 
 async def _transcribe_with_whisper_cpp(audio_path: Path) -> str | None:
-    """Transcribe using whisper.cpp (faster native implementation)."""
+    """Transcribe using whisper.cpp (faster native implementation).
+
+    If timeout is reached, returns partial transcript collected so far.
+    """
     try:
         model_name = os.getenv("LOCAL_WHISPER_MODEL", "turbo")
-        
+
         # Run whisper.cpp main command
         process = await asyncio.create_subprocess_exec(
-            "whisper", 
+            "whisper",
             str(audio_path),
             "-m", f"models/ggml-{model_name}.bin",
             "-t", "4",  # 4 threads
@@ -250,25 +495,68 @@ async def _transcribe_with_whisper_cpp(audio_path: Path) -> str | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
+
+        # Read stdout incrementally to capture partial output on timeout
+        partial_output: list[bytes] = []
+        start_time = time.time()
+        timed_out = False
+
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)  # 5 min timeout
-        except asyncio.TimeoutError:
+            while True:
+                # Check timeout
+                elapsed = time.time() - start_time
+                remaining = WHISPER_TIMEOUT_SECONDS - elapsed
+                if remaining <= 0:
+                    timed_out = True
+                    break
+
+                # Try to read a chunk with remaining timeout
+                try:
+                    chunk = await asyncio.wait_for(
+                        process.stdout.read(4096),
+                        timeout=min(remaining, 1.0)  # Check every second
+                    )
+                    if not chunk:
+                        # EOF reached - process finished
+                        break
+                    partial_output.append(chunk)
+                except asyncio.TimeoutError:
+                    # Just a read timeout, continue if we have time left
+                    continue
+
+        except Exception as e:
+            logger.warning("Error reading whisper.cpp output", error=str(e))
+
+        if timed_out:
             process.kill()
             await process.wait()
-            logger.warning("whisper.cpp transcription timed out")
+            # Return partial transcript if we have any
+            if partial_output:
+                partial_transcript = b"".join(partial_output).decode().strip()
+                logger.warning("whisper.cpp timed out, returning partial transcript",
+                              timeout=WHISPER_TIMEOUT_SECONDS,
+                              path=str(audio_path),
+                              partial_length=len(partial_transcript))
+                return partial_transcript if partial_transcript else None
+            logger.warning("whisper.cpp timed out with no output",
+                          timeout=WHISPER_TIMEOUT_SECONDS,
+                          path=str(audio_path))
             return None
-        
+
+        # Wait for process to finish
+        await process.wait()
+
         if process.returncode == 0:
-            transcript = stdout.decode().strip()
-            logger.info("whisper.cpp transcription completed", 
+            transcript = b"".join(partial_output).decode().strip()
+            logger.info("whisper.cpp transcription completed",
                        model=model_name,
                        length=len(transcript))
             return transcript
         else:
+            stderr = await process.stderr.read()
             logger.warning("whisper.cpp failed", stderr=stderr.decode())
             return None
-            
+
     except FileNotFoundError:
         logger.warning("whisper.cpp not available or failed", error="Command not found")
         return None
@@ -278,32 +566,123 @@ async def _transcribe_with_whisper_cpp(audio_path: Path) -> str | None:
 
 
 async def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
-    """Transcribe using OpenAI Whisper Python library."""
+    """Transcribe using OpenAI Whisper Python library with lazy loading.
+
+    If timeout is reached, returns partial transcript collected so far.
+    """
+    global _whisper_model, _whisper_model_name, _whisper_last_used_at
+
     try:
         import whisper
-        
+
         model_name = os.getenv("LOCAL_WHISPER_MODEL", "turbo")
-        
-        # Load model (cached after first use)
-        model = whisper.load_model(model_name)
-        
-        # Transcribe (run in thread pool since whisper is blocking)
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, model.transcribe, str(audio_path))
-        transcript = result["text"]
-        
-        logger.info("Whisper Python transcription completed", 
-                   model=model_name,
-                   length=len(transcript))
-        
-        return transcript.strip()
-        
+
+        # Lazy load model (only when needed)
+        if _whisper_model is None or _whisper_model_name != model_name:
+            logger.info("Loading Whisper model", model=model_name)
+            _whisper_model = whisper.load_model(model_name)
+            _whisper_model_name = model_name
+
+        # Update last used timestamp
+        _whisper_last_used_at = time.time()
+
+        # Use a shared list to collect partial results from the thread
+        partial_segments: list[str] = []
+        timed_out = False
+
+        def _do_transcribe_with_segments():
+            """Transcribe and collect segments incrementally."""
+            nonlocal timed_out
+            start_time = time.time()
+
+            # Load audio
+            audio = whisper.load_audio(str(audio_path))
+            audio = whisper.pad_or_trim(audio)
+
+            # Make log-Mel spectrogram
+            mel = whisper.log_mel_spectrogram(audio, n_mels=_whisper_model.dims.n_mels).to(_whisper_model.device)
+
+            # Detect language (use first 30 seconds)
+            _, probs = _whisper_model.detect_language(mel)
+            detected_lang = max(probs, key=probs.get)
+
+            # Decode with segment callback
+            options = whisper.DecodingOptions(language=detected_lang)
+
+            # For full transcription with segments, use transcribe which handles chunking
+            result = _whisper_model.transcribe(
+                str(audio_path),
+                language=detected_lang,
+                verbose=False,
+            )
+
+            # Collect segments, checking timeout periodically
+            for segment in result.get("segments", []):
+                if time.time() - start_time > WHISPER_TIMEOUT_SECONDS:
+                    timed_out = True
+                    logger.warning("Whisper timeout reached, keeping partial transcript",
+                                  segments_collected=len(partial_segments),
+                                  timeout=WHISPER_TIMEOUT_SECONDS)
+                    break
+                partial_segments.append(segment["text"])
+
+            return result
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, _do_transcribe_with_segments),
+                timeout=WHISPER_TIMEOUT_SECONDS + 5  # Allow a bit more for cleanup
+            )
+
+            if not timed_out:
+                transcript = result["text"]
+                logger.info("Whisper Python transcription completed",
+                           model=model_name,
+                           length=len(transcript))
+                return transcript.strip()
+
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.warning("Whisper Python transcription timed out (hard limit)",
+                          timeout=WHISPER_TIMEOUT_SECONDS,
+                          path=str(audio_path))
+
+        # Return partial transcript if we have any segments
+        if partial_segments:
+            partial_transcript = " ".join(partial_segments).strip()
+            logger.info("Returning partial Whisper transcript",
+                       model=model_name,
+                       segments=len(partial_segments),
+                       length=len(partial_transcript))
+            return partial_transcript
+
+        return None
+
     except ImportError:
         logger.error("Whisper library not installed - install with: pip install openai-whisper")
         return None
     except Exception as e:
         logger.exception("Whisper Python error", error=str(e))
         return None
+
+
+def get_whisper_last_used_at() -> float | None:
+    """Get the timestamp when whisper model was last used."""
+    return _whisper_last_used_at
+
+
+def unload_whisper_model() -> None:
+    """Unload the whisper model to free memory."""
+    global _whisper_model, _whisper_model_name, _whisper_last_used_at
+
+    if _whisper_model is not None:
+        logger.info("Unloading Whisper model", model=_whisper_model_name)
+        del _whisper_model
+        _whisper_model = None
+        _whisper_model_name = None
+        _whisper_last_used_at = None
+        from cosma_backend.utils.memory import release_memory
+        release_memory()
 
 
 # Local vision processing is now integrated into the summarization system
@@ -350,11 +729,16 @@ async def _extract_audio_from_video(video_path: Path) -> Path | None:
         )
         
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=FFMPEG_EXTRACT_TIMEOUT_SECONDS
+            )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            logger.warning("ffmpeg audio extraction timed out")
+            logger.warning("ffmpeg audio extraction timed out",
+                          timeout=FFMPEG_EXTRACT_TIMEOUT_SECONDS,
+                          path=str(video_path))
             return None
         
         if process.returncode == 0 and temp_audio.exists():
