@@ -132,8 +132,8 @@ class BaseSummarizer(ABC):
             logger.info("Content chunked", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_sample=max_chunk_tokens)
 
         if len(chunks) > max_chunks:
-            logger.warning("Too many chunks, will not summarize", chunks=len(chunks), max_chunks=max_chunks)
-            raise RuntimeError("Too many chunks to summarize")
+            logger.warning("Too many chunks, processing first N only", chunks=len(chunks), max_chunks=max_chunks)
+            chunks = chunks[:max_chunks]
 
         return chunks
 
