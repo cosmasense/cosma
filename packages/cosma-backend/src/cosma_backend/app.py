@@ -254,11 +254,16 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
             for wd in watched_dirs:
                 wp = str(wd.path)
                 params.extend([wp, wp])
-            cursor = await conn.execute(
-                f"DELETE FROM files WHERE {conditions}", tuple(params)
+            # Count first, then delete (asqlite Cursor has no rowcount)
+            count_cursor = await conn.execute(
+                f"SELECT COUNT(*) FROM files WHERE {conditions}", tuple(params)
             )
-            removed_count = cursor.rowcount
+            count_row = await count_cursor.fetchone()
+            removed_count = count_row[0] if count_row else 0
             if removed_count:
+                await conn.execute(
+                    f"DELETE FROM files WHERE {conditions}", tuple(params)
+                )
                 logger.info("Removed orphaned files not under any watched directory",
                             count=removed_count)
 
