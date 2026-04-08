@@ -248,13 +248,18 @@ class Pipeline:
             await self._save_to_db(file)
             self._publish_update(Update.file_summarized(file.file_path, file.filename))
             
-            # Stage 3: Embed (if embedder is available)
-            self._publish_update(Update.file_embedding(file.file_path, file.filename))
-            await self.embedder.embed(file)
-            # embeddings need special care when saving
-            await self._save_embeddings(file)
-            self._publish_update(Update.file_embedded(file.file_path, file.filename))
-            
+            # Stage 3: Embed — non-fatal; file is still FTS-searchable without embeddings
+            try:
+                self._publish_update(Update.file_embedding(file.file_path, file.filename))
+                await self.embedder.embed(file)
+                await self._save_embeddings(file)
+                self._publish_update(Update.file_embedded(file.file_path, file.filename))
+            except Exception as embed_err:
+                logger.warning("Embedding failed, file saved without embeddings",
+                               file=file.file_path, error=str(embed_err))
+                # File is still COMPLETE for FTS — just missing semantic search
+                file.status = ProcessingStatus.COMPLETE
+
             # Mark as complete
             self._publish_update(Update.file_complete(file.file_path, file.filename))
             

@@ -198,7 +198,7 @@ class Database:
                 # Insert new keywords
                 for keyword in file_data.keywords:
                     await conn.execute(
-                        "INSERT INTO file_keywords (file_id, keyword) VALUES (?, ?)",
+                        "INSERT OR IGNORE INTO file_keywords (file_id, keyword) VALUES (?, ?)",
                         (file_data.id, keyword)
                     )
             
