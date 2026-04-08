@@ -235,50 +235,61 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
     watched_dirs = await db.get_watched_directories(active_only=True)
     removed_count = 0
 
-    # Step 1: Clean up orphaned files (not under any active watched directory)
+    # Step 1: Clean up orphaned files (not under any active watched directory).
+    # Uses SQL-level DELETE to avoid loading all file rows into Python memory.
     async with db.acquire() as conn:
-        all_files = await conn.fetchall("SELECT id, file_path FROM files")
-
-        for row in all_files:
-            file_path = row["file_path"]
-            is_under_watched = False
-
-            for watched_dir in watched_dirs:
-                watched_path = str(watched_dir.path)
-                if file_path.startswith(watched_path + "/") or file_path == watched_path:
-                    is_under_watched = True
-                    break
-
-            if not is_under_watched:
-                await conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
-                removed_count += 1
-                logger.info("Removed orphaned file from index (not under any watched directory)",
-                              file_path=file_path)
+        if not watched_dirs:
+            cursor = await conn.execute("SELECT COUNT(*) FROM files")
+            row = await cursor.fetchone()
+            removed_count = row[0] if row else 0
+            if removed_count:
+                await conn.execute("DELETE FROM files")
+        else:
+            # Build a single DELETE that removes files not under any watched dir
+            conditions = " AND ".join(
+                "(file_path NOT LIKE ? || '/' || '%' AND file_path != ?)"
+                for _ in watched_dirs
+            )
+            params: list[str] = []
+            for wd in watched_dirs:
+                wp = str(wd.path)
+                params.extend([wp, wp])
+            cursor = await conn.execute(
+                f"DELETE FROM files WHERE {conditions}", tuple(params)
+            )
+            removed_count = cursor.rowcount
+            if removed_count:
+                logger.info("Removed orphaned files not under any watched directory",
+                            count=removed_count)
 
     if not watched_dirs:
         return removed_count
 
-    # Step 2: Clean up excluded files under watched directories
+    # Step 2: Clean up excluded files under watched directories.
+    # Uses cursor iteration instead of fetchall to keep memory bounded.
     for watched_dir in watched_dirs:
         base_path = watched_dir.path
         config = filter_manager.get_config_for_directory(base_path)
 
-        # Get all files under this directory from database
+        ids_to_delete: list = []
         async with db.acquire() as conn:
-            rows = await conn.fetchall(
-                "SELECT id, file_path FROM files WHERE file_path LIKE ? || '/%' OR file_path = ?",
+            cursor = await conn.execute(
+                "SELECT id, file_path FROM files WHERE file_path LIKE ? || '/' || '%' OR file_path = ?",
                 (str(base_path), str(base_path))
             )
-
+            rows = await cursor.fetchall()
             for row in rows:
                 file_path = Path(row["file_path"])
-
                 if not config.should_include(file_path, base_path):
-                    # File should be excluded, delete it
-                    await conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
-                    removed_count += 1
-                    logger.info("Removed excluded file from index",
-                                  file_path=str(file_path))
+                    ids_to_delete.append(row["id"])
+
+            # Batch delete collected IDs
+            for file_id in ids_to_delete:
+                await conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            removed_count += len(ids_to_delete)
+            if ids_to_delete:
+                logger.info("Removed excluded files under directory",
+                            directory=str(base_path), count=len(ids_to_delete))
 
     return removed_count
 

@@ -126,8 +126,9 @@ class AutoSummarizer:
         }
 
         if self.preferred_provider in _provider_getters:
+            # The getter already checks is_available() and caches the result.
             provider = await _provider_getters[self.preferred_provider]()
-            if not provider or not await provider.is_available():
+            if not provider:
                 raise SummarizerError(
                     f"Summarizer provider '{self.preferred_provider}' is not available. "
                     f"Check that the required package is installed and configured."
@@ -135,7 +136,9 @@ class AutoSummarizer:
             logger.info("Attempting summarization", provider=type(provider).__name__)
             return await provider.summarize(file_metadata)
 
-        # "auto" mode: try all providers in priority order with fallback
+        # "auto" mode: try all providers in priority order with fallback.
+        # Each getter already checks is_available() internally and returns
+        # None when unavailable, so no second check is needed.
         providers = [
             await self._get_llamacpp_summarizer(),
             await self._get_ollama_summarizer(),
@@ -143,7 +146,7 @@ class AutoSummarizer:
         ]
 
         for provider in providers:
-            if provider and await provider.is_available():
+            if provider:
                 try:
                     logger.info("Attempting summarization", provider=type(provider).__name__)
                     return await provider.summarize(file_metadata)

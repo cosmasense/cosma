@@ -4,6 +4,7 @@ Summarizer provider implementations: Ollama, Online (LiteLLM), and LlamaCpp.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Any, Optional, TYPE_CHECKING
@@ -370,11 +371,16 @@ class LlamaCppSummarizer(BaseSummarizer):
         text = self._format_content_with_context(chunk, chunk_num, total_chunks, filename)
         user_content = self._build_user_content(text, images)
 
-        response = self.llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
-                {"role": "user", "content": user_content},
-            ],
+        messages = [
+            {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
+            {"role": "user", "content": user_content},
+        ]
+
+        # Offload synchronous llama.cpp inference to a thread so it doesn't
+        # block the async event loop (inference can take several seconds).
+        response = await asyncio.to_thread(
+            self.llm.create_chat_completion,
+            messages=messages,
             max_tokens=500,
             temperature=0.1,
             top_p=0.95,

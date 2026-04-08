@@ -211,6 +211,7 @@ class QueueConfig:
     initial_cooldown_seconds: int = 5
     max_concurrency: int = 2
     max_retries: int = 3
+    file_processing_timeout: int = 300  # seconds per file (5 min default)
 
 
 @dataclass

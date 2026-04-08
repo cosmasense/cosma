@@ -204,6 +204,8 @@ class IndexingQueue:
         dest_key = str(Path(dest_path).resolve()) if dest_path else None
         now = time.time()
 
+        item_to_persist: Optional[QueueItem] = None
+
         async with self._lock:
             existing = self._items.get(key)
 
@@ -248,25 +250,24 @@ class IndexingQueue:
                         self._publish(Update.create(
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                         ))
-                        await self._save_item(existing)
+                        item_to_persist = existing
                         logger.info("Queue item fast-tracked to DELETE", file_path=key)
-                        return existing
 
-                    # Otherwise reset the cooldown timer
-                    existing.action = action
-                    existing.cooldown_expires_at = now + cooldown
-                    existing.dest_path = dest_key if dest_key else existing.dest_path
-                    # Update dest mapping
-                    if action == QueueAction.MOVE and existing.dest_path:
-                        self._dest_to_src[existing.dest_path] = key
-                    self._publish(Update.create(
-                        UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
-                    ))
-                    await self._save_item(existing)
-                    logger.info("Queue item cooldown reset", file_path=key)
-                    return existing
+                    else:
+                        # Otherwise reset the cooldown timer
+                        existing.action = action
+                        existing.cooldown_expires_at = now + cooldown
+                        existing.dest_path = dest_key if dest_key else existing.dest_path
+                        # Update dest mapping
+                        if action == QueueAction.MOVE and existing.dest_path:
+                            self._dest_to_src[existing.dest_path] = key
+                        self._publish(Update.create(
+                            UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
+                        ))
+                        item_to_persist = existing
+                        logger.info("Queue item cooldown reset", file_path=key)
 
-                if existing.status == QueueItemStatus.WAITING:
+                elif existing.status == QueueItemStatus.WAITING:
                     # Item is ready but hasn't been dispatched yet; reset it
                     # back to COOLING_DOWN so the new event is debounced.
                     if existing.action == QueueAction.MOVE and existing.dest_path:
@@ -280,33 +281,45 @@ class IndexingQueue:
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                     ))
-                    await self._save_item(existing)
+                    item_to_persist = existing
                     logger.info("Queue item reset from WAITING to cooldown",
                                 file_path=key, action=action.value)
-                    return existing
 
-            # New item
-            item = QueueItem(
-                id=str(uuid.uuid4()),
-                file_path=key,
-                action=action,
-                status=QueueItemStatus.COOLING_DOWN,
-                enqueued_at=now,
-                cooldown_expires_at=now + cooldown,
-                dest_path=dest_key,
-            )
-            self._items[key] = item
-            if action == QueueAction.MOVE and dest_key:
-                self._dest_to_src[dest_key] = key
-            self._publish(Update.create(
-                UpdateOpcode.QUEUE_ITEM_ADDED, **item.to_dict()
-            ))
-            await self._save_item(item)
-            logger.info("Item enqueued", file_path=key, action=action.value)
-            return item
+            if item_to_persist is None and existing is not None:
+                # Handled above (PROCESSING stash) — already returned
+                pass
+            elif item_to_persist is not None:
+                # Existing item was updated; will persist below
+                pass
+            else:
+                # New item
+                item = QueueItem(
+                    id=str(uuid.uuid4()),
+                    file_path=key,
+                    action=action,
+                    status=QueueItemStatus.COOLING_DOWN,
+                    enqueued_at=now,
+                    cooldown_expires_at=now + cooldown,
+                    dest_path=dest_key,
+                )
+                self._items[key] = item
+                if action == QueueAction.MOVE and dest_key:
+                    self._dest_to_src[dest_key] = key
+                self._publish(Update.create(
+                    UpdateOpcode.QUEUE_ITEM_ADDED, **item.to_dict()
+                ))
+                item_to_persist = item
+                logger.info("Item enqueued", file_path=key, action=action.value)
+
+        # Persist outside the lock to avoid blocking concurrent operations.
+        if item_to_persist is not None:
+            await self._save_item(item_to_persist)
+
+        return item_to_persist if item_to_persist is not None else existing
 
     async def remove_item(self, item_id: str) -> bool:
         """Remove an item by its ID. Returns True if found and removed."""
+        removed_key: Optional[str] = None
         async with self._lock:
             for key, item in self._items.items():
                 if item.id == item_id:
@@ -315,9 +328,12 @@ class IndexingQueue:
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_REMOVED, **item.to_dict()
                     ))
-                    await self._delete_item_from_db(item_id)
-                    logger.info("Queue item removed", item_id=item_id, file_path=key)
-                    return True
+                    removed_key = key
+                    break
+        if removed_key is not None:
+            await self._delete_item_from_db(item_id)
+            logger.info("Queue item removed", item_id=item_id, file_path=removed_key)
+            return True
         return False
 
     async def remove_items_under(self, directory: str | Path) -> int:
@@ -392,6 +408,7 @@ class IndexingQueue:
 
                 now = time.time()
                 ready_items: list[QueueItem] = []
+                items_to_persist: list[QueueItem] = []
 
                 async with self._lock:
                     for item in self._items.values():
@@ -400,7 +417,7 @@ class IndexingQueue:
                             and now >= item.cooldown_expires_at
                         ):
                             item.status = QueueItemStatus.WAITING
-                            await self._save_item(item)
+                            items_to_persist.append(item)
 
                     ready_items = [
                         i for i in self._items.values()
@@ -411,7 +428,12 @@ class IndexingQueue:
                     # semaphore.
                     for item in ready_items:
                         item.status = QueueItemStatus.PROCESSING
-                        await self._save_item(item)
+                        items_to_persist.append(item)
+
+                # Persist status changes outside the lock to avoid blocking
+                # enqueue/remove operations during DB writes.
+                for item in items_to_persist:
+                    await self._save_item(item)
 
                 if ready_items:
                     tasks = [self._process_item(item) for item in ready_items]
@@ -444,20 +466,33 @@ class IndexingQueue:
             ))
 
             try:
+                timeout = self._config.file_processing_timeout
+
                 if item.action == QueueAction.DELETE:
-                    await self._pipeline.db.delete_file(item.file_path)
+                    await asyncio.wait_for(
+                        self._pipeline.db.delete_file(item.file_path),
+                        timeout=timeout,
+                    )
                 elif item.action == QueueAction.MOVE:
-                    await self._pipeline.db.delete_file(item.file_path)
-                    if item.dest_path:
-                        dest_file = File.from_path(Path(item.dest_path))
-                        if await self._pipeline.is_supported(dest_file):
-                            await self._pipeline.process_file(dest_file)
+                    async def _do_move() -> None:
+                        await self._pipeline.db.delete_file(item.file_path)
+                        if item.dest_path:
+                            dest_file = File.from_path(Path(item.dest_path))
+                            if await self._pipeline.is_supported(dest_file):
+                                await self._pipeline.process_file(dest_file)
+                    await asyncio.wait_for(_do_move(), timeout=timeout)
                 elif item.action == QueueAction.INDEX:
                     file = File.from_path(Path(item.file_path))
                     if await self._pipeline.is_supported(file):
-                        await self._pipeline.process_file(file)
+                        await asyncio.wait_for(
+                            self._pipeline.process_file(file),
+                            timeout=timeout,
+                        )
                 elif item.action == QueueAction.EMBED_FALLBACK:
-                    await self._pipeline.embed_fallback(item.file_path)
+                    await asyncio.wait_for(
+                        self._pipeline.embed_fallback(item.file_path),
+                        timeout=timeout,
+                    )
 
                 # Success — remove from queue
                 async with self._lock:
