@@ -149,77 +149,86 @@ app.register_blueprint(api_blueprint, url_prefix='/api')
 
 @app.before_serving
 async def initialize_services():
-    logger.info("Initializing database")
+    """Two-phase startup: API-ready first, heavy models load in background.
+
+    Phase 1 (blocking): DB + filter + services created (no model loading)
+           → API is reachable, frontend can connect
+    Phase 2 (background): Load embedding model + start indexing + watcher
+           → Search becomes available, then indexing starts
+    """
+    # ── Phase 1: Fast startup — get the API responding ──
+    logger.info("Phase 1: Initializing database and core services")
     app.db = await db.connect(app.config['DATABASE_PATH'])
 
-    logger.info("Initializing filter configuration")
-    # Load global filter config (creates default if not exists)
     global_config = app.filter_manager.global_config
     logger.info("Filter config loaded",
                   mode=global_config.mode.value,
-                  exclude_count=len(global_config.exclude),
                   include_count=len(global_config.include),
                   config_path=str(global_config.config_path))
 
-    logger.info("Initializing services")
     settings = app.settings_manager.settings
     discoverer = Discoverer()
     parser = FileParser(config=settings.parser)
     summarizer = AutoSummarizer(config=settings.summarizer)
-    embedder = AutoEmbedder(config=settings.embedder)
+
+    # Create embedder WITHOUT eager model loading — stays lazy
+    embedder = AutoEmbedder(config=settings.embedder, preferred_provider="lazy_local")
 
     app.pipeline = Pipeline(
-        db=app.db,
-        updates_hub=app.updates_hub,
-        parser=parser,
-        discoverer=discoverer,
-        summarizer=summarizer,
-        embedder=embedder,
+        db=app.db, updates_hub=app.updates_hub,
+        parser=parser, discoverer=discoverer,
+        summarizer=summarizer, embedder=embedder,
     )
-
-    app.searcher = HybridSearcher(
-        db=app.db,
-        embedder=embedder,
-    )
+    app.searcher = HybridSearcher(db=app.db, embedder=embedder)
 
     app.indexing_queue = IndexingQueue(
-        pipeline=app.pipeline,
-        updates_hub=app.updates_hub,
-        config=settings.queue,
-        db=app.db,
+        pipeline=app.pipeline, updates_hub=app.updates_hub,
+        config=settings.queue, db=app.db,
     )
-    await app.indexing_queue.start()
-
-    app.scheduler = Scheduler(
-        queue=app.indexing_queue,
-        updates_hub=app.updates_hub,
-        config=settings.scheduler,
-    )
-    app.scheduler.start()
-
     app.model_lifecycle = ModelLifecycleManager(
         summarizer=summarizer,
         idle_unload_seconds=settings.summarizer.idle_unload_seconds,
         embedder=embedder,
     )
-    app.model_lifecycle.start()
 
-    app.watcher = Watcher(
-        db=app.db,
-        pipeline=app.pipeline,
-        filter_manager=app.filter_manager,
-        indexing_queue=app.indexing_queue,
-    )
+    logger.info("Phase 1 complete — API is ready")
 
-    # Run startup cleanup to remove excluded files from database
-    logger.info("Running startup cleanup for excluded files")
-    removed_count = await cleanup_excluded_files_on_startup(app.db, app.filter_manager)
-    if removed_count > 0:
-        logger.info("Startup cleanup complete", removed_files=removed_count)
+    # ── Phase 2: Background — load models and start indexing ──
+    async def _deferred_startup():
+        try:
+            # Load embedding model (this is the slow part, ~6s)
+            logger.info("Phase 2: Loading embedding model...")
+            if embedder.preferred_provider in ("local", "lazy_local"):
+                embedder.preferred_provider = "local"
+                embedder._eagerly_initialize_models()
+            logger.info("Embedding model loaded — search is ready")
 
-    await app.watcher.initialize_from_database()
+            # Start indexing services
+            await app.indexing_queue.start()
+            app.scheduler = Scheduler(
+                queue=app.indexing_queue, updates_hub=app.updates_hub,
+                config=settings.scheduler,
+            )
+            app.scheduler.start()
+            app.model_lifecycle.start()
 
-    logger.info("Initialized services")
+            app.watcher = Watcher(
+                db=app.db, pipeline=app.pipeline,
+                filter_manager=app.filter_manager,
+                indexing_queue=app.indexing_queue,
+            )
+
+            logger.info("Running startup cleanup")
+            removed = await cleanup_excluded_files_on_startup(app.db, app.filter_manager)
+            if removed > 0:
+                logger.info("Cleanup complete", removed_files=removed)
+
+            await app.watcher.initialize_from_database()
+            logger.info("Phase 2 complete — indexing is ready")
+        except Exception:
+            logger.exception("Error in deferred startup")
+
+    app.run_task(_deferred_startup())
 
 
 async def cleanup_excluded_files_on_startup(db: Database, filter_manager: FilterConfigManager) -> int:

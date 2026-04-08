@@ -51,7 +51,9 @@ class AutoEmbedder:
                     preferred_provider=self.preferred_provider)
 
         # Eagerly initialize models based on preferred provider
-        self._eagerly_initialize_models()
+        # "lazy_local" skips eager loading — model will load on first use
+        if self.preferred_provider != "lazy_local":
+            self._eagerly_initialize_models()
 
     def _eagerly_initialize_models(self) -> None:
         """Initialize embedding models based on provider preference - eager for local, lazy for online."""
