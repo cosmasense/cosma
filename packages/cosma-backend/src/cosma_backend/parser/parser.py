@@ -250,7 +250,10 @@ class FileParser:
             error_msg = f"Failed to parse file: {e!s}"
             logger.exception(error_msg, file_path=str(path), error=str(e))
 
-            raise e
+            # Ensure file has a consistent failed state before re-raising
+            file.status = ProcessingStatus.FAILED
+            file.processing_error = error_msg
+            raise
 
     async def _try_spotlight_extraction(self, path: Path) -> str | None:
         """
@@ -352,9 +355,13 @@ class FileParser:
         """
         try:
             logger.debug("Trying MarkItDown extraction", path=str(path))
-            
-            result = await asyncio.to_thread(self.markitdown.convert, str(path))
-            
+
+            # Timeout prevents hangs on malformed/malicious files
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self.markitdown.convert, str(path)),
+                timeout=120,  # 2 minute max per file
+            )
+
             if result and result.text_content:
                 content = result.text_content.strip()
                 if len(content) > 0:
@@ -366,9 +373,12 @@ class FileParser:
             logger.debug("MarkItDown extraction returned empty content", path=str(path))
             return None
             
+        except asyncio.TimeoutError:
+            logger.warning("MarkItDown extraction timed out", path=str(path))
+            return None
         except Exception as e:
-            logger.debug("MarkItDown extraction failed", 
-                            path=str(path), 
+            logger.debug("MarkItDown extraction failed",
+                            path=str(path),
                             error=str(e))
             return None
 

@@ -49,6 +49,8 @@ load_dotenv()
 
 import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Limit PyTorch MPS memory usage (set before torch is imported)
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.75")
 
 configure_logging()
 logger = get_logger(__name__)
@@ -167,6 +169,36 @@ async def initialize_services():
                   config_path=str(global_config.config_path))
 
     settings = app.settings_manager.settings
+
+    # Apply GPU memory cap from settings.
+    #
+    # IMPORTANT: the cap affects different backends differently:
+    #   * PyTorch / MPS (embedder, local whisper) — honors
+    #     PYTORCH_MPS_HIGH_WATERMARK_RATIO directly.
+    #   * llama.cpp (summarizer via llama-cpp-python) — uses its own Metal
+    #     backend. Memory usage is controlled by `summarizer.llamacpp.n_gpu_layers`
+    #     (negative = all layers on GPU, positive = N layers only). Metal
+    #     respects system memory pressure automatically.
+    #   * Ollama — runs as a separate process. Configure Ollama itself via
+    #     OLLAMA_NUM_GPU / OLLAMA_KEEP_ALIVE env vars before launching it;
+    #     this setting has no direct effect on an already-running Ollama server.
+    gpu_cap = settings.queue.gpu_memory_cap
+    if not (0.0 < gpu_cap <= 1.0):
+        logger.warning("Invalid gpu_memory_cap, falling back to 0.75",
+                      configured=gpu_cap)
+        gpu_cap = 0.75
+    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = str(gpu_cap)
+
+    # Hint for any Ollama instance spawned in this environment
+    os.environ.setdefault("OLLAMA_KEEP_ALIVE", "5m")
+
+    logger.info(
+        "GPU memory cap applied",
+        gpu_cap=f"{gpu_cap:.0%}",
+        affects="torch (embedder, local whisper)",
+        note="llama.cpp uses n_gpu_layers; Ollama uses its own env config",
+    )
+
     discoverer = Discoverer()
     parser = FileParser(config=settings.parser)
     summarizer = AutoSummarizer(config=settings.summarizer)
@@ -228,7 +260,7 @@ async def initialize_services():
         except Exception:
             logger.exception("Error in deferred startup")
 
-    app.run_task(_deferred_startup())
+    asyncio.ensure_future(_deferred_startup())
 
 
 async def cleanup_excluded_files_on_startup(db: Database, filter_manager: FilterConfigManager) -> int:
@@ -310,12 +342,48 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
 
 @app.after_serving
 async def handle_shutdown():
-    logger.info("Stopping model lifecycle manager, scheduler, and indexing queue")
-    await app.model_lifecycle.stop()
-    await app.scheduler.stop()
-    await app.indexing_queue.stop()
-    logger.info("Closing DB")
-    await app.db.close()
+    logger.info("Shutdown: stopping lifecycle manager, scheduler, and indexing queue")
+    try:
+        await app.model_lifecycle.stop()
+    except Exception:
+        logger.exception("Error stopping model lifecycle manager")
+    try:
+        await app.scheduler.stop()
+    except Exception:
+        logger.exception("Error stopping scheduler")
+    try:
+        await app.indexing_queue.stop()
+    except Exception:
+        logger.exception("Error stopping indexing queue")
+
+    # Unload summarizer models — this is important for Ollama, which runs in a
+    # separate process and keeps the model pinned in GPU until explicitly told
+    # to release (via a request with keep_alive=0). Without this call, Ollama
+    # can hold 100% of GPU memory even after the backend quits.
+    logger.info("Shutdown: unloading summarizer models")
+    try:
+        summarizer = getattr(app.pipeline, "summarizer", None)
+        if summarizer is not None and hasattr(summarizer, "unload_models"):
+            await asyncio.wait_for(summarizer.unload_models(), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("Summarizer unload timed out after 5s")
+    except Exception:
+        logger.exception("Error unloading summarizer models")
+
+    # Unload Whisper if it was loaded
+    try:
+        from cosma_backend.parser.media import unload_whisper_model
+        unload_whisper_model()
+    except Exception:
+        logger.exception("Error unloading whisper model")
+
+    logger.info("Shutdown: closing DB")
+    try:
+        await app.db.close()
+    except Exception:
+        logger.exception("Error closing DB")
+
+    logger.info("Shutdown complete")
     
 
 @app.before_request

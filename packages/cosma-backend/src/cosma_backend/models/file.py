@@ -127,8 +127,13 @@ class File:
                 logger.warning(f"Failed to parse timestamp: {value}")
                 return None
         
-        # Parse status from string to enum
-        status = ProcessingStatus[row["status"]] if row["status"] else ProcessingStatus.DISCOVERED
+        # Parse status from string to enum (with fallback for corrupted data)
+        try:
+            status = ProcessingStatus[row["status"]] if row["status"] else ProcessingStatus.DISCOVERED
+        except KeyError:
+            logger.warning("Invalid processing status in database, defaulting to DISCOVERED",
+                          status=row["status"], file_path=row.get("file_path"))
+            status = ProcessingStatus.DISCOVERED
         
         # Parse timestamps (they're stored as UNIX timestamps in the database)
         created = parse_timestamp(row["created"])

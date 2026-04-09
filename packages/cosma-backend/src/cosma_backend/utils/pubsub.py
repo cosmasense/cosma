@@ -35,7 +35,11 @@ class Hub(Generic[T]):
     Generic pub/sub hub that broadcasts messages to all subscribers.
 
     Thread-safe for publishing; subscribers receive messages via asyncio.Queue.
+    Includes backpressure: subscriber queues are capped to prevent unbounded
+    memory growth from slow or disconnected clients.
     """
+
+    MAX_QUEUE_SIZE = 1000  # Maximum buffered messages per subscriber
 
     subscriptions: set[asyncio.Queue[T]]
 
@@ -43,9 +47,21 @@ class Hub(Generic[T]):
         self.subscriptions = set()
 
     def publish(self, message: T) -> None:
-        """Broadcast message to all subscribed queues."""
+        """Broadcast message to all subscribed queues.
+
+        Drops subscribers whose queue is full to prevent memory exhaustion.
+        """
+        dead_queues: list[asyncio.Queue[T]] = []
         for queue in self.subscriptions:
-            queue.put_nowait(message)
+            if queue.qsize() >= self.MAX_QUEUE_SIZE:
+                logger.warning("Subscriber queue full, dropping subscriber",
+                              queue_size=queue.qsize())
+                dead_queues.append(queue)
+            else:
+                queue.put_nowait(message)
+
+        for queue in dead_queues:
+            self.subscriptions.discard(queue)
 
 
 @contextmanager

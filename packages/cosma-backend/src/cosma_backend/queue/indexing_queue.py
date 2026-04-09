@@ -576,7 +576,12 @@ class IndexingQueue:
         try:
             rows = await self._db.get_queue_items()
             for row in rows:
-                action = QueueAction(row["action"])
+                try:
+                    action = QueueAction(row["action"])
+                except ValueError:
+                    logger.error("Invalid queue action type, skipping item",
+                                action=row["action"], item_id=row["id"])
+                    continue
                 # Restore PROCESSING items as WAITING so they get re-processed.
                 # Also map legacy "ready" values to WAITING.
                 raw_status = row["status"]

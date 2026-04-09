@@ -112,6 +112,10 @@ class BaseSummarizer(ABC):
         chunks = await chunk_content(content, self.max_tokens, self.chunk_overlap, self.model)
         logger.info("Content chunked (noverify)", num_chunks=len(chunks))
 
+        if not chunks:
+            logger.warning("Chunking produced no output, returning content as single chunk")
+            return [content]
+
         max_chunks = self.config.max_chunks
 
         # Use fast estimation for chunk statistics (sample a few chunks for accurate check)

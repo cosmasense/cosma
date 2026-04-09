@@ -89,10 +89,14 @@ async def get_jobs() -> tuple[JobsListResponse, int]:
     """    
     # Get all watched directories from database
     watched_dirs = await current_app.db.get_watched_directories(active_only=False)
-    
-    # Convert to API response models
-    jobs = [watched_dir.to_response() for watched_dir in watched_dirs]
-    
+
+    # Convert to API response models with file counts
+    jobs = []
+    for watched_dir in watched_dirs:
+        job = watched_dir.to_response()
+        job.file_count = await current_app.db.count_files_in_directory(str(watched_dir.path))
+        jobs.append(job)
+
     return JobsListResponse(jobs=jobs), 200
 
 
