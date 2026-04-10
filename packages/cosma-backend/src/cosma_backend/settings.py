@@ -111,7 +111,12 @@ class SchedulerRuleConfig:
 class SchedulerConfig:
     enabled: bool = False
     combine_mode: str = "ALL"
-    check_interval_seconds: int = 30
+    # The scheduler primarily evaluates rules BETWEEN tasks (see
+    # IndexingQueue._pre_task_hook). This interval is only used as a backstop
+    # for long-term conditions (e.g. time_window) that can change while the
+    # queue is idle. Short intervals cause unnecessary start/pause thrashing
+    # and mid-task metric polling, so keep it coarse.
+    check_interval_seconds: int = 60
     rules: list[SchedulerRuleConfig] = field(default_factory=list)
 
 

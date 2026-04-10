@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Awaitable, Callable, TYPE_CHECKING, Optional
 
 from cosma_backend.db.errors import DatabaseClosingError
 from cosma_backend.logging import get_logger
@@ -104,6 +104,19 @@ class IndexingQueue:
 
         self._processing_task: Optional[asyncio.Task] = None
         self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
+
+        # Optional hook invoked right before each batch of ready items is
+        # dispatched. The scheduler installs this so rule evaluation happens
+        # at task boundaries (not mid-task). The hook may set
+        # ``_scheduler_paused`` via queue.scheduler_pause() — the loop will
+        # then wait instead of picking up new work.
+        self._pre_task_hook: Optional[Callable[[], Awaitable[Any]]] = None
+
+    def set_pre_task_hook(self, hook: Optional[Callable[[], Awaitable[Any]]]) -> None:
+        """Install a callback invoked once per processing cycle, right
+        before ready items are picked. Used by the scheduler to evaluate
+        rules between tasks without a fixed polling interval."""
+        self._pre_task_hook = hook
 
     # ------------------------------------------------------------------
     # Public properties
@@ -419,6 +432,27 @@ class IndexingQueue:
                             item.status = QueueItemStatus.WAITING
                             items_to_persist.append(item)
 
+                    has_waiting = any(
+                        i.status == QueueItemStatus.WAITING
+                        for i in self._items.values()
+                    )
+
+                # Task-boundary scheduler check: evaluate rules right before
+                # we promote WAITING items to PROCESSING. If the hook flips
+                # is_paused, we loop back and wait without starting new work.
+                # This is the sole "should we run now?" check — there is no
+                # fixed polling interval for GPU/CPU/memory rules, so a
+                # single file's inference cannot get interrupted mid-way.
+                if has_waiting and self._pre_task_hook is not None:
+                    try:
+                        await self._pre_task_hook()
+                    except Exception:
+                        logger.exception("pre_task_hook raised — proceeding anyway")
+                    if self.is_paused:
+                        await asyncio.sleep(1)
+                        continue
+
+                async with self._lock:
                     ready_items = [
                         i for i in self._items.values()
                         if i.status == QueueItemStatus.WAITING

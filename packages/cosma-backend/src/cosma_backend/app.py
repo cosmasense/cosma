@@ -226,41 +226,80 @@ async def initialize_services():
     logger.info("Phase 1 complete — API is ready")
 
     # ── Phase 2: Background — load models and start indexing ──
-    async def _deferred_startup():
+    # Start indexing services immediately (non-blocking async)
+    await app.indexing_queue.start()
+    app.scheduler = Scheduler(
+        queue=app.indexing_queue, updates_hub=app.updates_hub,
+        config=settings.scheduler,
+    )
+    app.indexing_queue.set_pre_task_hook(app.scheduler.evaluate_and_apply)
+    app.scheduler.start()
+    app.model_lifecycle.start()
+
+    app.watcher = Watcher(
+        db=app.db, pipeline=app.pipeline,
+        filter_manager=app.filter_manager,
+        indexing_queue=app.indexing_queue,
+    )
+
+    # Progress tracking for Phase 2 (0.0 → 1.0)
+    app._deferred_init_progress: float = 0.0
+    app._model_loading_done = asyncio.Event()
+
+    async def _model_loading_progress_updater():
+        """Smoothly increment progress from 10% → 78% over ~12 s while
+        the embedding model loads on a background thread."""
+        progress = 0.10
+        while not app._model_loading_done.is_set():
+            remaining = 0.78 - progress
+            if remaining > 0.01:
+                progress += remaining * 0.06
+                app._deferred_init_progress = progress
+            try:
+                await asyncio.wait_for(
+                    app._model_loading_done.wait(), timeout=0.3,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    async def _deferred_heavy_init():
+        """Load embedding model in a thread so it doesn't block the event loop.
+
+        This lets Uvicorn start accepting connections immediately after Phase 1
+        instead of waiting ~8s for the SentenceTransformer model to load.
+        Cancellation-safe: if SIGTERM arrives mid-load, the task is cancelled.
+        """
         try:
-            # Load embedding model (this is the slow part, ~6s)
+            app._deferred_init_progress = 0.05
             logger.info("Phase 2: Loading embedding model...")
             if embedder.preferred_provider in ("local", "lazy_local"):
                 embedder.preferred_provider = "local"
-                embedder._eagerly_initialize_models()
+                app._deferred_init_progress = 0.10
+                progress_task = asyncio.ensure_future(
+                    _model_loading_progress_updater(),
+                )
+                await asyncio.to_thread(embedder._eagerly_initialize_models)
+                app._model_loading_done.set()
+                await progress_task
+            app._deferred_init_progress = 0.80
             logger.info("Embedding model loaded — search is ready")
-
-            # Start indexing services
-            await app.indexing_queue.start()
-            app.scheduler = Scheduler(
-                queue=app.indexing_queue, updates_hub=app.updates_hub,
-                config=settings.scheduler,
-            )
-            app.scheduler.start()
-            app.model_lifecycle.start()
-
-            app.watcher = Watcher(
-                db=app.db, pipeline=app.pipeline,
-                filter_manager=app.filter_manager,
-                indexing_queue=app.indexing_queue,
-            )
 
             logger.info("Running startup cleanup")
             removed = await cleanup_excluded_files_on_startup(app.db, app.filter_manager)
             if removed > 0:
                 logger.info("Cleanup complete", removed_files=removed)
+            app._deferred_init_progress = 0.90
 
             await app.watcher.initialize_from_database()
+            app._deferred_init_progress = 1.0
             logger.info("Phase 2 complete — indexing is ready")
+        except asyncio.CancelledError:
+            logger.info("Phase 2 cancelled (shutdown in progress)")
         except Exception:
             logger.exception("Error in deferred startup")
 
-    asyncio.ensure_future(_deferred_startup())
+    app._deferred_init_task = asyncio.ensure_future(_deferred_heavy_init())
 
 
 async def cleanup_excluded_files_on_startup(db: Database, filter_manager: FilterConfigManager) -> int:
@@ -342,6 +381,17 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
 
 @app.after_serving
 async def handle_shutdown():
+    # Cancel Phase 2 if it's still running (e.g. model loading in thread).
+    # This prevents the shutdown from waiting on a slow model download.
+    deferred = getattr(app, "_deferred_init_task", None)
+    if deferred and not deferred.done():
+        logger.info("Shutdown: cancelling deferred startup")
+        deferred.cancel()
+        try:
+            await deferred
+        except (asyncio.CancelledError, Exception):
+            pass
+
     logger.info("Shutdown: stopping lifecycle manager, scheduler, and indexing queue")
     try:
         await app.model_lifecycle.stop()
@@ -364,9 +414,9 @@ async def handle_shutdown():
     try:
         summarizer = getattr(app.pipeline, "summarizer", None)
         if summarizer is not None and hasattr(summarizer, "unload_models"):
-            await asyncio.wait_for(summarizer.unload_models(), timeout=5.0)
+            await asyncio.wait_for(summarizer.unload_models(), timeout=3.0)
     except asyncio.TimeoutError:
-        logger.warning("Summarizer unload timed out after 5s")
+        logger.warning("Summarizer unload timed out after 3s")
     except Exception:
         logger.exception("Error unloading summarizer models")
 

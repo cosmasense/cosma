@@ -68,6 +68,11 @@ class File:
     # Meta
     status: ProcessingStatus = ProcessingStatus.DISCOVERED
     processing_error: Optional[str] = None
+    # DB bookkeeping: time the row was last written (set automatically by
+    # `upsert_file` via strftime('%s','now')). This is the correct value to
+    # show as "processed at" in the Recent/Failed lists — `modified` is the
+    # filesystem mtime and can be years old.
+    updated_at: Optional[datetime] = None
 
     # Transient data (not persisted to DB)
     # Used to pass video frames to the summarizer for vision analysis
@@ -142,6 +147,7 @@ class File:
         parsed_at = parse_timestamp(get_value("parsed_at"))
         summarized_at = parse_timestamp(get_value("summarized_at"))
         embedded_at = parse_timestamp(get_value("embedded_at"))
+        updated_at = parse_timestamp(get_value("updated_at"))
         
         # Parse keywords if present (stored as comma or || separated string)
         keywords = None
@@ -170,6 +176,7 @@ class File:
             embedded_at=embedded_at,
             status=status,
             processing_error=get_value("processing_error"),
+            updated_at=updated_at,
         )
     
     def to_response(self) -> "FileResponse":
