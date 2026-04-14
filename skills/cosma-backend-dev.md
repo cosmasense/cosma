@@ -79,11 +79,12 @@ current_app.updates_hub.publish(
 ```python
 # tests/unit/test_myfeature.py
 import pytest
-from cosma_backend.app import app
 
 @pytest.fixture
-def client():
-    return app.test_client()
+def client(app_instance):
+    # `app_instance` is a conftest fixture that builds an isolated App via
+    # `create_app(dirs=...)` so tests don't touch the real user config.
+    return app_instance.test_client()
 
 @pytest.mark.asyncio
 async def test_do_something(client):

@@ -13,7 +13,8 @@ from quart_schema import validate_request, validate_response
 from cosma_backend.api.models import JobResponse
 
 if TYPE_CHECKING:
-    from cosma_backend.app import app as current_app
+    from cosma_backend.app import App
+    current_app: App
 
 watch_bp = Blueprint('watch', __name__)
 

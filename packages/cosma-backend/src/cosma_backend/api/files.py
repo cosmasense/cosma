@@ -11,7 +11,8 @@ from quart import Blueprint, current_app
 from quart_schema import validate_request, validate_response
 
 if TYPE_CHECKING:
-    from cosma_backend.app import app as current_app
+    from cosma_backend.app import App
+    current_app: App
 
 files_bp = Blueprint('files', __name__)
 

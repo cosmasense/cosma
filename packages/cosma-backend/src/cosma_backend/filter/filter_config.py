@@ -14,7 +14,7 @@ import shutil
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol
 
 from platformdirs import PlatformDirs
 
@@ -26,8 +26,28 @@ logger = get_logger(__name__)
 GLOBAL_CONFIG_FILENAME = "filter.json"  # Global config in app data dir
 LOCAL_CONFIG_FILENAME = ".cosmaconfig"   # Per-folder config
 
-# App directories (same as used by app.py and tui)
-APP_DIRS = PlatformDirs("cosma", ensure_exists=True)
+
+class _AppDirs(Protocol):
+    """Subset of platformdirs.PlatformDirs actually consumed by this module."""
+
+    @property
+    def user_config_dir(self) -> str: ...
+    @property
+    def user_data_dir(self) -> str: ...
+
+
+# Lazy default — only instantiated when a caller actually needs the real
+# user-config path. Creating `PlatformDirs(..., ensure_exists=True)` at import
+# time would materialize `~/Library/Application Support/cosma/` even during
+# test runs, which breaks isolation.
+_default_app_dirs: Optional[PlatformDirs] = None
+
+
+def _get_default_app_dirs() -> PlatformDirs:
+    global _default_app_dirs
+    if _default_app_dirs is None:
+        _default_app_dirs = PlatformDirs("cosma", ensure_exists=True)
+    return _default_app_dirs
 
 
 class FilterMode(str, Enum):
@@ -477,36 +497,45 @@ class FilterConfig:
             return False
 
     @classmethod
-    def get_default_global_path(cls) -> Path:
+    def get_default_global_path(cls, dirs: Optional[_AppDirs] = None) -> Path:
         """Get the default path for global config.
+
+        Args:
+            dirs: Override the app directories (tests pass a temp shim).
+                When None, falls back to the real PlatformDirs for "cosma".
 
         Returns path in app config directory:
         - macOS: ~/Library/Application Support/cosma/filter.json
         - Linux: ~/.config/cosma/filter.json
         - Windows: C:/Users/<user>/AppData/Local/cosma/filter.json
         """
-        return Path(APP_DIRS.user_config_dir) / GLOBAL_CONFIG_FILENAME
+        app_dirs = dirs if dirs is not None else _get_default_app_dirs()
+        return Path(app_dirs.user_config_dir) / GLOBAL_CONFIG_FILENAME
 
     @classmethod
-    def _migrate_from_data_dir(cls) -> None:
+    def _migrate_from_data_dir(cls, dirs: Optional[_AppDirs] = None) -> None:
         """Migrate filter config from user_data_dir to user_config_dir if needed."""
-        old_path = Path(APP_DIRS.user_data_dir) / GLOBAL_CONFIG_FILENAME
-        new_path = cls.get_default_global_path()
+        app_dirs = dirs if dirs is not None else _get_default_app_dirs()
+        old_path = Path(app_dirs.user_data_dir) / GLOBAL_CONFIG_FILENAME
+        new_path = cls.get_default_global_path(dirs=app_dirs)
         if old_path.exists() and not new_path.exists():
             new_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(old_path), str(new_path))
             logger.info("Migrated filter config", old=str(old_path), new=str(new_path))
 
     @classmethod
-    def load_global(cls) -> FilterConfig:
+    def load_global(cls, dirs: Optional[_AppDirs] = None) -> FilterConfig:
         """
         Load global filter config, creating default if not exists.
+
+        Args:
+            dirs: Override the app directories (tests pass a temp shim).
 
         Returns:
             FilterConfig instance (default if file doesn't exist)
         """
-        cls._migrate_from_data_dir()
-        global_path = cls.get_default_global_path()
+        cls._migrate_from_data_dir(dirs=dirs)
+        global_path = cls.get_default_global_path(dirs=dirs)
 
         config = cls.load_from_file(global_path)
         if config is not None:
@@ -557,7 +586,12 @@ class FilterConfig:
         return config
 
     @classmethod
-    def load_for_directory(cls, directory: Path, global_config: Optional[FilterConfig] = None) -> FilterConfig:
+    def load_for_directory(
+        cls,
+        directory: Path,
+        global_config: Optional[FilterConfig] = None,
+        dirs: Optional[_AppDirs] = None,
+    ) -> FilterConfig:
         """
         Load merged config for a specific directory.
 
@@ -568,13 +602,14 @@ class FilterConfig:
         Args:
             directory: Directory to load config for
             global_config: Optional pre-loaded global config
+            dirs: Override the app directories (only used when global_config is None)
 
         Returns:
             Merged FilterConfig
         """
         # Load global config if not provided
         if global_config is None:
-            global_config = cls.load_global()
+            global_config = cls.load_global(dirs=dirs)
 
         # Check for per-folder config (.cosmaconfig in the watched directory)
         folder_config_path = directory / LOCAL_CONFIG_FILENAME
@@ -671,7 +706,8 @@ class FilterConfigManager:
     Caches loaded configs and handles reloading on config file changes.
     """
 
-    def __init__(self):
+    def __init__(self, dirs: Optional[_AppDirs] = None):
+        self._dirs = dirs
         self._global_config: Optional[FilterConfig] = None
         self._directory_configs: dict[Path, FilterConfig] = {}
 
@@ -679,12 +715,12 @@ class FilterConfigManager:
     def global_config(self) -> FilterConfig:
         """Get the global config, loading if necessary."""
         if self._global_config is None:
-            self._global_config = FilterConfig.load_global()
+            self._global_config = FilterConfig.load_global(dirs=self._dirs)
         return self._global_config
 
     def reload_global(self) -> FilterConfig:
         """Force reload of global config."""
-        self._global_config = FilterConfig.load_global()
+        self._global_config = FilterConfig.load_global(dirs=self._dirs)
         # Invalidate all directory configs since they depend on global
         self._directory_configs.clear()
         return self._global_config

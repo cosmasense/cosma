@@ -16,7 +16,8 @@ from cosma_backend.models import File
 from cosma_backend.pipeline import Pipeline
 
 if TYPE_CHECKING:
-    from cosma_backend.app import app as current_app
+    from cosma_backend.app import App
+    current_app: App
 
 index_bp = Blueprint('index', __name__)
 

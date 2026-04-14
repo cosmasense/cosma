@@ -15,7 +15,8 @@ from quart_schema import validate_request, validate_response
 from cosma_backend.utils.pubsub import subscribe
 
 if TYPE_CHECKING:
-    from cosma_backend.app import app as current_app
+    from cosma_backend.app import App
+    current_app: App
 
 status_bp = Blueprint('status', __name__)
 
