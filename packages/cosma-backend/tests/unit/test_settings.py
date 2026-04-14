@@ -4,7 +4,6 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from platformdirs import PlatformDirs
 
 from cosma_backend.settings import (
     SettingsManager,
@@ -112,10 +111,13 @@ class TestSettingsManager:
         return config_dir
 
     @pytest.fixture
-    def manager(self, temp_config_dir):
-        """Create a SettingsManager with a temp config dir."""
-        dirs = PlatformDirs("cosma-test", ensure_exists=True)
-        mgr = SettingsManager(dirs)
+    def manager(self, temp_config_dir, isolated_app_dirs):
+        """Create a SettingsManager with a temp config dir.
+
+        Uses the shared `isolated_app_dirs` shim so nothing escapes to the real
+        user dirs even before `_toml_path` is overridden.
+        """
+        mgr = SettingsManager(isolated_app_dirs)
         # Override the TOML path to use temp dir
         mgr._toml_path = temp_config_dir / "settings.toml"
         return mgr

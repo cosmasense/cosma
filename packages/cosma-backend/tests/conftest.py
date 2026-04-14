@@ -2,6 +2,7 @@
 
 import asyncio
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator, Generator
@@ -13,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 from cosma_backend.db.database import Database
 from cosma_backend.models.file import File
 from cosma_backend.models.status import ProcessingStatus
-from cosma_backend.app import App
+from cosma_backend.app import App, create_app
 from cosma_backend.discoverer import Discoverer
 from cosma_backend.parser import FileParser
 from cosma_backend.summarizer import AutoSummarizer
@@ -107,17 +108,46 @@ def sample_file_data() -> dict:
     }
 
 
+@dataclass
+class _TestAppDirs:
+    """Test stand-in for PlatformDirs.
+
+    Exposes only the three properties cosma-backend reads (user_config_dir,
+    user_data_dir, user_log_dir). Pointing every dir at a temp directory is
+    what keeps tests from touching ~/Library/Application Support/cosma.
+    """
+    user_config_dir: str
+    user_data_dir: str
+    user_log_dir: str
+
+
+@pytest.fixture
+def isolated_app_dirs(tmp_path: Path) -> _TestAppDirs:
+    """Build per-test PlatformDirs pointing at a temp directory."""
+    config_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    log_dir = tmp_path / "logs"
+    for d in (config_dir, data_dir, log_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    return _TestAppDirs(
+        user_config_dir=str(config_dir),
+        user_data_dir=str(data_dir),
+        user_log_dir=str(log_dir),
+    )
+
+
 @pytest_asyncio.fixture
-async def app_instance() -> AsyncGenerator[App, None]:
-    """Create a test instance of the Quart app using the real app with routes."""
-    # Import the actual app from app.py which has all routes registered
-    from cosma_backend.app import app as real_app
+async def app_instance(isolated_app_dirs: _TestAppDirs) -> AsyncGenerator[App, None]:
+    """Build a fresh backend App per test, isolated from the real user dirs.
 
-    # Override config for testing
-    real_app.config["TESTING"] = True
-    real_app.config["DATABASE_PATH"] = ":memory:"
+    Uses `create_app(dirs=...)` so settings/filter/log/db paths all resolve
+    into the tmp directory. No port is bound — callers use `app.test_client()`.
+    """
+    app = create_app(dirs=isolated_app_dirs)
+    app.config["TESTING"] = True
+    app.config["DATABASE_PATH"] = ":memory:"
 
-    yield real_app
+    yield app
 
 
 @pytest_asyncio.fixture

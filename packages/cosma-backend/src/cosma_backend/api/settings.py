@@ -15,7 +15,8 @@ from quart import Blueprint, current_app, request
 from cosma_backend.logging import get_logger
 
 if TYPE_CHECKING:
-    from cosma_backend.app import app as current_app
+    from cosma_backend.app import App
+    current_app: App
 
 logger = get_logger(__name__)
 

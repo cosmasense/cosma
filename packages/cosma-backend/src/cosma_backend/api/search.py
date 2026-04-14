@@ -13,7 +13,8 @@ from quart_schema import validate_request, validate_response
 from cosma_backend.api.models import FileResponse
 
 if TYPE_CHECKING:
-    from cosma_backend.app import app as current_app
+    from cosma_backend.app import App
+    current_app: App
 
 search_bp = Blueprint('search', __name__)
 

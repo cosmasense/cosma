@@ -1,14 +1,16 @@
-from .app import app as app
-from .app import run as run
+from .app import App as App, create_app as create_app, run as run
+
 
 def serve():
     import uvicorn
-    
+
+    app = create_app()
     uvicorn.run(
-        app, host="127.0.0.1",
-        port=60534,
+        app,
+        host=app.config["HOST"],
+        port=app.config["PORT"],
         log_level="info",
         # I can't find a way to gracefully shut down SSE connections,
         # so this bullshit will have to do for now
-        timeout_graceful_shutdown=5
+        timeout_graceful_shutdown=5,
     )

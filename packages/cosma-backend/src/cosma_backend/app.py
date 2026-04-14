@@ -10,7 +10,7 @@ Main Quart web application that orchestrates all backend services:
 - Model Lifecycle: Automatic unloading of idle AI models
 
 Application lifecycle:
-1. App instance created, config loaded from env vars + TOML
+1. `create_app()` builds an App, loads config, registers blueprints + hooks
 2. `before_serving`: Initialize DB, services, start background tasks
 3. Request handling via API blueprints
 4. `after_serving`: Graceful shutdown of all services
@@ -18,8 +18,9 @@ Application lifecycle:
 
 import asyncio
 import datetime
+import os
 from pathlib import Path
-from typing import Coroutine
+from typing import Coroutine, Optional, Protocol
 
 from dotenv import load_dotenv
 from platformdirs import PlatformDirs
@@ -47,13 +48,28 @@ from cosma_backend.watcher import Watcher
 
 load_dotenv()
 
-import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Limit PyTorch MPS memory usage (set before torch is imported)
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.75")
 
 configure_logging()
 logger = get_logger(__name__)
+
+
+class AppDirs(Protocol):
+    """Minimal subset of `platformdirs.PlatformDirs` used by the backend.
+
+    Any object exposing these three properties is accepted — this lets tests
+    pass a temp-directory shim without touching real user dirs.
+    """
+
+    @property
+    def user_config_dir(self) -> str: ...
+    @property
+    def user_data_dir(self) -> str: ...
+    @property
+    def user_log_dir(self) -> str: ...
+
 
 class App(Quart):
     """
@@ -80,18 +96,21 @@ class App(Quart):
     # Configuration
     filter_manager: FilterConfigManager  # Include/exclude patterns
     settings_manager: SettingsManager    # Persistent TOML settings
-    dirs: PlatformDirs                   # Platform-specific directories
+    dirs: AppDirs                        # Platform-specific directories
 
     # Background processing
     indexing_queue: IndexingQueue        # Async file processing queue
     scheduler: Scheduler                 # Conditional queue processing
     model_lifecycle: ModelLifecycleManager  # Auto-unload idle models
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, dirs: Optional[AppDirs] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.updates_hub = Hub()
         self.jobs = set()
-        self.filter_manager = FilterConfigManager()
+        # Caller-supplied dirs take priority over the default PlatformDirs.
+        # Tests set this to a temp-directory shim so nothing touches
+        # ~/Library/Application Support/cosma.
+        self._dirs_override: Optional[AppDirs] = dirs
 
     def initialize_config(self) -> None:
         """
@@ -106,7 +125,10 @@ class App(Quart):
 
         # Bootstrap settings (env vars only, needed before app starts)
         self.config.setdefault("APP_NAME", "cosma")
-        self.dirs = PlatformDirs(self.config["APP_NAME"], ensure_exists=True)
+        if self._dirs_override is not None:
+            self.dirs = self._dirs_override
+        else:
+            self.dirs = PlatformDirs(self.config["APP_NAME"], ensure_exists=True)
         log_path = Path(self.dirs.user_log_dir) / "cosma-backend.log"
         configure_logging(log_path=log_path)
         logger = get_logger(__name__)
@@ -114,7 +136,9 @@ class App(Quart):
         self.config.setdefault("PORT", 60534)
         self.config.setdefault("DATABASE_PATH", Path(self.dirs.user_data_dir) / "app.db")
 
-        # Load persistent settings from TOML (model configs, queue settings, etc.)
+        # Filter and settings managers are bound to whichever dirs the app
+        # ended up with — real PlatformDirs in prod, temp shim in tests.
+        self.filter_manager = FilterConfigManager(dirs=self.dirs)
         self.settings_manager = SettingsManager(self.dirs)
         self.settings_manager.load()
 
@@ -140,166 +164,6 @@ class App(Quart):
         task.add_done_callback(remove_task_callback)
 
         return task
-        
-
-app = App(__name__)
-app.initialize_config()
-QuartSchema(app)
-
-# Register API blueprints
-app.register_blueprint(api_blueprint, url_prefix='/api')
-
-@app.before_serving
-async def initialize_services():
-    """Two-phase startup: API-ready first, heavy models load in background.
-
-    Phase 1 (blocking): DB + filter + services created (no model loading)
-           → API is reachable, frontend can connect
-    Phase 2 (background): Load embedding model + start indexing + watcher
-           → Search becomes available, then indexing starts
-    """
-    # ── Phase 1: Fast startup — get the API responding ──
-    logger.info("Phase 1: Initializing database and core services")
-    app.db = await db.connect(app.config['DATABASE_PATH'])
-
-    global_config = app.filter_manager.global_config
-    logger.info("Filter config loaded",
-                  mode=global_config.mode.value,
-                  include_count=len(global_config.include),
-                  config_path=str(global_config.config_path))
-
-    settings = app.settings_manager.settings
-
-    # Apply GPU memory cap from settings.
-    #
-    # IMPORTANT: the cap affects different backends differently:
-    #   * PyTorch / MPS (embedder, local whisper) — honors
-    #     PYTORCH_MPS_HIGH_WATERMARK_RATIO directly.
-    #   * llama.cpp (summarizer via llama-cpp-python) — uses its own Metal
-    #     backend. Memory usage is controlled by `summarizer.llamacpp.n_gpu_layers`
-    #     (negative = all layers on GPU, positive = N layers only). Metal
-    #     respects system memory pressure automatically.
-    #   * Ollama — runs as a separate process. Configure Ollama itself via
-    #     OLLAMA_NUM_GPU / OLLAMA_KEEP_ALIVE env vars before launching it;
-    #     this setting has no direct effect on an already-running Ollama server.
-    gpu_cap = settings.queue.gpu_memory_cap
-    if not (0.0 < gpu_cap <= 1.0):
-        logger.warning("Invalid gpu_memory_cap, falling back to 0.75",
-                      configured=gpu_cap)
-        gpu_cap = 0.75
-    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = str(gpu_cap)
-
-    # Hint for any Ollama instance spawned in this environment
-    os.environ.setdefault("OLLAMA_KEEP_ALIVE", "5m")
-
-    logger.info(
-        "GPU memory cap applied",
-        gpu_cap=f"{gpu_cap:.0%}",
-        affects="torch (embedder, local whisper)",
-        note="llama.cpp uses n_gpu_layers; Ollama uses its own env config",
-    )
-
-    discoverer = Discoverer()
-    parser = FileParser(config=settings.parser)
-    summarizer = AutoSummarizer(config=settings.summarizer)
-
-    # Create embedder WITHOUT eager model loading — stays lazy
-    embedder = AutoEmbedder(config=settings.embedder, preferred_provider="lazy_local")
-
-    app.pipeline = Pipeline(
-        db=app.db, updates_hub=app.updates_hub,
-        parser=parser, discoverer=discoverer,
-        summarizer=summarizer, embedder=embedder,
-    )
-    app.searcher = HybridSearcher(db=app.db, embedder=embedder)
-
-    app.indexing_queue = IndexingQueue(
-        pipeline=app.pipeline, updates_hub=app.updates_hub,
-        config=settings.queue, db=app.db,
-    )
-    app.model_lifecycle = ModelLifecycleManager(
-        summarizer=summarizer,
-        idle_unload_seconds=settings.summarizer.idle_unload_seconds,
-        embedder=embedder,
-    )
-
-    logger.info("Phase 1 complete — API is ready")
-
-    # ── Phase 2: Background — load models and start indexing ──
-    # Start indexing services immediately (non-blocking async)
-    await app.indexing_queue.start()
-    app.scheduler = Scheduler(
-        queue=app.indexing_queue, updates_hub=app.updates_hub,
-        config=settings.scheduler,
-    )
-    app.indexing_queue.set_pre_task_hook(app.scheduler.evaluate_and_apply)
-    app.scheduler.start()
-    app.model_lifecycle.start()
-
-    app.watcher = Watcher(
-        db=app.db, pipeline=app.pipeline,
-        filter_manager=app.filter_manager,
-        indexing_queue=app.indexing_queue,
-    )
-
-    # Progress tracking for Phase 2 (0.0 → 1.0)
-    app._deferred_init_progress: float = 0.0
-    app._model_loading_done = asyncio.Event()
-
-    async def _model_loading_progress_updater():
-        """Smoothly increment progress from 10% → 78% over ~12 s while
-        the embedding model loads on a background thread."""
-        progress = 0.10
-        while not app._model_loading_done.is_set():
-            remaining = 0.78 - progress
-            if remaining > 0.01:
-                progress += remaining * 0.06
-                app._deferred_init_progress = progress
-            try:
-                await asyncio.wait_for(
-                    app._model_loading_done.wait(), timeout=0.3,
-                )
-                break
-            except asyncio.TimeoutError:
-                pass
-
-    async def _deferred_heavy_init():
-        """Load embedding model in a thread so it doesn't block the event loop.
-
-        This lets Uvicorn start accepting connections immediately after Phase 1
-        instead of waiting ~8s for the SentenceTransformer model to load.
-        Cancellation-safe: if SIGTERM arrives mid-load, the task is cancelled.
-        """
-        try:
-            app._deferred_init_progress = 0.05
-            logger.info("Phase 2: Loading embedding model...")
-            if embedder.preferred_provider in ("local", "lazy_local"):
-                embedder.preferred_provider = "local"
-                app._deferred_init_progress = 0.10
-                progress_task = asyncio.ensure_future(
-                    _model_loading_progress_updater(),
-                )
-                await asyncio.to_thread(embedder._eagerly_initialize_models)
-                app._model_loading_done.set()
-                await progress_task
-            app._deferred_init_progress = 0.80
-            logger.info("Embedding model loaded — search is ready")
-
-            logger.info("Running startup cleanup")
-            removed = await cleanup_excluded_files_on_startup(app.db, app.filter_manager)
-            if removed > 0:
-                logger.info("Cleanup complete", removed_files=removed)
-            app._deferred_init_progress = 0.90
-
-            await app.watcher.initialize_from_database()
-            app._deferred_init_progress = 1.0
-            logger.info("Phase 2 complete — indexing is ready")
-        except asyncio.CancelledError:
-            logger.info("Phase 2 cancelled (shutdown in progress)")
-        except Exception:
-            logger.exception("Error in deferred startup")
-
-    app._deferred_init_task = asyncio.ensure_future(_deferred_heavy_init())
 
 
 async def cleanup_excluded_files_on_startup(db: Database, filter_manager: FilterConfigManager) -> int:
@@ -379,91 +243,260 @@ async def cleanup_excluded_files_on_startup(db: Database, filter_manager: Filter
     return removed_count
 
 
-@app.after_serving
-async def handle_shutdown():
-    # Cancel Phase 2 if it's still running (e.g. model loading in thread).
-    # This prevents the shutdown from waiting on a slow model download.
-    deferred = getattr(app, "_deferred_init_task", None)
-    if deferred and not deferred.done():
-        logger.info("Shutdown: cancelling deferred startup")
-        deferred.cancel()
-        try:
-            await deferred
-        except (asyncio.CancelledError, Exception):
-            pass
+def create_app(dirs: Optional[AppDirs] = None) -> App:
+    """Build a fully-wired backend App.
 
-    logger.info("Shutdown: stopping lifecycle manager, scheduler, and indexing queue")
-    try:
-        await app.model_lifecycle.stop()
-    except Exception:
-        logger.exception("Error stopping model lifecycle manager")
-    try:
-        await app.scheduler.stop()
-    except Exception:
-        logger.exception("Error stopping scheduler")
-    try:
-        await app.indexing_queue.stop()
-    except Exception:
-        logger.exception("Error stopping indexing queue")
+    Args:
+        dirs: Optional override for platform directories. Production leaves this
+            unset and gets the default `PlatformDirs("cosma")`. Tests pass a
+            temp-directory shim so settings/logs/db stay isolated.
+    """
+    app = App(__name__, dirs=dirs)
+    app.initialize_config()
+    QuartSchema(app)
+    app.register_blueprint(api_blueprint, url_prefix='/api')
 
-    # Unload summarizer models — this is important for Ollama, which runs in a
-    # separate process and keeps the model pinned in GPU until explicitly told
-    # to release (via a request with keep_alive=0). Without this call, Ollama
-    # can hold 100% of GPU memory even after the backend quits.
-    logger.info("Shutdown: unloading summarizer models")
-    try:
-        summarizer = getattr(app.pipeline, "summarizer", None)
-        if summarizer is not None and hasattr(summarizer, "unload_models"):
-            await asyncio.wait_for(summarizer.unload_models(), timeout=3.0)
-    except asyncio.TimeoutError:
-        logger.warning("Summarizer unload timed out after 3s")
-    except Exception:
-        logger.exception("Error unloading summarizer models")
+    @app.before_serving
+    async def initialize_services():
+        """Two-phase startup: API-ready first, heavy models load in background.
 
-    # Unload Whisper if it was loaded
-    try:
-        from cosma_backend.parser.media import unload_whisper_model
-        unload_whisper_model()
-    except Exception:
-        logger.exception("Error unloading whisper model")
+        Phase 1 (blocking): DB + filter + services created (no model loading)
+               → API is reachable, frontend can connect
+        Phase 2 (background): Load embedding model + start indexing + watcher
+               → Search becomes available, then indexing starts
+        """
+        # ── Phase 1: Fast startup — get the API responding ──
+        logger.info("Phase 1: Initializing database and core services")
+        app.db = await db.connect(app.config['DATABASE_PATH'])
 
-    logger.info("Shutdown: closing DB")
-    try:
-        await app.db.close()
-    except Exception:
-        logger.exception("Error closing DB")
+        global_config = app.filter_manager.global_config
+        logger.info("Filter config loaded",
+                      mode=global_config.mode.value,
+                      include_count=len(global_config.include),
+                      config_path=str(global_config.config_path))
 
-    logger.info("Shutdown complete")
-    
+        settings = app.settings_manager.settings
 
-@app.before_request
-async def log_request():
-    request.start_time = datetime.datetime.now()
-    logger.info(
-        "Incoming request",
-        method=request.method,
-        path=request.path,
-        remote_addr=request.remote_addr,
-        user_agent=request.headers.get('User-Agent')
-    )
+        # Apply GPU memory cap from settings.
+        #
+        # IMPORTANT: the cap affects different backends differently:
+        #   * PyTorch / MPS (embedder, local whisper) — honors
+        #     PYTORCH_MPS_HIGH_WATERMARK_RATIO directly.
+        #   * llama.cpp (summarizer via llama-cpp-python) — uses its own Metal
+        #     backend. Memory usage is controlled by `summarizer.llamacpp.n_gpu_layers`
+        #     (negative = all layers on GPU, positive = N layers only). Metal
+        #     respects system memory pressure automatically.
+        #   * Ollama — runs as a separate process. Configure Ollama itself via
+        #     OLLAMA_NUM_GPU / OLLAMA_KEEP_ALIVE env vars before launching it;
+        #     this setting has no direct effect on an already-running Ollama server.
+        gpu_cap = settings.queue.gpu_memory_cap
+        if not (0.0 < gpu_cap <= 1.0):
+            logger.warning("Invalid gpu_memory_cap, falling back to 0.75",
+                          configured=gpu_cap)
+            gpu_cap = 0.75
+        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = str(gpu_cap)
 
-@app.after_request
-async def log_response(response):
-    if hasattr(request, 'start_time'):
-        duration = (datetime.datetime.now() - request.start_time).total_seconds()
+        # Hint for any Ollama instance spawned in this environment
+        os.environ.setdefault("OLLAMA_KEEP_ALIVE", "5m")
+
         logger.info(
-            "Request completed",
+            "GPU memory cap applied",
+            gpu_cap=f"{gpu_cap:.0%}",
+            affects="torch (embedder, local whisper)",
+            note="llama.cpp uses n_gpu_layers; Ollama uses its own env config",
+        )
+
+        discoverer = Discoverer()
+        parser = FileParser(config=settings.parser)
+        summarizer = AutoSummarizer(config=settings.summarizer)
+
+        # Create embedder WITHOUT eager model loading — stays lazy
+        embedder = AutoEmbedder(config=settings.embedder, preferred_provider="lazy_local")
+
+        app.pipeline = Pipeline(
+            db=app.db, updates_hub=app.updates_hub,
+            parser=parser, discoverer=discoverer,
+            summarizer=summarizer, embedder=embedder,
+        )
+        app.searcher = HybridSearcher(db=app.db, embedder=embedder)
+
+        app.indexing_queue = IndexingQueue(
+            pipeline=app.pipeline, updates_hub=app.updates_hub,
+            config=settings.queue, db=app.db,
+        )
+        app.model_lifecycle = ModelLifecycleManager(
+            summarizer=summarizer,
+            idle_unload_seconds=settings.summarizer.idle_unload_seconds,
+            embedder=embedder,
+        )
+
+        logger.info("Phase 1 complete — API is ready")
+
+        # ── Phase 2: Background — load models and start indexing ──
+        # Start indexing services immediately (non-blocking async)
+        await app.indexing_queue.start()
+        app.scheduler = Scheduler(
+            queue=app.indexing_queue, updates_hub=app.updates_hub,
+            config=settings.scheduler,
+        )
+        app.indexing_queue.set_pre_task_hook(app.scheduler.evaluate_and_apply)
+        app.scheduler.start()
+        app.model_lifecycle.start()
+
+        app.watcher = Watcher(
+            db=app.db, pipeline=app.pipeline,
+            filter_manager=app.filter_manager,
+            indexing_queue=app.indexing_queue,
+        )
+
+        # Progress tracking for Phase 2 (0.0 → 1.0)
+        app._deferred_init_progress: float = 0.0
+        app._model_loading_done = asyncio.Event()
+
+        async def _model_loading_progress_updater():
+            """Smoothly increment progress from 10% → 78% over ~12 s while
+            the embedding model loads on a background thread."""
+            progress = 0.10
+            while not app._model_loading_done.is_set():
+                remaining = 0.78 - progress
+                if remaining > 0.01:
+                    progress += remaining * 0.06
+                    app._deferred_init_progress = progress
+                try:
+                    await asyncio.wait_for(
+                        app._model_loading_done.wait(), timeout=0.3,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+        async def _deferred_heavy_init():
+            """Load embedding model in a thread so it doesn't block the event loop.
+
+            This lets Uvicorn start accepting connections immediately after Phase 1
+            instead of waiting ~8s for the SentenceTransformer model to load.
+            Cancellation-safe: if SIGTERM arrives mid-load, the task is cancelled.
+            """
+            try:
+                app._deferred_init_progress = 0.05
+                logger.info("Phase 2: Loading embedding model...")
+                if embedder.preferred_provider in ("local", "lazy_local"):
+                    embedder.preferred_provider = "local"
+                    app._deferred_init_progress = 0.10
+                    progress_task = asyncio.ensure_future(
+                        _model_loading_progress_updater(),
+                    )
+                    await asyncio.to_thread(embedder._eagerly_initialize_models)
+                    app._model_loading_done.set()
+                    await progress_task
+                app._deferred_init_progress = 0.80
+                logger.info("Embedding model loaded — search is ready")
+
+                logger.info("Running startup cleanup")
+                removed = await cleanup_excluded_files_on_startup(app.db, app.filter_manager)
+                if removed > 0:
+                    logger.info("Cleanup complete", removed_files=removed)
+                app._deferred_init_progress = 0.90
+
+                await app.watcher.initialize_from_database()
+                app._deferred_init_progress = 1.0
+                logger.info("Phase 2 complete — indexing is ready")
+            except asyncio.CancelledError:
+                logger.info("Phase 2 cancelled (shutdown in progress)")
+            except Exception:
+                logger.exception("Error in deferred startup")
+
+        app._deferred_init_task = asyncio.ensure_future(_deferred_heavy_init())
+
+    @app.after_serving
+    async def handle_shutdown():
+        # Cancel Phase 2 if it's still running (e.g. model loading in thread).
+        # This prevents the shutdown from waiting on a slow model download.
+        deferred = getattr(app, "_deferred_init_task", None)
+        if deferred and not deferred.done():
+            logger.info("Shutdown: cancelling deferred startup")
+            deferred.cancel()
+            try:
+                await deferred
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        logger.info("Shutdown: stopping lifecycle manager, scheduler, and indexing queue")
+        try:
+            await app.model_lifecycle.stop()
+        except Exception:
+            logger.exception("Error stopping model lifecycle manager")
+        try:
+            await app.scheduler.stop()
+        except Exception:
+            logger.exception("Error stopping scheduler")
+        try:
+            await app.indexing_queue.stop()
+        except Exception:
+            logger.exception("Error stopping indexing queue")
+
+        # Unload summarizer models — this is important for Ollama, which runs in a
+        # separate process and keeps the model pinned in GPU until explicitly told
+        # to release (via a request with keep_alive=0). Without this call, Ollama
+        # can hold 100% of GPU memory even after the backend quits.
+        logger.info("Shutdown: unloading summarizer models")
+        try:
+            summarizer = getattr(app.pipeline, "summarizer", None)
+            if summarizer is not None and hasattr(summarizer, "unload_models"):
+                await asyncio.wait_for(summarizer.unload_models(), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning("Summarizer unload timed out after 3s")
+        except Exception:
+            logger.exception("Error unloading summarizer models")
+
+        # Unload Whisper if it was loaded
+        try:
+            from cosma_backend.parser.media import unload_whisper_model
+            unload_whisper_model()
+        except Exception:
+            logger.exception("Error unloading whisper model")
+
+        logger.info("Shutdown: closing DB")
+        try:
+            await app.db.close()
+        except Exception:
+            logger.exception("Error closing DB")
+
+        logger.info("Shutdown complete")
+
+    @app.before_request
+    async def log_request():
+        request.start_time = datetime.datetime.now()
+        logger.info(
+            "Incoming request",
             method=request.method,
             path=request.path,
-            status_code=response.status_code,
-            duration_seconds=duration
+            remote_addr=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
         )
-    return response
+
+    @app.after_request
+    async def log_response(response):
+        if hasattr(request, 'start_time'):
+            duration = (datetime.datetime.now() - request.start_time).total_seconds()
+            logger.info(
+                "Request completed",
+                method=request.method,
+                path=request.path,
+                status_code=response.status_code,
+                duration_seconds=duration
+            )
+        return response
+
+    return app
 
 
 # ====== Application Entry Point ======
 
 def run() -> None:
+    """Production entrypoint: build the default app and serve it with Quart's
+    dev server. The uvicorn-based path lives in `cosma_backend.serve`."""
+    app = create_app()
     app.run(
         host=app.config['HOST'],
         port=app.config['PORT'],

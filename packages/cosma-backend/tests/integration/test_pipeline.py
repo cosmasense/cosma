@@ -105,7 +105,7 @@ class TestPipeline:
         await test_pipeline.db.upsert_file(file_obj)
         
         # Check if file should be skipped
-        should_skip = await test_pipeline._should_skip_file(file_obj)
+        should_skip, _saved = await test_pipeline._should_skip_file(file_obj)
         assert should_skip is True
 
     async def test_should_process_modified_file(self, test_pipeline: Pipeline, temp_file_dir: Path):
@@ -124,7 +124,7 @@ class TestPipeline:
         current_file_obj = File.from_path(test_file)
         
         # Check if file should be skipped (it shouldn't be)
-        should_skip = await test_pipeline._should_skip_file(current_file_obj)
+        should_skip, _saved = await test_pipeline._should_skip_file(current_file_obj)
         assert should_skip is False
 
     async def test_has_file_changed_by_hash(self, test_pipeline: Pipeline, temp_file_dir: Path):
