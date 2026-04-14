@@ -230,32 +230,60 @@ class Scheduler:
     # Monitor loop
     # ------------------------------------------------------------------
 
+    async def evaluate_and_apply(self) -> bool:
+        """Collect fresh metrics, evaluate rules, and pause/resume the queue.
+
+        This is the primary entry point — it is called by the IndexingQueue
+        at each task boundary so pause/resume decisions react to real
+        instantaneous GPU/CPU/memory state without a fixed polling interval
+        (which would otherwise cause start/pause thrashing mid-task).
+
+        Returns True if conditions allow processing, False if paused.
+        """
+        async with self._config_lock:
+            enabled = self._config.enabled
+            has_rules = bool(self._config.rules)
+
+        if not (enabled and has_rules):
+            if not self._conditions_met:
+                self._conditions_met = True
+                self._queue.scheduler_resume()
+            return True
+
+        metrics = await self._collector.collect()
+        self._last_metrics = metrics
+
+        async with self._config_lock:
+            met = self._evaluate_rules(metrics)
+
+        if met != self._conditions_met:
+            self._conditions_met = met
+            if met:
+                self._queue.scheduler_resume()
+            else:
+                self._queue.scheduler_pause()
+        return met
+
     async def _monitor_loop(self) -> None:
+        """Backstop for time-based rules while the queue is idle.
+
+        Rule evaluation is primarily driven by the indexing queue at task
+        boundaries (see ``evaluate_and_apply``). This loop runs at a coarse
+        interval just to catch conditions that can change with no queue
+        activity — e.g. a ``time_window`` rule opening while nothing is
+        being processed.
+        """
         while True:
             try:
                 async with self._config_lock:
-                    enabled = self._config.enabled
-                    has_rules = bool(self._config.rules)
                     interval = self._config.check_interval_seconds
 
-                if enabled and has_rules:
-                    metrics = await self._collector.collect()
-                    self._last_metrics = metrics
-
-                    async with self._config_lock:
-                        met = self._evaluate_rules(metrics)
-
-                    if met != self._conditions_met:
-                        self._conditions_met = met
-                        if met:
-                            self._queue.scheduler_resume()
-                        else:
-                            self._queue.scheduler_pause()
-                else:
-                    # Scheduler disabled — make sure queue isn't scheduler-paused
-                    if not self._conditions_met:
-                        self._conditions_met = True
-                        self._queue.scheduler_resume()
+                # Only evaluate when the queue is idle — the queue's
+                # task-boundary hook handles the active-work case. This
+                # avoids competing with the hook and eliminates any
+                # mid-task metric polling.
+                if self._queue.queue_size == 0:
+                    await self.evaluate_and_apply()
 
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:

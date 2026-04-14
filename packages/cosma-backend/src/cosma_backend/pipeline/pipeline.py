@@ -109,16 +109,17 @@ class Pipeline:
                 await self.db.update_file_timestamp(file.file_path)
 
                 # Check if file needs processing
-                if await self._should_skip_file(file):
+                should_skip, saved_file = await self._should_skip_file(file)
+                if should_skip:
                     logger.info("Skipping processing file", file=file)
                     self._publish_update(Update.file_skipped(
-                        file.file_path, 
-                        file.filename, 
+                        file.file_path,
+                        file.filename,
                         reason="already processed"
                     ))
                     # result.skipped += 1
                     continue
-                
+
                 # Process the file through the pipeline
                 await self.process_file(file)
 
@@ -168,7 +169,8 @@ class Pipeline:
                 # Touch the timestamp so stale-file cleanup knows this file still exists
                 await self.db.update_file_timestamp(file.file_path)
 
-                if await self._should_skip_file(file):
+                should_skip, _saved = await self._should_skip_file(file)
+                if should_skip:
                     self._publish_update(Update.file_skipped(
                         file.file_path, file.filename, reason="already processed"
                     ))
@@ -246,13 +248,18 @@ class Pipeline:
             await self._save_to_db(file)
             self._publish_update(Update.file_summarized(file.file_path, file.filename))
             
-            # Stage 3: Embed (if embedder is available)
-            self._publish_update(Update.file_embedding(file.file_path, file.filename))
-            await self.embedder.embed(file)
-            # embeddings need special care when saving
-            await self._save_embeddings(file)
-            self._publish_update(Update.file_embedded(file.file_path, file.filename))
-            
+            # Stage 3: Embed — non-fatal; file is still FTS-searchable without embeddings
+            try:
+                self._publish_update(Update.file_embedding(file.file_path, file.filename))
+                await self.embedder.embed(file)
+                await self._save_embeddings(file)
+                self._publish_update(Update.file_embedded(file.file_path, file.filename))
+            except Exception as embed_err:
+                logger.warning("Embedding failed, file saved without embeddings",
+                               file=file.file_path, error=str(embed_err))
+                # File is still COMPLETE for FTS — just missing semantic search
+                file.status = ProcessingStatus.COMPLETE
+
             # Mark as complete
             self._publish_update(Update.file_complete(file.file_path, file.filename))
             
@@ -283,37 +290,43 @@ class Pipeline:
         """Check if a file is supported for processing"""
         return self.parser.is_supported(file)
     
-    async def _should_skip_file(self, file: File) -> bool:
-        """Check if file should be skipped based on DB state."""
+    async def _should_skip_file(self, file: File) -> tuple[bool, File | None]:
+        """Check if file should be skipped based on DB state.
+
+        Returns (should_skip, saved_file) so callers can reuse the DB record.
+        """
         if not await self.is_supported(file):
             logger.debug("Skipping unsupported file", file=file.file_path)
-            return True
+            return True, None
 
         saved_file = await self.db.get_file_by_path(file.file_path)
 
         # File not in DB or not yet fully processed - don't skip
         if not saved_file or saved_file.status not in (ProcessingStatus.COMPLETE, ProcessingStatus.FAILED):
             logger.debug("File needs processing", file=file.file_path, status=saved_file.status if saved_file else "not in DB")
-            return False
-            
+            return False, saved_file
+
         saved_modified = saved_file.modified.replace(microsecond=0)
         current_modified = file.modified.replace(microsecond=0)
-        
+
         logger.info("Should skip", file=file, saved_modified=saved_modified, current_modified=current_modified)
-            
-        return saved_modified == current_modified
 
+        return saved_modified == current_modified, saved_file
 
+    async def _has_file_changed(self, file: File, saved_file: File | None = None) -> bool:
+        """Check if file content has changed based on hash.
 
-    async def _has_file_changed(self, file: File) -> bool:
-        """Check if file has been changed based on hash."""
-        saved_file = await self.db.get_file_by_path(file.file_path)
-        
+        Accepts an optional pre-fetched ``saved_file`` to avoid a redundant
+        DB query when the caller already has it.
+        """
+        if saved_file is None:
+            saved_file = await self.db.get_file_by_path(file.file_path)
+
         logger.info("Saved file", saved_file=saved_file, status=saved_file.status if saved_file else "N/A")
-        
+
         if not saved_file or saved_file.status is not ProcessingStatus.COMPLETE:
             return True
-            
+
         return saved_file.content_hash != file.content_hash
     
     def _apply_fallback_indexing(self, file: File) -> None:

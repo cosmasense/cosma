@@ -60,6 +60,10 @@ async def extract_audio_transcript(path: Path, config: ParserConfig | None = Non
     """
     Extract transcript from audio file using configurable backends.
 
+    Includes automatic fallback: if the preferred backend is unavailable
+    (e.g., local openai-whisper not installed), tries the other available
+    backend instead of silently failing.
+
     Args:
         path: Path to audio file
         config: ParserConfig instance
@@ -71,35 +75,74 @@ async def extract_audio_transcript(path: Path, config: ParserConfig | None = Non
     from cosma_backend.settings import ParserConfig as _ParserConfig
     cfg = config or _ParserConfig()
     provider = backend or cfg.whisper.provider
-    
+
     # Map provider names to backend names
     backend_map = {"online": "openai", "local": "local", "openai": "openai"}
-    backend = backend_map.get(provider, "openai")
-    
+    preferred = backend_map.get(provider, "openai")
+
     if not path.exists():
         logger.warning("Audio file not found", path=str(path))
         return None
-        
-    logger.info("Extracting audio transcript", 
-               path=str(path), 
-               backend=backend,
+
+    # Build fallback order: preferred first, then the other backend as fallback
+    backends_to_try: list[str] = [preferred]
+    if preferred == "local":
+        backends_to_try.append("openai")
+    elif preferred == "openai":
+        backends_to_try.append("local")
+
+    logger.info("Extracting audio transcript",
+               path=str(path),
+               preferred=preferred,
                size=path.stat().st_size)
-    
-    try:
-        if backend == "openai":
-            return await _transcribe_with_openai(path)
-        elif backend == "local":
-            return await _transcribe_with_local_whisper(path)
-        else:
-            logger.error("Unknown Whisper backend", backend=backend)
-            return None
-            
-    except Exception as e:
-        logger.exception("Audio transcription failed", 
-                        path=str(path), 
-                        backend=backend,
-                        error=str(e))
-        return None
+
+    last_error: str | None = None
+    for attempt_backend in backends_to_try:
+        try:
+            if attempt_backend == "openai":
+                # Skip openai if no API key configured — save time and give a
+                # clearer error path.
+                if not os.getenv("OPENAI_API_KEY"):
+                    last_error = "OpenAI API key not set (OPENAI_API_KEY)"
+                    logger.info("Skipping OpenAI transcription",
+                               path=str(path), reason=last_error)
+                    continue
+                result = await _transcribe_with_openai(path)
+            elif attempt_backend == "local":
+                # Quick pre-check: is the local whisper library importable?
+                import importlib.util
+                if importlib.util.find_spec("whisper") is None and not await _check_whisper_cpp_available():
+                    last_error = "Neither openai-whisper nor whisper.cpp is installed"
+                    logger.warning("Local whisper unavailable, will try fallback",
+                                   path=str(path), reason=last_error)
+                    continue
+                result = await _transcribe_with_local_whisper(path)
+            else:
+                logger.error("Unknown Whisper backend", backend=attempt_backend)
+                continue
+
+            if result:
+                if attempt_backend != preferred:
+                    logger.info("Fell back to alternate backend successfully",
+                               path=str(path),
+                               preferred=preferred,
+                               used=attempt_backend)
+                return result
+
+            # None returned but no exception — treat as soft failure, try next
+            last_error = f"{attempt_backend} backend returned no transcript"
+
+        except Exception as e:
+            last_error = f"{attempt_backend} raised: {e}"
+            logger.exception("Audio transcription backend failed, trying fallback",
+                            path=str(path),
+                            backend=attempt_backend,
+                            error=str(e))
+
+    logger.warning("All audio transcription backends failed",
+                   path=str(path),
+                   last_error=last_error)
+    return None
 
 
 from dataclasses import dataclass, field
@@ -201,6 +244,7 @@ async def _extract_video_frames(path: Path, num_frames: int = DEFAULT_NUM_FRAMES
         List of JPEG-encoded frame bytes
     """
     frames: list[bytes] = []
+    MAX_TOTAL_FRAME_SIZE = 50 * 1024 * 1024  # 50MB total limit for all frames
 
     try:
         # First, get video duration
@@ -224,11 +268,18 @@ async def _extract_video_frames(path: Path, num_frames: int = DEFAULT_NUM_FRAMES
                 for i in range(num_frames)
             ]
 
-        # Extract each frame
+        # Extract each frame with total size tracking
+        total_frame_size = 0
         for i, ts in enumerate(timestamps):
             frame_data = await _extract_single_frame(path, ts)
             if frame_data:
+                if total_frame_size + len(frame_data) > MAX_TOTAL_FRAME_SIZE:
+                    logger.warning("Frame extraction size limit reached",
+                                  frames_extracted=len(frames),
+                                  total_size=total_frame_size)
+                    break
                 frames.append(frame_data)
+                total_frame_size += len(frame_data)
                 logger.debug("Extracted frame", index=i, timestamp=ts)
 
         logger.info("Frames extracted from video",
@@ -659,7 +710,11 @@ async def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
         return None
 
     except ImportError:
-        logger.error("Whisper library not installed - install with: pip install openai-whisper")
+        logger.warning(
+            "openai-whisper package not installed — "
+            "install with `uv pip install openai-whisper` or configure "
+            "Whisper provider to 'online' in Settings"
+        )
         return None
     except Exception as e:
         logger.exception("Whisper Python error", error=str(e))

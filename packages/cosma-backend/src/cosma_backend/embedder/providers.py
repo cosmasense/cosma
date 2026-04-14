@@ -184,8 +184,9 @@ class LocalEmbedder(BaseEmbedder):
         from sentence_transformers import SentenceTransformer
         logger.info("Loading local embedding model on first use",
                      model=self.model_name, dimensions=self.configured_dimensions)
-        self.model = SentenceTransformer(self.model_name)
-        logger.info("Local embedding model loaded", model=self.model_name)
+        # Force CPU to avoid MPS sdpa assertion crash on Apple Silicon
+        self.model = SentenceTransformer(self.model_name, device="cpu")
+        logger.info("Local embedding model loaded", model=self.model_name, device="cpu")
 
     def unload_model(self) -> None:
         """Unload the model to free memory."""

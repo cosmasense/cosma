@@ -37,3 +37,5 @@ class JobResponse:
     last_scan: datetime | None
     created_at: datetime | None
     updated_at: datetime | None
+    file_count: int = 0        # total indexed files in DB for this directory
+    total_files: int = 0       # total files on disk (from last discovery)

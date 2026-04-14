@@ -112,6 +112,10 @@ class BaseSummarizer(ABC):
         chunks = await chunk_content(content, self.max_tokens, self.chunk_overlap, self.model)
         logger.info("Content chunked (noverify)", num_chunks=len(chunks))
 
+        if not chunks:
+            logger.warning("Chunking produced no output, returning content as single chunk")
+            return [content]
+
         max_chunks = self.config.max_chunks
 
         # Use fast estimation for chunk statistics (sample a few chunks for accurate check)
@@ -132,8 +136,8 @@ class BaseSummarizer(ABC):
             logger.info("Content chunked", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_sample=max_chunk_tokens)
 
         if len(chunks) > max_chunks:
-            logger.warning("Too many chunks, will not summarize", chunks=len(chunks), max_chunks=max_chunks)
-            raise RuntimeError("Too many chunks to summarize")
+            logger.warning("Too many chunks, processing first N only", chunks=len(chunks), max_chunks=max_chunks)
+            chunks = chunks[:max_chunks]
 
         return chunks
 

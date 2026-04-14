@@ -23,6 +23,15 @@ status_bp = Blueprint('status', __name__)
 @status_bp.get("/")  # type: ignore[return-value]
 async def status():
     """Get current application status and active jobs count"""
+    embedder_ready = False
+    searcher = getattr(current_app, "searcher", None)
+    if searcher is not None:
+        embedder = getattr(searcher, "embedder", None)
+        if embedder is not None:
+            embedder_ready = embedder.is_model_loaded()
+    init_progress = getattr(current_app, "_deferred_init_progress", 0.0)
     return {
         "jobs": len(current_app.jobs),
+        "embedder_ready": embedder_ready,
+        "init_progress": round(init_progress, 2),
     }

@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Awaitable, Callable, TYPE_CHECKING, Optional
 
 from cosma_backend.db.errors import DatabaseClosingError
 from cosma_backend.logging import get_logger
@@ -104,6 +104,19 @@ class IndexingQueue:
 
         self._processing_task: Optional[asyncio.Task] = None
         self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
+
+        # Optional hook invoked right before each batch of ready items is
+        # dispatched. The scheduler installs this so rule evaluation happens
+        # at task boundaries (not mid-task). The hook may set
+        # ``_scheduler_paused`` via queue.scheduler_pause() — the loop will
+        # then wait instead of picking up new work.
+        self._pre_task_hook: Optional[Callable[[], Awaitable[Any]]] = None
+
+    def set_pre_task_hook(self, hook: Optional[Callable[[], Awaitable[Any]]]) -> None:
+        """Install a callback invoked once per processing cycle, right
+        before ready items are picked. Used by the scheduler to evaluate
+        rules between tasks without a fixed polling interval."""
+        self._pre_task_hook = hook
 
     # ------------------------------------------------------------------
     # Public properties
@@ -204,6 +217,8 @@ class IndexingQueue:
         dest_key = str(Path(dest_path).resolve()) if dest_path else None
         now = time.time()
 
+        item_to_persist: Optional[QueueItem] = None
+
         async with self._lock:
             existing = self._items.get(key)
 
@@ -248,25 +263,24 @@ class IndexingQueue:
                         self._publish(Update.create(
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                         ))
-                        await self._save_item(existing)
+                        item_to_persist = existing
                         logger.info("Queue item fast-tracked to DELETE", file_path=key)
-                        return existing
 
-                    # Otherwise reset the cooldown timer
-                    existing.action = action
-                    existing.cooldown_expires_at = now + cooldown
-                    existing.dest_path = dest_key if dest_key else existing.dest_path
-                    # Update dest mapping
-                    if action == QueueAction.MOVE and existing.dest_path:
-                        self._dest_to_src[existing.dest_path] = key
-                    self._publish(Update.create(
-                        UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
-                    ))
-                    await self._save_item(existing)
-                    logger.info("Queue item cooldown reset", file_path=key)
-                    return existing
+                    else:
+                        # Otherwise reset the cooldown timer
+                        existing.action = action
+                        existing.cooldown_expires_at = now + cooldown
+                        existing.dest_path = dest_key if dest_key else existing.dest_path
+                        # Update dest mapping
+                        if action == QueueAction.MOVE and existing.dest_path:
+                            self._dest_to_src[existing.dest_path] = key
+                        self._publish(Update.create(
+                            UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
+                        ))
+                        item_to_persist = existing
+                        logger.info("Queue item cooldown reset", file_path=key)
 
-                if existing.status == QueueItemStatus.WAITING:
+                elif existing.status == QueueItemStatus.WAITING:
                     # Item is ready but hasn't been dispatched yet; reset it
                     # back to COOLING_DOWN so the new event is debounced.
                     if existing.action == QueueAction.MOVE and existing.dest_path:
@@ -280,33 +294,45 @@ class IndexingQueue:
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                     ))
-                    await self._save_item(existing)
+                    item_to_persist = existing
                     logger.info("Queue item reset from WAITING to cooldown",
                                 file_path=key, action=action.value)
-                    return existing
 
-            # New item
-            item = QueueItem(
-                id=str(uuid.uuid4()),
-                file_path=key,
-                action=action,
-                status=QueueItemStatus.COOLING_DOWN,
-                enqueued_at=now,
-                cooldown_expires_at=now + cooldown,
-                dest_path=dest_key,
-            )
-            self._items[key] = item
-            if action == QueueAction.MOVE and dest_key:
-                self._dest_to_src[dest_key] = key
-            self._publish(Update.create(
-                UpdateOpcode.QUEUE_ITEM_ADDED, **item.to_dict()
-            ))
-            await self._save_item(item)
-            logger.info("Item enqueued", file_path=key, action=action.value)
-            return item
+            if item_to_persist is None and existing is not None:
+                # Handled above (PROCESSING stash) — already returned
+                pass
+            elif item_to_persist is not None:
+                # Existing item was updated; will persist below
+                pass
+            else:
+                # New item
+                item = QueueItem(
+                    id=str(uuid.uuid4()),
+                    file_path=key,
+                    action=action,
+                    status=QueueItemStatus.COOLING_DOWN,
+                    enqueued_at=now,
+                    cooldown_expires_at=now + cooldown,
+                    dest_path=dest_key,
+                )
+                self._items[key] = item
+                if action == QueueAction.MOVE and dest_key:
+                    self._dest_to_src[dest_key] = key
+                self._publish(Update.create(
+                    UpdateOpcode.QUEUE_ITEM_ADDED, **item.to_dict()
+                ))
+                item_to_persist = item
+                logger.info("Item enqueued", file_path=key, action=action.value)
+
+        # Persist outside the lock to avoid blocking concurrent operations.
+        if item_to_persist is not None:
+            await self._save_item(item_to_persist)
+
+        return item_to_persist if item_to_persist is not None else existing
 
     async def remove_item(self, item_id: str) -> bool:
         """Remove an item by its ID. Returns True if found and removed."""
+        removed_key: Optional[str] = None
         async with self._lock:
             for key, item in self._items.items():
                 if item.id == item_id:
@@ -315,9 +341,12 @@ class IndexingQueue:
                     self._publish(Update.create(
                         UpdateOpcode.QUEUE_ITEM_REMOVED, **item.to_dict()
                     ))
-                    await self._delete_item_from_db(item_id)
-                    logger.info("Queue item removed", item_id=item_id, file_path=key)
-                    return True
+                    removed_key = key
+                    break
+        if removed_key is not None:
+            await self._delete_item_from_db(item_id)
+            logger.info("Queue item removed", item_id=item_id, file_path=removed_key)
+            return True
         return False
 
     async def remove_items_under(self, directory: str | Path) -> int:
@@ -392,6 +421,7 @@ class IndexingQueue:
 
                 now = time.time()
                 ready_items: list[QueueItem] = []
+                items_to_persist: list[QueueItem] = []
 
                 async with self._lock:
                     for item in self._items.values():
@@ -400,8 +430,29 @@ class IndexingQueue:
                             and now >= item.cooldown_expires_at
                         ):
                             item.status = QueueItemStatus.WAITING
-                            await self._save_item(item)
+                            items_to_persist.append(item)
 
+                    has_waiting = any(
+                        i.status == QueueItemStatus.WAITING
+                        for i in self._items.values()
+                    )
+
+                # Task-boundary scheduler check: evaluate rules right before
+                # we promote WAITING items to PROCESSING. If the hook flips
+                # is_paused, we loop back and wait without starting new work.
+                # This is the sole "should we run now?" check — there is no
+                # fixed polling interval for GPU/CPU/memory rules, so a
+                # single file's inference cannot get interrupted mid-way.
+                if has_waiting and self._pre_task_hook is not None:
+                    try:
+                        await self._pre_task_hook()
+                    except Exception:
+                        logger.exception("pre_task_hook raised — proceeding anyway")
+                    if self.is_paused:
+                        await asyncio.sleep(1)
+                        continue
+
+                async with self._lock:
                     ready_items = [
                         i for i in self._items.values()
                         if i.status == QueueItemStatus.WAITING
@@ -411,7 +462,12 @@ class IndexingQueue:
                     # semaphore.
                     for item in ready_items:
                         item.status = QueueItemStatus.PROCESSING
-                        await self._save_item(item)
+                        items_to_persist.append(item)
+
+                # Persist status changes outside the lock to avoid blocking
+                # enqueue/remove operations during DB writes.
+                for item in items_to_persist:
+                    await self._save_item(item)
 
                 if ready_items:
                     tasks = [self._process_item(item) for item in ready_items]
@@ -444,20 +500,33 @@ class IndexingQueue:
             ))
 
             try:
+                timeout = self._config.file_processing_timeout
+
                 if item.action == QueueAction.DELETE:
-                    await self._pipeline.db.delete_file(item.file_path)
+                    await asyncio.wait_for(
+                        self._pipeline.db.delete_file(item.file_path),
+                        timeout=timeout,
+                    )
                 elif item.action == QueueAction.MOVE:
-                    await self._pipeline.db.delete_file(item.file_path)
-                    if item.dest_path:
-                        dest_file = File.from_path(Path(item.dest_path))
-                        if await self._pipeline.is_supported(dest_file):
-                            await self._pipeline.process_file(dest_file)
+                    async def _do_move() -> None:
+                        await self._pipeline.db.delete_file(item.file_path)
+                        if item.dest_path:
+                            dest_file = File.from_path(Path(item.dest_path))
+                            if await self._pipeline.is_supported(dest_file):
+                                await self._pipeline.process_file(dest_file)
+                    await asyncio.wait_for(_do_move(), timeout=timeout)
                 elif item.action == QueueAction.INDEX:
                     file = File.from_path(Path(item.file_path))
                     if await self._pipeline.is_supported(file):
-                        await self._pipeline.process_file(file)
+                        await asyncio.wait_for(
+                            self._pipeline.process_file(file),
+                            timeout=timeout,
+                        )
                 elif item.action == QueueAction.EMBED_FALLBACK:
-                    await self._pipeline.embed_fallback(item.file_path)
+                    await asyncio.wait_for(
+                        self._pipeline.embed_fallback(item.file_path),
+                        timeout=timeout,
+                    )
 
                 # Success — remove from queue
                 async with self._lock:
@@ -541,7 +610,12 @@ class IndexingQueue:
         try:
             rows = await self._db.get_queue_items()
             for row in rows:
-                action = QueueAction(row["action"])
+                try:
+                    action = QueueAction(row["action"])
+                except ValueError:
+                    logger.error("Invalid queue action type, skipping item",
+                                action=row["action"], item_id=row["id"])
+                    continue
                 # Restore PROCESSING items as WAITING so they get re-processed.
                 # Also map legacy "ready" values to WAITING.
                 raw_status = row["status"]

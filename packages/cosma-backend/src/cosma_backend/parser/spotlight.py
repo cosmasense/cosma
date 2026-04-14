@@ -73,7 +73,14 @@ async def spotlight_to_text(path: Path, config: ParserConfig | None = None) -> s
             return None
             
         output = stdout.decode().strip()
-        
+
+        # Cap output size to prevent memory exhaustion from huge metadata
+        MAX_SPOTLIGHT_OUTPUT = 1024 * 1024  # 1MB
+        if len(output) > MAX_SPOTLIGHT_OUTPUT:
+            logger.warning("Spotlight output too large, truncating",
+                          path=str(path), size=len(output))
+            output = output[:MAX_SPOTLIGHT_OUTPUT]
+
         # Parse mdls output format: kMDItemTextContent = "content here"
         if "= " not in output:
             logger.debug("No text content found in Spotlight", path=str(path))

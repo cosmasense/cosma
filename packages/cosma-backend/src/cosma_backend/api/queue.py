@@ -236,14 +236,24 @@ async def system_metrics() -> tuple[MetricsResponse, int]:
 # ------------------------------------------------------------------
 
 def _file_to_list_item(f) -> dict[str, Any]:
-    """Convert a File model to a dict suitable for FileListResponse."""
+    """Convert a File model to a dict suitable for FileListResponse.
+
+    `updated_at` is the DB row's last-write time (when we actually processed
+    the file), NOT the filesystem mtime. We fall back to `modified` only if
+    the column is missing (older DBs).
+    """
+    ts = None
+    if getattr(f, "updated_at", None) is not None:
+        ts = int(f.updated_at.timestamp())
+    elif f.modified is not None:
+        ts = int(f.modified.timestamp())
     return {
         "file_path": f.file_path,
         "filename": f.filename,
         "extension": f.extension,
         "processing_error": f.processing_error,
         "status": f.status.name if hasattr(f.status, "name") else str(f.status),
-        "updated_at": int(f.modified.timestamp()) if f.modified else None,
+        "updated_at": ts,
     }
 
 

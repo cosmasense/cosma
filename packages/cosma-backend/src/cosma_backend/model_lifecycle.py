@@ -116,7 +116,7 @@ class ModelLifecycleManager:
                             idle_seconds=round(whisper_idle, 1),
                             threshold=self._idle_unload_seconds,
                         )
-                        unload_whisper_model()
+                        await asyncio.to_thread(unload_whisper_model)
 
                 await asyncio.sleep(CHECK_INTERVAL_SECONDS)
             except asyncio.CancelledError:

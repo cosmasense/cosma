@@ -198,7 +198,7 @@ class Database:
                 # Insert new keywords
                 for keyword in file_data.keywords:
                     await conn.execute(
-                        "INSERT INTO file_keywords (file_id, keyword) VALUES (?, ?)",
+                        "INSERT OR IGNORE INTO file_keywords (file_id, keyword) VALUES (?, ?)",
                         (file_data.id, keyword)
                     )
             
@@ -494,6 +494,16 @@ class Database:
             
             logger.info("Retrieved watched directories", count=len(directories), active_only=active_only)
             return directories
+
+    async def count_files_in_directory(self, directory_path: str) -> int:
+        """Count indexed files under a watched directory path."""
+        async with self.acquire() as conn:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM files WHERE file_path LIKE ? || '/' || '%' OR file_path = ?",
+                (directory_path, directory_path),
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else 0
 
     async def delete_watched_directory(self, job_id: int) -> WatchedDirectory | None:
         """

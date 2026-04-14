@@ -49,12 +49,15 @@ class LlamaCppConfig:
     n_gpu_layers: int = -1
     verbose: bool = False
     model_path: str = ""
-    repo_id: str = "unsloth/Qwen3.5-2B-GGUF"
+    # Standardized on Qwen3-VL-2B-Instruct: visual-input multimodal, small, fast.
+    # HuggingFace canonical model: Qwen/Qwen3-VL-2B-Instruct
+    # Ollama: qwen3-vl:2b-instruct
+    repo_id: str = "unsloth/Qwen3-VL-2B-Instruct-GGUF"
     filename: str = "*Q4_K_M.gguf"
     clip_model_path: str = ""
-    clip_repo_id: str = "unsloth/Qwen3.5-2B-GGUF"
+    clip_repo_id: str = "unsloth/Qwen3-VL-2B-Instruct-GGUF"
     clip_filename: str = "mmproj-F16.gguf"
-    chat_handler: str = "qwen3.5"
+    chat_handler: str = "qwen3-vl"
     enable_thinking: bool = False
     image_min_tokens: int = 1024
 
@@ -108,7 +111,12 @@ class SchedulerRuleConfig:
 class SchedulerConfig:
     enabled: bool = False
     combine_mode: str = "ALL"
-    check_interval_seconds: int = 30
+    # The scheduler primarily evaluates rules BETWEEN tasks (see
+    # IndexingQueue._pre_task_hook). This interval is only used as a backstop
+    # for long-term conditions (e.g. time_window) that can change while the
+    # queue is idle. Short intervals cause unnecessary start/pause thrashing
+    # and mid-task metric polling, so keep it coarse.
+    check_interval_seconds: int = 60
     rules: list[SchedulerRuleConfig] = field(default_factory=list)
 
 
@@ -211,6 +219,8 @@ class QueueConfig:
     initial_cooldown_seconds: int = 5
     max_concurrency: int = 2
     max_retries: int = 3
+    file_processing_timeout: int = 300  # seconds per file (5 min default)
+    gpu_memory_cap: float = 0.75  # fraction of GPU memory to use (0.0-1.0, default 75%)
 
 
 @dataclass
