@@ -32,6 +32,12 @@ import threading
 # Our own filesystem poller drives the UI progress, so we don't need tqdm.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# Keep Xet enabled: HF streams chunks into a shared cache at
+# ~/.cache/huggingface/xet/chunk-cache/ which is content-addressed, so any
+# other app using huggingface_hub reuses the same bytes and nobody pays
+# the download cost twice. Our poller below watches both the per-download
+# .incomplete file AND the aggregate xet chunk-cache growth so the
+# wizard bar still ticks during Xet-backed downloads.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -182,13 +188,22 @@ def _poll_size(
     Runs in a background thread. Checks, in order:
       1. The final dest path (once HF moves it into place).
       2. Any `*.incomplete` in <dest_dir>/.cache/huggingface/download/
-         — HF's canonical in-progress location. With one-download-per-subdir
-         there is at most one such file per stage, so a naive max() wins.
+         — HF's classic in-progress location for direct transfers.
+      3. Xet chunk-cache growth (~/.cache/huggingface/xet/chunk-cache/).
+         Xet-backed repos stream chunks into a content-addressed shared
+         cache instead of writing to the `.incomplete` file; without this
+         fallback the bar would freeze at 0%. The delta from a baseline
+         snapshot taken at poller start approximates bytes-in-flight for
+         this download. It's slightly off when multiple Xet downloads
+         run in parallel (chunks are shared across them) but at worst the
+         bar reads faster than reality, which is fine for a UX signal.
 
     Polling interval is ~200 ms: slow enough to be invisible in the I/O
     budget, fast enough to feel responsive in the UI.
     """
     cache_dir = dest.parent / ".cache" / "huggingface" / "download"
+    xet_chunks = Path.home() / ".cache" / "huggingface" / "xet" / "chunk-cache"
+    baseline_xet = _dir_size(xet_chunks)
     while not stop.is_set():
         done = 0
         try:
@@ -196,9 +211,6 @@ def _poll_size(
         except FileNotFoundError:
             pass
         if done == 0 and cache_dir.exists():
-            # Pick the largest .incomplete — with one download per subdir
-            # there's effectively only one, but max() is cheap and robust
-            # to HF re-resolving hashes between runs.
             try:
                 for child in cache_dir.iterdir():
                     if child.name.endswith(".incomplete"):
@@ -207,10 +219,35 @@ def _poll_size(
                             done = s
             except FileNotFoundError:
                 pass
+        if done == 0:
+            # Xet path: use chunk-cache delta, capped to `total` so a busy
+            # shared cache from other downloads can't overshoot the bar.
+            xet_delta = max(0, _dir_size(xet_chunks) - baseline_xet)
+            if total > 0:
+                xet_delta = min(xet_delta, total)
+            done = xet_delta
         try:
             cb(done, total, label)
         except Exception:
             pass  # never let a progress exception kill the download
         stop.wait(0.2)
+
+
+def _dir_size(path: Path) -> int:
+    """Sum file sizes under `path` without recursing into subdirs we don't
+    need. Xet's chunk-cache is flat at the chunk level but bucketed into
+    two-char prefix dirs, so os.walk-style traversal is required. Errors
+    (missing dir, permissions) yield 0 so the poller never crashes."""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except (OSError, FileNotFoundError):
+        return 0
+    return total
 
 
