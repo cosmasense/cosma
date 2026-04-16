@@ -54,7 +54,7 @@ class TestFromDict:
         assert s.embedder.provider == "online"
         # Other fields keep defaults
         assert s.embedder.model == "text-embedding-3-small"
-        assert s.summarizer.provider == "auto"
+        assert s.summarizer.provider == "llamacpp"
 
     def test_nested_dict(self):
         s = _from_dict(Settings, {
@@ -127,7 +127,7 @@ class TestSettingsManager:
         settings = manager.load()
         assert manager.toml_path.exists()
         assert settings.embedder.provider == "local"
-        assert settings.summarizer.provider == "auto"
+        assert settings.summarizer.provider == "llamacpp"
         assert settings.embedder.dimensions == 512
 
     def test_load_returns_defaults(self, manager):
@@ -200,7 +200,7 @@ class TestSettingsManager:
         assert "summarizer" in grouped
         assert "parser" in grouped
         assert grouped["embedder"]["provider"] == "local"
-        assert grouped["summarizer"]["provider"] == "auto"
+        assert grouped["summarizer"]["provider"] == "llamacpp"
 
     def test_defaults_static(self):
         defaults = SettingsManager.defaults()

@@ -17,6 +17,10 @@ Frontend (separate repo):
 - For cosma-backend specifically: `cd packages/cosma-backend && uv run --group test pytest --no-cov`
 - Run unit tests only: `uv run --group test pytest tests/unit/ -m unit --no-cov`
 - Run integration tests only: `uv run --group test pytest tests/integration/ -m integration --no-cov`
+- Tests must pass before committing or pushing. If a test fails, fix the
+  underlying code rather than the test — tests encode the API/behavior
+  contract. Only update test assertions when the contract itself is
+  intentionally changing, and mention that contract change in the commit.
 
 ## Development
 
