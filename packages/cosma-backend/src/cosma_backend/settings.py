@@ -46,12 +46,14 @@ class LlamaCppConfig:
     context_length: int = 10000
     n_ctx: int = 16384
     n_threads: int = 4
+    # n_gpu_layers = -1 offloads all transformer layers to Metal on Apple
+    # Silicon. Override to 0 for CPU-only machines.
     n_gpu_layers: int = -1
     verbose: bool = False
     model_path: str = ""
-    # Standardized on Qwen3-VL-2B-Instruct: visual-input multimodal, small, fast.
-    # HuggingFace canonical model: Qwen/Qwen3-VL-2B-Instruct
-    # Ollama: qwen3-vl:2b-instruct
+    # Standardized on Qwen3-VL-2B-Instruct: visual-input multimodal, small,
+    # and fast enough for interactive file summarization on M-series Macs.
+    # Defaults here drive the bootstrap downloader.
     repo_id: str = "unsloth/Qwen3-VL-2B-Instruct-GGUF"
     filename: str = "*Q4_K_M.gguf"
     clip_model_path: str = ""
@@ -64,7 +66,13 @@ class LlamaCppConfig:
 
 @dataclass
 class SummarizerConfig:
-    provider: str = "auto"
+    # User-selected backend: "llamacpp" (default — fully local, self-contained),
+    # "ollama" (local, external daemon), or "online" (OpenAI-style API).
+    # "auto" is retained as an explicit opt-in for users who want legacy
+    # fallback behavior, but is no longer the default because silent provider
+    # switching made failures hard to diagnose (see the original
+    # "All AI summarizers failed or are unavailable" report).
+    provider: str = "llamacpp"
     max_tokens_per_request: int = 100000
     chunk_overlap_tokens: int = 1000
     max_chunks: int = 10
@@ -85,9 +93,15 @@ class EmbedderConfig:
 
 @dataclass
 class WhisperConfig:
-    provider: str = "online"
+    # "local" (default — pywhispercpp bundled, no keys needed) or "online"
+    # (OpenAI whisper-1, requires OPENAI_API_KEY). Previous default of
+    # "online" meant .mov files silently failed for every user without a
+    # key — hence the new local-first default.
+    provider: str = "local"
     online_model: str = "whisper-1"
-    local_model: str = "turbo"
+    # base.en keeps first-run download to ~140 MB. Users wanting higher
+    # accuracy can switch to "large-v3-turbo" (~1.5 GB) via settings.
+    local_model: str = "base.en"
 
 
 @dataclass

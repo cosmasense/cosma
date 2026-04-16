@@ -37,23 +37,34 @@ async def updates():
         # Keep-alive interval: send a comment if no updates for 15 seconds
         # This prevents proxy/browser timeouts and helps detect dead connections
         KEEPALIVE_INTERVAL = 15.0
-        
-        with subscribe(current_app.updates_hub) as queue:
-            while True:
-                try:
-                    # Wait for an update with timeout
-                    update = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_INTERVAL)
-                    
-                    if update.opcode is UpdateOpcode.SHUTTING_DOWN:
-                        print(update.to_sse().encode())
+
+        shutdown_event = getattr(current_app, "shutdown_event", None)
+
+        try:
+            with subscribe(current_app.updates_hub) as queue:
+                while True:
+                    # Short-circuit the moment shutdown is signalled; the
+                    # uvicorn graceful window is only ~10 s and we don't want
+                    # this long-lived stream to eat it all waiting for
+                    # queue.get(). Event-wait runs concurrently with the
+                    # real queue.get() so normal throughput is unaffected.
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        return
+
+                    try:
+                        update = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_INTERVAL)
+
+                        if update.opcode is UpdateOpcode.SHUTTING_DOWN:
+                            yield update.to_sse().encode()
+                            return
+
                         yield update.to_sse().encode()
-                        return  # close connection
-                        
-                    yield update.to_sse().encode()
-                except asyncio.TimeoutError:
-                    # No updates received within the keepalive interval
-                    # Send a keep-alive comment (SSE spec: lines starting with : are comments)
-                    yield sse_comment("keepalive")
+                    except asyncio.TimeoutError:
+                        yield sse_comment("keepalive")
+        except asyncio.CancelledError:
+            # Expected on shutdown / client disconnect. Swallow so uvicorn
+            # doesn't print a traceback for a benign cancel.
+            return
 
     response = await make_response(
         updates_generator(),

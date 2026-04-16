@@ -256,6 +256,11 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
     QuartSchema(app)
     app.register_blueprint(api_blueprint, url_prefix='/api')
 
+    # Shutdown signal observed by long-lived SSE streams (see api/updates.py,
+    # api/bootstrap.py). Setting this in after_serving lets them bail out
+    # cleanly instead of sitting in queue.get() until uvicorn force-cancels.
+    app.shutdown_event = asyncio.Event()
+
     @app.before_serving
     async def initialize_services():
         """Two-phase startup: API-ready first, heavy models load in background.
@@ -410,8 +415,23 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
 
     @app.after_serving
     async def handle_shutdown():
+        # Signal SSE streams first so they stop blocking on queue.get().
+        # Without this step uvicorn's graceful-shutdown window gets burned
+        # waiting for these long-lived handlers, leading to force-cancels
+        # and ugly CancelledError tracebacks.
+        app.shutdown_event.set()
+        try:
+            from cosma_backend.models.update import Update
+            app.updates_hub.publish(Update.shutting_down())
+        except Exception:
+            logger.exception("Error publishing SHUTTING_DOWN update")
+        try:
+            from cosma_backend import bootstrap as _bootstrap_core
+            _bootstrap_core.runner.broadcast_shutdown()
+        except Exception:
+            logger.exception("Error broadcasting bootstrap shutdown")
+
         # Cancel Phase 2 if it's still running (e.g. model loading in thread).
-        # This prevents the shutdown from waiting on a slow model download.
         deferred = getattr(app, "_deferred_init_task", None)
         if deferred and not deferred.done():
             logger.info("Shutdown: cancelling deferred startup")
@@ -422,23 +442,24 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
                 pass
 
         logger.info("Shutdown: stopping lifecycle manager, scheduler, and indexing queue")
-        try:
-            await app.model_lifecycle.stop()
-        except Exception:
-            logger.exception("Error stopping model lifecycle manager")
-        try:
-            await app.scheduler.stop()
-        except Exception:
-            logger.exception("Error stopping scheduler")
-        try:
-            await app.indexing_queue.stop()
-        except Exception:
-            logger.exception("Error stopping indexing queue")
 
-        # Unload summarizer models — this is important for Ollama, which runs in a
-        # separate process and keeps the model pinned in GPU until explicitly told
-        # to release (via a request with keep_alive=0). Without this call, Ollama
-        # can hold 100% of GPU memory even after the backend quits.
+        async def _safe(label: str, coro):
+            try:
+                await coro
+            except Exception:
+                logger.exception(f"Error stopping {label}")
+
+        # Parallelize independent teardown: these three don't share state,
+        # so gather cuts wall-clock shutdown time roughly in thirds.
+        await asyncio.gather(
+            _safe("model lifecycle", app.model_lifecycle.stop()),
+            _safe("scheduler",       app.scheduler.stop()),
+            _safe("indexing queue",  app.indexing_queue.stop()),
+        )
+
+        # Unload summarizer — important for Ollama (holds GPU until told to
+        # release via keep_alive=0). Short bounded timeout so we don't run
+        # out the uvicorn grace window.
         logger.info("Shutdown: unloading summarizer models")
         try:
             summarizer = getattr(app.pipeline, "summarizer", None)
@@ -449,12 +470,22 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
         except Exception:
             logger.exception("Error unloading summarizer models")
 
-        # Unload Whisper if it was loaded
         try:
             from cosma_backend.parser.media import unload_whisper_model
             unload_whisper_model()
         except Exception:
             logger.exception("Error unloading whisper model")
+
+        # Kill joblib/loky pool workers. sentence-transformers uses them
+        # indirectly; their daemon threads outlive shutdown and keep the
+        # interpreter alive, which the macOS supervisor then SIGKILLs (exit
+        # code 9). kill_workers=True releases the semaphores cleanly.
+        try:
+            from joblib.externals.loky import get_reusable_executor
+            get_reusable_executor().shutdown(wait=False, kill_workers=True)
+        except Exception:
+            # joblib may not be importable in slim deployments; best-effort.
+            pass
 
         logger.info("Shutdown: closing DB")
         try:

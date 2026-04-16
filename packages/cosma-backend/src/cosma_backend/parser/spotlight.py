@@ -25,14 +25,20 @@ logger = get_logger(__name__)
 
 async def spotlight_to_text(path: Path, config: ParserConfig | None = None) -> str | None:
     """
-    Extract text content from a file using macOS Spotlight indexing.
+    Extract text content from a file using macOS Spotlight.
 
-    Args:
-        path: Path to the file to extract text from
-        config: ParserConfig instance
+    Why `mdimport -t -d3` instead of `mdls -name kMDItemTextContent`:
+    Apple restricts `kMDItemTextContent` from non-system callers — `mdls`
+    returns "(null)" for that attribute on every file even though Spotlight
+    DID index the text. The older code took that `(null)` at face value and
+    gave up, which is why Spotlight "never worked" in practice. The
+    `mdimport -t -d3 <path>` invocation asks the Spotlight importer to
+    test-import the file and dump all attributes (including
+    kMDItemTextContent) to stdout, which is the documented way to see
+    indexed text from userland tools.
 
-    Returns:
-        Extracted text content or None if unavailable
+    Returns None if Spotlight has no text importer for the file type
+    (images, binaries, etc.) — the caller should fall back to MarkItDown.
     """
     if sys.platform != "darwin":
         logger.warning("Spotlight extraction only available on macOS", platform=sys.platform)
@@ -42,21 +48,22 @@ async def spotlight_to_text(path: Path, config: ParserConfig | None = None) -> s
         logger.warning("File not found for Spotlight extraction", path=str(path))
         return None
 
-    # Get timeout from config
     from cosma_backend.settings import ParserConfig as _ParserConfig
     cfg = config or _ParserConfig()
     timeout = cfg.spotlight_timeout_seconds
-    
+
     try:
-        logger.debug("Extracting text via Spotlight", path=str(path))
-        
-        # Use asyncio.create_subprocess_exec to get kMDItemTextContent
+        logger.debug("Extracting text via Spotlight (mdimport)", path=str(path))
+
+        # -t: test-import (don't mutate the real index)
+        # -d3: print summary + ALL imported attributes (vs -d2 which omits
+        #      kMDItemTextContent, which is exactly what we need).
         process = await asyncio.create_subprocess_exec(
-            "mdls", "-name", "kMDItemTextContent", str(path),
+            "mdimport", "-t", "-d3", str(path),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
-        
+
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -64,58 +71,77 @@ async def spotlight_to_text(path: Path, config: ParserConfig | None = None) -> s
             await process.wait()
             logger.warning("Spotlight extraction timed out", path=str(path), timeout=timeout)
             return None
-        
-        if process.returncode != 0:
-            logger.debug("mdls command failed", 
-                        path=str(path), 
-                        returncode=process.returncode,
-                        stderr=stderr.decode().strip())
-            return None
-            
-        output = stdout.decode().strip()
 
-        # Cap output size to prevent memory exhaustion from huge metadata
-        MAX_SPOTLIGHT_OUTPUT = 1024 * 1024  # 1MB
+        if process.returncode != 0:
+            logger.debug("mdimport failed",
+                         path=str(path),
+                         returncode=process.returncode,
+                         stderr=stderr.decode(errors="replace").strip()[:200])
+            return None
+
+        output = stdout.decode(errors="replace")
+
+        # mdimport can dump several MB for large docs. Cap early so we don't
+        # blow memory on a 200 MB transcript embedded in a weird file.
+        MAX_SPOTLIGHT_OUTPUT = 4 * 1024 * 1024  # 4MB — Spotlight's own text cap
         if len(output) > MAX_SPOTLIGHT_OUTPUT:
-            logger.warning("Spotlight output too large, truncating",
-                          path=str(path), size=len(output))
             output = output[:MAX_SPOTLIGHT_OUTPUT]
 
-        # Parse mdls output format: kMDItemTextContent = "content here"
-        if "= " not in output:
-            logger.debug("No text content found in Spotlight", path=str(path))
+        content = _parse_mditem_text_content(output)
+        if not content:
+            logger.debug("No kMDItemTextContent in mdimport output", path=str(path))
             return None
-            
-        # Extract content after "= "
-        _, content_part = output.split("= ", 1)
-        
-        # Handle null value
-        if content_part.strip() == "(null)":
-            logger.debug("Spotlight returned null content", path=str(path))
-            return None
-            
-        # Remove surrounding quotes and clean up
-        content = content_part.strip()
-        if content.startswith('"') and content.endswith('"'):
-            content = content[1:-1]
-            
-        # Unescape common escape sequences
-        content = content.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
-        
-        if len(content.strip()) < 10:  # Too short to be useful
+
+        # Short content usually means the importer only knows the filename
+        # (e.g. binary files with no extractable text). Not worth sending to
+        # the summarizer — let the caller fall through to MarkItDown.
+        if len(content.strip()) < 10:
             logger.debug("Spotlight content too short", path=str(path), length=len(content))
             return None
-            
-        logger.info("Successfully extracted text via Spotlight", 
-                   path=str(path), 
-                   content_length=len(content))
+
+        logger.info("Extracted text via Spotlight",
+                    path=str(path), content_length=len(content))
         return content
-        
-    except Exception as e:
-        logger.exception("Unexpected error in Spotlight extraction", 
-                        path=str(path), 
-                        error=str(e))
+
+    except FileNotFoundError:
+        logger.warning("mdimport not found (non-macOS?)")
         return None
+    except Exception as e:
+        logger.exception("Unexpected error in Spotlight extraction",
+                         path=str(path), error=str(e))
+        return None
+
+
+# Match `    kMDItemTextContent = "...contents..."` where `...contents...`
+# may span multiple lines and contain escaped quotes.
+# mdimport terminates each attribute line with `;` and uses doubled-quotes
+# to escape a literal `"` inside the string — the regex is anchored so we
+# don't accidentally match inside some other attribute's value.
+import re  # local import — keeps the public API at the top of the file
+
+_TEXT_CONTENT_RE = re.compile(
+    r'^\s*kMDItemTextContent\s*=\s*"(?P<body>(?:[^"\\]|\\.|"")*)"\s*;',
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _parse_mditem_text_content(output: str) -> str | None:
+    """Pull kMDItemTextContent's value out of `mdimport -t -d3` stdout.
+
+    Split out for testability — the parsing is the fiddly part and doing
+    it inline with the subprocess wrangling made spotlight_to_text hard
+    to eyeball.
+    """
+    m = _TEXT_CONTENT_RE.search(output)
+    if not m:
+        return None
+    body = m.group("body")
+    # macOS escapes: \n, \t, \", and "" (double-quote pair). Order matters:
+    # unescape `""` first so we don't turn a literal escaped quote into the
+    # start of a new string.
+    body = body.replace('""', '"')
+    body = body.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+    return body
 
 
 async def spotlight_metadata(path: Path) -> dict[str, Any]:

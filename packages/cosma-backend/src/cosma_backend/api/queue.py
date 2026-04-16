@@ -128,7 +128,10 @@ async def queue_resume() -> tuple[QueueActionResponse, int]:
 @validate_response(QueueItemsResponse, 200)
 async def queue_items() -> tuple[QueueItemsResponse, int]:
     offset = request.args.get("offset", 0, type=int)
-    limit = request.args.get("limit", 50, type=int)
+    # 10000 = effectively uncapped. Listing failed/recent files is cheap
+    # (indexed lookup on a single column) and the UI's "Retry All" button
+    # needs to see every failure, not just the first page.
+    limit = request.args.get("limit", 10000, type=int)
 
     all_items = await current_app.indexing_queue.get_items()
     total_count = len(all_items)
@@ -262,7 +265,10 @@ def _file_to_list_item(f) -> dict[str, Any]:
 @validate_response(FileListResponse, 200)
 async def queue_failed_files() -> tuple[FileListResponse, int]:
     offset = request.args.get("offset", 0, type=int)
-    limit = request.args.get("limit", 50, type=int)
+    # 10000 = effectively uncapped. Listing failed/recent files is cheap
+    # (indexed lookup on a single column) and the UI's "Retry All" button
+    # needs to see every failure, not just the first page.
+    limit = request.args.get("limit", 10000, type=int)
 
     files, total_count = await current_app.db.get_files_by_status("FAILED", limit=limit, offset=offset)
 
@@ -278,7 +284,10 @@ async def queue_failed_files() -> tuple[FileListResponse, int]:
 @validate_response(FileListResponse, 200)
 async def queue_recent_files() -> tuple[FileListResponse, int]:
     offset = request.args.get("offset", 0, type=int)
-    limit = request.args.get("limit", 50, type=int)
+    # 10000 = effectively uncapped. Listing failed/recent files is cheap
+    # (indexed lookup on a single column) and the UI's "Retry All" button
+    # needs to see every failure, not just the first page.
+    limit = request.args.get("limit", 10000, type=int)
 
     files, total_count = await current_app.db.get_files_by_status("COMPLETE", limit=limit, offset=offset)
 

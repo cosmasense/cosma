@@ -217,6 +217,20 @@ class IndexingQueue:
         dest_key = str(Path(dest_path).resolve()) if dest_path else None
         now = time.time()
 
+        # Base the debounce window on the file's last-modified time, not
+        # on when this event reached us. Watchers can batch / lag by a few
+        # seconds; without this a file that was actually saved 10s ago
+        # still sat in "cooling down" for another full cooldown window,
+        # making indexing feel sluggish. mtime + cooldown is the correct
+        # "wait N seconds after the user last touched the file" semantic.
+        # Falls back to `now` if the file is gone (deletes) or stat fails.
+        try:
+            mtime = Path(key).stat().st_mtime
+            cooldown_base = max(mtime, now - cooldown)  # clamp to recent past
+        except OSError:
+            cooldown_base = now
+        expires_at = cooldown_base + cooldown
+
         item_to_persist: Optional[QueueItem] = None
 
         async with self._lock:
@@ -229,7 +243,7 @@ class IndexingQueue:
                 if src_key is not None:
                     move_item = self._items.get(src_key)
                     if move_item is not None and move_item.status == QueueItemStatus.COOLING_DOWN:
-                        move_item.cooldown_expires_at = now + cooldown
+                        move_item.cooldown_expires_at = expires_at
                         self._publish(Update.create(
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **move_item.to_dict()
                         ))
@@ -269,7 +283,7 @@ class IndexingQueue:
                     else:
                         # Otherwise reset the cooldown timer
                         existing.action = action
-                        existing.cooldown_expires_at = now + cooldown
+                        existing.cooldown_expires_at = expires_at
                         existing.dest_path = dest_key if dest_key else existing.dest_path
                         # Update dest mapping
                         if action == QueueAction.MOVE and existing.dest_path:
@@ -287,7 +301,7 @@ class IndexingQueue:
                         self._dest_to_src.pop(existing.dest_path, None)
                     existing.action = action
                     existing.status = QueueItemStatus.COOLING_DOWN
-                    existing.cooldown_expires_at = now + cooldown
+                    existing.cooldown_expires_at = expires_at
                     existing.dest_path = dest_key if dest_key else existing.dest_path
                     if action == QueueAction.MOVE and existing.dest_path:
                         self._dest_to_src[existing.dest_path] = key
@@ -395,8 +409,13 @@ class IndexingQueue:
             return None
 
     async def get_status(self) -> dict:
-        async with self._lock:
-            items = list(self._items.values())
+        # Snapshot without taking the lock. During a large initial scan the
+        # lock is held hundreds of times per second by enqueue(), and a
+        # status call that queued behind those acquires could miss the
+        # frontend's 60 s URLSession timeout. A plain list(self._items.values())
+        # is safe here: Python dict views over in-memory state are cheap and
+        # a racy read that shows a count ±1 is fine for a UI badge.
+        items = list(self._items.values())
         return {
             "paused": self.is_paused,
             "manually_paused": self._manually_paused,

@@ -242,7 +242,13 @@ class LlamaCppSummarizer(BaseSummarizer):
         return self._last_used_at
 
     def _resolve_clip_model_path(self) -> Optional[str]:
-        """Download or locate the clip (mmproj) model for vision support."""
+        """Download or locate the clip (mmproj) model for vision support.
+
+        Uses the shared cosma_backend.downloads helper so the file lands in
+        ~/Library/Application Support/cosma/models/llama/ instead of the
+        HuggingFace cache. This keeps all model blobs in one inspectable
+        location and lets the bootstrap API report them consistently.
+        """
         if self.clip_model_path:
             return self.clip_model_path
 
@@ -250,13 +256,15 @@ class LlamaCppSummarizer(BaseSummarizer):
             return None
 
         try:
-            from huggingface_hub import hf_hub_download
-            path = hf_hub_download(
+            from cosma_backend.downloads import download_hf_file
+            result = download_hf_file(
                 repo_id=self.clip_repo_id,
                 filename=self.clip_filename,
+                kind="llama",
+                subdir="mmproj",
+                stage_label="mmproj",
             )
-            logger.info("clip model downloaded", repo_id=self.clip_repo_id, filename=self.clip_filename, path=path)
-            return path
+            return str(result.path)
         except Exception as e:
             logger.warning("Failed to download clip model, vision will be unavailable", error=str(e))
             return None
@@ -312,9 +320,21 @@ class LlamaCppSummarizer(BaseSummarizer):
                 llama_kwargs["chat_handler"] = self.chat_handler
 
             if self.repo_id and self.filename:
-                self.llm = Llama.from_pretrained(
+                # Route through our shared downloader so the GGUF lands in
+                # cosma/models/llama/ and is skipped on subsequent starts.
+                # Llama() is then constructed against the local file path
+                # rather than .from_pretrained() (which would re-resolve
+                # into the HF cache dir).
+                from cosma_backend.downloads import download_hf_file
+                result = download_hf_file(
                     repo_id=self.repo_id,
                     filename=self.filename,
+                    kind="llama",
+                    subdir="gguf",
+                    stage_label="llama-gguf",
+                )
+                self.llm = Llama(
+                    model_path=str(result.path),
                     **llama_kwargs,
                 )
                 logger.info("llama.cpp model loaded",

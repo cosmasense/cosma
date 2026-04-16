@@ -29,6 +29,7 @@ from .status import status_bp
 from .filters import filters_bp
 from .settings import settings_bp
 from .queue import queue_bp
+from .bootstrap import bootstrap_bp
 
 # Create the main API blueprint
 api_blueprint = Blueprint('api', __name__)
@@ -43,6 +44,7 @@ api_blueprint.register_blueprint(status_bp, url_prefix='/status')
 api_blueprint.register_blueprint(filters_bp, url_prefix='/filters')
 api_blueprint.register_blueprint(settings_bp, url_prefix='/settings')
 api_blueprint.register_blueprint(queue_bp, url_prefix='/queue')
+api_blueprint.register_blueprint(bootstrap_bp, url_prefix='/bootstrap')
 
 
 __all__ = ['api_blueprint']

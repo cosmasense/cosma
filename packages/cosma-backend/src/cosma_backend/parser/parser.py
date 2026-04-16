@@ -213,13 +213,32 @@ class FileParser:
                     self.extraction_stats["markitdown_success"] += 1
                     logger.info("EXTRACTION: MarkItDown successful",
                                    filename=path.name,
-                                   method="markitdown", 
+                                   method="markitdown",
                                    content_length=len(extracted_content))
                 else:
                     self.extraction_stats["markitdown_failed"] += 1
                     logger.info("EXTRACTION: MarkItDown failed",
                                    filename=path.name,
                                    method="markitdown_failed")
+
+            # Strategy 4: Vision OCR — last-resort for scanned PDFs and
+            # raster images whose text content every prior method gave up on.
+            # Why this is gated on PDF ext: OCR is expensive (~1s/page on
+            # M-series) and most other formats that reach this point are
+            # binaries with genuinely no text, not scanned documents.
+            # The Carol-frontend failure report had at least one scanned
+            # PDF (`wechat-channels-en.pdf`) that sat in this exact hole.
+            if not extracted_content and path.suffix.lower() == ".pdf":
+                from cosma_backend.parser import ocr_vision
+                if ocr_vision.is_available():
+                    logger.info("Attempting Vision OCR fallback", filename=path.name)
+                    ocr_text = await ocr_vision.ocr_pdf(path)
+                    if ocr_text:
+                        extracted_content = ocr_text
+                        extraction_method = "vision_ocr"
+                        logger.info("EXTRACTION: Vision OCR successful",
+                                    filename=path.name,
+                                    content_length=len(ocr_text))
 
             # Process results
             if extracted_content and len(extracted_content.strip()) > 10:

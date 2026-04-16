@@ -514,14 +514,24 @@ async def _transcribe_with_openai(audio_path: Path, config: Optional[Dict[str, A
 # =============================================================================
 
 async def _transcribe_with_local_whisper(audio_path: Path) -> str | None:
-    """Transcribe audio using local Whisper model."""
+    """Transcribe audio using local Whisper model.
+
+    Preference order:
+      1. whisper.cpp via pywhispercpp — fastest, no subprocess, bundled binary.
+      2. openai-whisper (PyTorch) — slower but supports more model variants.
+
+    The previous implementation shelled out to a `whisper` binary that was
+    ambiguous across installs (see whisper_local.py for the rationale).
+    """
     try:
-        # Try whisper-cpp first (faster), then whisper
-        if await _check_whisper_cpp_available():
-            return await _transcribe_with_whisper_cpp(audio_path)
-        else:
-            return await _transcribe_with_whisper_python(audio_path)
-            
+        from cosma_backend.parser import whisper_local
+        if whisper_local.is_available():
+            result = await whisper_local.transcribe(audio_path)
+            if result:
+                return result
+            # Fall through to python whisper on transcription failure.
+            logger.info("pywhispercpp returned no text; trying whisper python fallback")
+        return await _transcribe_with_whisper_python(audio_path)
     except Exception as e:
         logger.exception("Local Whisper transcription error", error=str(e))
         return None
@@ -814,17 +824,15 @@ async def _extract_audio_from_video(video_path: Path) -> Path | None:
 
 
 async def _check_whisper_cpp_available() -> bool:
-    """Check if whisper.cpp is available."""
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "whisper", "--help",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await asyncio.wait_for(process.communicate(), timeout=5)
-        return process.returncode == 0
-    except (asyncio.TimeoutError, FileNotFoundError, PermissionError):
-        return False
+    """Availability probe for whisper.cpp.
+
+    Now backed by pywhispercpp (Python binding); the old subprocess probe
+    for a bare `whisper` binary was unreliable because that binary name
+    collides with openai-whisper's CLI. Kept as a function for source
+    compatibility with callers like validate_media_backends().
+    """
+    from cosma_backend.parser import whisper_local
+    return whisper_local.is_available()
 
 
 async def get_supported_media_extensions() -> dict[str, list[str]]:

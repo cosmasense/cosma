@@ -114,7 +114,17 @@ class AutoEmbedder:
             return False
 
     def _get_online_embedder(self) -> OnlineEmbedder | None:
-        """Get or create online embedder if available."""
+        """Get or create online embedder if available.
+
+        Short-circuit when no API key is present. Without this, every search
+        call instantiated the OpenAI client (initializing the embedding
+        model shim) even though the fallback was never going to fire —
+        observed as a 60-second hang on the first search when the user has
+        no OPENAI_API_KEY set, because some transitive init path made a
+        network call that timed out.
+        """
+        if not self._check_online_availability():
+            return None
         if "online" not in self.embedders:
             try:
                 embedder = OnlineEmbedder(config=self.config)
