@@ -92,6 +92,11 @@ class SummarizerConfig:
 
 @dataclass
 class EmbedderConfig:
+    # "local" eagerly loads + warms the SentenceTransformer at backend
+    # startup so the user's first search returns in normal latency
+    # instead of paying a 5-15 s cold encode. "lazy_local" defers the
+    # load to first use (lower startup CPU but slower first query).
+    # "online" needs an API key; falls back to local on failure.
     provider: str = "local"
     model: str = "text-embedding-3-small"
     dimensions: int = 512
