@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 from sqlite3 import Row
 import struct
@@ -66,6 +67,20 @@ class Database:
             # WAL mode: crash-safe journaling that survives sudden termination
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            # Cap the WAL at ~32 MB and trigger an automatic checkpoint
+            # every 1000 dirty pages. SQLite's default auto-checkpoint is
+            # 1000 pages too, but it can be inhibited by long-lived
+            # readers — and during heavy enqueue + search overlap we
+            # observed a single user accumulate an 852 MB WAL because no
+            # writer ever got to run a checkpoint cleanly. Once the WAL
+            # is that size, every read merges 800+ MB of pending frames
+            # before serving, which froze the UI for tens of seconds.
+            # `journal_size_limit` tells SQLite to truncate the WAL
+            # back down on the next checkpoint instead of letting it
+            # grow without bound; the explicit autocheckpoint is a
+            # belt-and-suspenders default.
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
+            conn.execute("PRAGMA journal_size_limit=33554432")  # 32 MiB
             # initialize sqlite_vec in each connection
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
@@ -79,11 +94,67 @@ class Database:
         async with pool.acquire() as conn:
             await conn.executescript(schema)
 
-        return cls(pool)
+        instance = cls(pool)
+        # Background checkpoint task: PASSIVE every 60s as a safety net
+        # for the autocheckpoint above. PASSIVE is non-blocking — it
+        # only checkpoints frames not currently held by readers, so it
+        # can't stall the request path. See `_checkpoint_loop`.
+        instance._start_checkpoint_task()
+        return instance
+
+    def _start_checkpoint_task(self) -> None:
+        loop = asyncio.get_event_loop()
+        self._checkpoint_task = loop.create_task(self._checkpoint_loop())
+
+    async def _checkpoint_loop(self) -> None:
+        """Run PRAGMA wal_checkpoint(PASSIVE) every 60s.
+
+        PASSIVE is the safe variant: it never blocks readers and never
+        forces a writer to wait. If readers are holding old frames it
+        simply skips them and tries again next tick. That's exactly the
+        right policy for a UI-driven workload — we'd rather have a
+        slowly-shrinking WAL than a brief stall every minute.
+        """
+        while not self._closed:
+            try:
+                await asyncio.sleep(60)
+                if self._closed:
+                    return
+                async with self.pool.acquire() as conn:
+                    await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                # Don't take down the loop for a transient error.
+                # Log via aiosqlite — a checkpoint failure is operational
+                # info, not a fatal condition.
+                from cosma_backend.logging import get_logger
+                get_logger(__name__).warning(
+                    "WAL checkpoint failed; will retry next tick",
+                    error=str(e),
+                )
         
     async def close(self) -> None:
         """Close the connection pool."""
         self._closed = True
+        # Stop the background checkpoint task before closing the pool —
+        # otherwise it may try to acquire from a half-closed pool and
+        # log a spurious warning during shutdown.
+        task = getattr(self, "_checkpoint_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Final checkpoint before close so the next launch starts with
+        # a clean WAL — readers cleaned up by the cancel above mean
+        # TRUNCATE can fully reclaim the file.
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
         await self.pool.close()
 
     async def __aenter__(self) -> Self:
