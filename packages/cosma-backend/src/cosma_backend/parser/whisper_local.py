@@ -101,9 +101,10 @@ async def transcribe(audio_path: Path, model_name: Optional[str] = None) -> Opti
 
     resolved = _resolve_model_name(model_name)
     try:
-        model = await asyncio.to_thread(_load_model_sync, resolved)
+        from cosma_backend.pipeline_executor import run_in_pipeline
+        model = await run_in_pipeline(_load_model_sync, resolved)
         # `transcribe` returns a list of Segment objects with .text
-        segments = await asyncio.to_thread(model.transcribe, str(audio_path))
+        segments = await run_in_pipeline(model.transcribe, str(audio_path))
         text = " ".join(seg.text for seg in segments).strip()
         if not text:
             return None

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from cosma_backend.db import Database
 from cosma_backend.db.errors import DatabaseClosingError
+from cosma_backend.dev_logging import log_failed_file
 from cosma_backend.discoverer import Discoverer
 from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.logging import get_logger
@@ -281,6 +282,12 @@ class Pipeline:
             # Save failed state to DB if we have file_data
             file.status = ProcessingStatus.FAILED
             file.processing_error = str(e)
+            log_failed_file(
+                file_path=file.file_path,
+                extension=file.extension,
+                error=str(e),
+                phase="pipeline",
+            )
             self._apply_fallback_indexing(file)
             await self._save_to_db(file)
 

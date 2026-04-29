@@ -189,21 +189,25 @@ def _poll_size(
       1. The final dest path (once HF moves it into place).
       2. Any `*.incomplete` in <dest_dir>/.cache/huggingface/download/
          — HF's classic in-progress location for direct transfers.
-      3. Xet chunk-cache growth (~/.cache/huggingface/xet/chunk-cache/).
+      3. Xet chunk-cache + staging growth under ~/.cache/huggingface/xet/.
          Xet-backed repos stream chunks into a content-addressed shared
          cache instead of writing to the `.incomplete` file; without this
-         fallback the bar would freeze at 0%. The delta from a baseline
-         snapshot taken at poller start approximates bytes-in-flight for
-         this download. It's slightly off when multiple Xet downloads
-         run in parallel (chunks are shared across them) but at worst the
-         bar reads faster than reality, which is fine for a UX signal.
+         fallback the bar would freeze at 0%. The cache is nested one
+         level under a per-CAS-server directory (e.g.
+         `xet/https___cas_serv-<hash>/chunk-cache/`), so we glob rather
+         than hardcode the path — and that CAS dir may not exist until
+         the first chunk lands, so we re-glob every poll. The delta from
+         a baseline snapshot approximates bytes-in-flight for this
+         download. It's slightly off when multiple Xet downloads run in
+         parallel (chunks are shared across them) but at worst the bar
+         reads faster than reality, which is fine for a UX signal.
 
     Polling interval is ~200 ms: slow enough to be invisible in the I/O
     budget, fast enough to feel responsive in the UI.
     """
     cache_dir = dest.parent / ".cache" / "huggingface" / "download"
-    xet_chunks = Path.home() / ".cache" / "huggingface" / "xet" / "chunk-cache"
-    baseline_xet = _dir_size(xet_chunks)
+    xet_root = Path.home() / ".cache" / "huggingface" / "xet"
+    baseline_xet = _xet_size(xet_root)
     while not stop.is_set():
         done = 0
         try:
@@ -222,7 +226,7 @@ def _poll_size(
         if done == 0:
             # Xet path: use chunk-cache delta, capped to `total` so a busy
             # shared cache from other downloads can't overshoot the bar.
-            xet_delta = max(0, _dir_size(xet_chunks) - baseline_xet)
+            xet_delta = max(0, _xet_size(xet_root) - baseline_xet)
             if total > 0:
                 xet_delta = min(xet_delta, total)
             done = xet_delta
@@ -246,6 +250,23 @@ def _dir_size(path: Path) -> int:
                     total += os.path.getsize(os.path.join(root, f))
                 except OSError:
                     pass
+    except (OSError, FileNotFoundError):
+        return 0
+    return total
+
+
+def _xet_size(xet_root: Path) -> int:
+    """Sum bytes across all Xet per-CAS-server chunk-cache and staging dirs.
+    The real paths look like `xet/https___cas_serv-<hash>/{chunk-cache,staging}/`,
+    and the CAS dir may not exist until the first chunk lands — so glob
+    each poll rather than caching paths."""
+    total = 0
+    try:
+        for cas_dir in xet_root.iterdir():
+            if not cas_dir.is_dir():
+                continue
+            total += _dir_size(cas_dir / "chunk-cache")
+            total += _dir_size(cas_dir / "staging")
     except (OSError, FileNotFoundError):
         return 0
     return total

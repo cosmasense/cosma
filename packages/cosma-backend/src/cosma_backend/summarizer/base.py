@@ -113,8 +113,14 @@ class BaseSummarizer(ABC):
         logger.info("Content chunked (noverify)", num_chunks=len(chunks))
 
         if not chunks:
-            logger.warning("Chunking produced no output, returning content as single chunk")
-            return [content]
+            # This should no longer happen (chunk_content now has a
+            # character-split fallback), but if it does we absolutely
+            # cannot return the full content — that sends an oversized
+            # prompt straight to the model. Truncate instead.
+            logger.error("Chunking produced no output even after fallback; "
+                         "truncating content to max_tokens worth of chars")
+            approx_chars = max(1, self.max_tokens * 3)
+            return [content[:approx_chars]]
 
         max_chunks = self.config.max_chunks
 
@@ -157,15 +163,15 @@ class BaseSummarizer(ABC):
         if len(chunk_summaries) == 1:
             return chunk_summaries[0]["summary"], chunk_summaries[0]["keywords"]
 
-        # Combine summaries
+        # Combine all chunk summaries. We keep the full concatenation for
+        # embedding purposes — the embedder tokenizer will truncate at its
+        # own max_seq_length if needed. Previously we replaced the joined
+        # summary with a "Multi-part document covering: first-3-chunks..."
+        # stub once the concatenation crossed 500 chars, which silently
+        # dropped every chunk past index 2 from the text the embedder sees.
+        # For a 10-chunk PDF, only 30% of the summarized content survived.
         summaries = [cs["summary"] for cs in chunk_summaries]
         combined_summary = " ".join(summaries)
-
-        # If combined summary is too long, summarize it again
-        if len(combined_summary) > 500:  # Rough character limit
-            combined_summary = f"Multi-part document covering: {'; '.join(summaries[:3])}"
-            if len(summaries) > 3:
-                combined_summary += f" and {len(summaries) - 3} additional topics."
 
         # Combine and deduplicate keywords
         all_keywords = []

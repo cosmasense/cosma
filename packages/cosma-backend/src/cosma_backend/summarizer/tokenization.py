@@ -5,7 +5,8 @@ Token estimation and content chunking utilities.
 from __future__ import annotations
 
 import re
-from typing import List, Optional
+from functools import lru_cache
+from typing import Callable, List, Optional
 
 import tiktoken
 
@@ -17,13 +18,12 @@ logger = get_logger(__name__)
 
 def get_encoding_for_model(model: str) -> tiktoken.Encoding:
     """
-    Get the tiktoken encoding for a given model name.
+    Get a tiktoken encoding for OpenAI-family model names.
 
-    Args:
-        model: Model name (e.g., "gpt-4", "gpt-3.5-turbo", "qwen3-vl:2b-instruct")
-
-    Returns:
-        tiktoken.Encoding object for the model
+    Kept for backward compatibility and for online (OpenAI-compatible)
+    providers. For non-OpenAI models (Qwen, Llama, Gemma, ...) callers
+    should prefer ``_get_token_counter`` which may return a proper HF
+    tokenizer keyed off an HF repo id ("owner/repo").
     """
     # Try to get encoding directly from tiktoken for known models
     try:
@@ -31,30 +31,65 @@ def get_encoding_for_model(model: str) -> tiktoken.Encoding:
     except KeyError:
         pass
 
-    # Handle common model families and aliases
     model_lower = model.lower()
 
-    # OpenAI models
     if any(x in model_lower for x in ["gpt-4", "gpt-3.5", "gpt-35"]):
         return tiktoken.get_encoding("cl100k_base")
     elif "gpt-3" in model_lower or "davinci" in model_lower or "curie" in model_lower:
         return tiktoken.get_encoding("p50k_base")
-
-    # Claude models use cl100k_base approximation
-    elif "claude" in model_lower:
+    elif "claude" in model_lower or "gemini" in model_lower:
         return tiktoken.get_encoding("cl100k_base")
 
-    # Gemini models use cl100k_base approximation
-    elif "gemini" in model_lower:
-        return tiktoken.get_encoding("cl100k_base")
-
-    # Llama models (including Ollama) - use cl100k_base as approximation
-    elif any(x in model_lower for x in ["llama", "mistral", "mixtral", "phi", "qwen", "gemma", "deepseek"]):
-        return tiktoken.get_encoding("cl100k_base")
-
-    # Default to cl100k_base for unknown models (GPT-4 tokenizer)
     logger.debug(f"Unknown model '{model}', defaulting to cl100k_base encoding")
     return tiktoken.get_encoding("cl100k_base")
+
+
+@lru_cache(maxsize=8)
+def _load_hf_tokenizer(repo_id: str):
+    """Load and cache an HF tokenizer. Returns None on any failure so the
+    caller can fall back to tiktoken/heuristic counting without crashing.
+
+    The tokenizer download is tiny (~5 MB) compared to the GGUF weights,
+    and `transformers` is already pulled in by sentence-transformers.
+    """
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=False)
+        logger.info("Loaded HF tokenizer for token counting",
+                    repo_id=repo_id, vocab_size=tok.vocab_size)
+        return tok
+    except Exception as e:
+        logger.warning("Failed to load HF tokenizer, will fall back",
+                       repo_id=repo_id, error=str(e))
+        return None
+
+
+def _get_token_counter(model: Optional[str]) -> Callable[[str], int]:
+    """Return a callable that counts tokens for `model`.
+
+    Resolution order:
+      1. `model` looks like an HF repo ("owner/repo"): try AutoTokenizer.
+      2. Otherwise: tiktoken encoding_for_model / family heuristic.
+      3. On any failure: 4-chars-per-token heuristic.
+
+    The GGUF repos the bootstrap pulls (e.g. unsloth/*-GGUF) don't carry
+    a usable `config.json` for AutoTokenizer, so callers should pass the
+    upstream tokenizer repo (see `LlamaCppConfig.tokenizer_repo`) rather
+    than the GGUF repo.
+    """
+    if model and "/" in model:
+        tok = _load_hf_tokenizer(model)
+        if tok is not None:
+            def _count(text: str, _tok=tok) -> int:
+                return len(_tok.encode(text, add_special_tokens=False))
+            return _count
+
+    try:
+        enc = get_encoding_for_model(model) if model else tiktoken.get_encoding("cl100k_base")
+        return lambda text: len(enc.encode(text))
+    except Exception as e:
+        logger.warning("Token counter fallback to char heuristic", error=str(e))
+        return lambda text: len(text) // 4
 
 
 def estimate_tokens_fast(text: str, model: Optional[str] = None) -> int:
@@ -90,16 +125,9 @@ def estimate_tokens(text: str, model: Optional[str] = None, use_fast: bool = Fal
         return estimate_tokens_fast(text, model)
 
     try:
-        if model:
-            encoding = get_encoding_for_model(model)
-        else:
-            # Default to cl100k_base (used by GPT-4, GPT-3.5-turbo, etc.)
-            encoding = tiktoken.get_encoding("cl100k_base")
-
-        return len(encoding.encode(text))
+        return _get_token_counter(model)(text)
     except Exception as e:
-        logger.warning(f"Error using tiktoken: {e}, falling back to fast estimation")
-        # Fallback to fast estimation
+        logger.warning(f"Error counting tokens: {e}, falling back to fast estimation")
         return estimate_tokens_fast(text, model)
 
 
@@ -167,6 +195,44 @@ async def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50,
             chunk_text = await _oversized_chunk_fix(chunk_text, max_tokens, model)
         chunks.append(chunk_text)
 
+    # Fallback: if sentence-based splitting produced no chunks (e.g. content
+    # with no ". " sequences — raw markdown, PDF-extracted text without
+    # sentence delimiters, log files), break the content by character
+    # ranges guaranteed to fit ``max_tokens``. Without this, callers treated
+    # the original content as a single chunk and sent it to the model, which
+    # then blew past the context window.
+    if not chunks:
+        logger.warning("Sentence-based chunking produced no chunks; "
+                       "falling back to character-based splitting",
+                       content_length=len(content), max_tokens=max_tokens)
+        chunks = await _character_split(content, max_tokens, model)
+
+    return chunks
+
+
+async def _character_split(content: str, max_tokens: int, model: Optional[str] = None) -> List[str]:
+    """Split by character ranges, verifying each piece against ``max_tokens``.
+
+    Used as a last resort when sentence-based chunking yields nothing.
+    Uses a conservative ~3 chars/token estimate and then trims any chunk
+    that still measures over the limit.
+    """
+    approx_chars_per_chunk = max(1, max_tokens * 3)
+    chunks: List[str] = []
+    pos = 0
+    while pos < len(content):
+        end = min(pos + approx_chars_per_chunk, len(content))
+        piece = content[pos:end]
+        # Shrink until the piece genuinely fits — the 3 chars/token estimate
+        # understates tokens for CJK / base64 / code.
+        while piece and await estimate_tokens(piece, model, use_fast=False) > max_tokens:
+            piece = piece[: max(1, int(len(piece) * 0.8))]
+        if piece:
+            chunks.append(piece)
+            pos += len(piece)
+        else:
+            # Safety: avoid infinite loop if tokenization keeps rejecting.
+            break
     return chunks
 
 

@@ -101,6 +101,12 @@ class IndexingQueue:
 
         self._manually_paused = False
         self._scheduler_paused = False
+        # Set at startup if bootstrap (llama/whisper model downloads) hasn't
+        # finished yet. Cleared once the bootstrap runner emits a "complete"
+        # event. Without this gate, any file discovered by the watcher during
+        # the initial download would hit AutoSummarizer → load_model() →
+        # a lazy HF download racing the bootstrap on the same GGUF.
+        self._bootstrap_paused = False
 
         self._processing_task: Optional[asyncio.Task] = None
         self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
@@ -124,7 +130,7 @@ class IndexingQueue:
 
     @property
     def is_paused(self) -> bool:
-        return self._manually_paused or self._scheduler_paused
+        return self._manually_paused or self._scheduler_paused or self._bootstrap_paused
 
     @property
     def is_manually_paused(self) -> bool:
@@ -133,6 +139,10 @@ class IndexingQueue:
     @property
     def is_scheduler_paused(self) -> bool:
         return self._scheduler_paused
+
+    @property
+    def is_bootstrap_paused(self) -> bool:
+        return self._bootstrap_paused
 
     @property
     def item_count(self) -> int:
@@ -195,6 +205,16 @@ class IndexingQueue:
             self._scheduler_paused = False
             self._publish(Update.create(UpdateOpcode.SCHEDULER_RESUMED))
             logger.info("Queue resumed by scheduler")
+
+    def bootstrap_pause(self) -> None:
+        if not self._bootstrap_paused:
+            self._bootstrap_paused = True
+            logger.info("Queue paused: bootstrap in progress")
+
+    def bootstrap_resume(self) -> None:
+        if self._bootstrap_paused:
+            self._bootstrap_paused = False
+            logger.info("Queue resumed: bootstrap complete")
 
     # ------------------------------------------------------------------
     # Enqueue / Remove
@@ -420,6 +440,7 @@ class IndexingQueue:
             "paused": self.is_paused,
             "manually_paused": self._manually_paused,
             "scheduler_paused": self._scheduler_paused,
+            "bootstrap_paused": self._bootstrap_paused,
             "total_items": len(items),
             "cooling_down": sum(1 for i in items if i.status == QueueItemStatus.COOLING_DOWN),
             "waiting": sum(1 for i in items if i.status == QueueItemStatus.WAITING),
@@ -472,10 +493,18 @@ class IndexingQueue:
                         continue
 
                 async with self._lock:
-                    ready_items = [
-                        i for i in self._items.values()
-                        if i.status == QueueItemStatus.WAITING
-                    ]
+                    # Only claim as many items as we can actually run at once.
+                    # The old behavior marked every WAITING item as PROCESSING,
+                    # spawning hundreds of asyncio tasks that all parked on
+                    # the semaphore — starving the event loop and making
+                    # status=PROCESSING lie about how many were truly running.
+                    ready_items = []
+                    cap = self._config.max_concurrency
+                    for i in self._items.values():
+                        if i.status == QueueItemStatus.WAITING:
+                            ready_items.append(i)
+                            if len(ready_items) >= cap:
+                                break
                     # Mark PROCESSING under the lock so concurrent enqueue()
                     # calls see the correct status while items wait for the
                     # semaphore.

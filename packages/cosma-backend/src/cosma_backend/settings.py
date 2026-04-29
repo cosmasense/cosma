@@ -62,6 +62,14 @@ class LlamaCppConfig:
     chat_handler: str = "qwen3-vl"
     enable_thinking: bool = False
     image_min_tokens: int = 1024
+    # HF repo for the tokenizer used when counting/chunking tokens. The GGUF
+    # repo itself usually has no `config.json` / `tokenizer.json` layout that
+    # `AutoTokenizer` accepts, so we point at the upstream un-quantized repo.
+    # Setting this to the model's real tokenizer prevents the tiktoken
+    # cl100k_base fallback, which miscounts Qwen tokens and causes
+    # "token out of bounds" failures at llama.cpp prefill when a chunk
+    # actually exceeds n_ctx.
+    tokenizer_repo: str = "Qwen/Qwen3-VL-2B-Instruct"
 
 
 @dataclass
@@ -109,7 +117,13 @@ class ParserConfig:
     extraction_strategy: str = "spotlight_first"
     spotlight_enabled: bool = True
     spotlight_timeout_seconds: int = 5
-    max_file_size_mb: int = 200
+    # Hard cap on file size before extraction even starts. Set generously
+    # (20 GB) because the per-extractor pipelines stream rather than load
+    # whole files: ffmpeg streams audio/video, MarkItDown / PDF readers
+    # operate page-by-page, and Whisper consumes audio in chunks. The cap
+    # exists only to avoid pathological inputs (corrupted multi-TB files,
+    # disk images mistakenly inside a watched folder).
+    max_file_size_mb: int = 20480
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
 
 

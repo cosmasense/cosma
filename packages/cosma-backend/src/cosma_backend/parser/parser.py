@@ -316,6 +316,13 @@ class FileParser:
         try:
             if media_type == "audio":
                 content = await extract_audio_transcript(path, self.config)
+                # Audio with no decodable speech (silent track, broken codec,
+                # whisper produced empty segments) used to fail the whole
+                # file. Fall back to a metadata placeholder so the file is at
+                # least indexed by name/extension and findable in search —
+                # the user's report had >40 .mov / .mp3 files in this hole.
+                if not content or len(content.strip()) <= 10:
+                    content = _audio_metadata_placeholder(path)
             elif media_type == "video":
                 # Extract both transcript and frames for vision analysis
                 video_content = await extract_video_content(path)
@@ -326,6 +333,23 @@ class FileParser:
                     logger.debug("Attached video frames for vision analysis",
                                  path=str(path),
                                  num_frames=len(video_content.frames))
+                    # A silent video (camera footage, B-roll) has no speech
+                    # to transcribe, but we DID get frames. Don't fail the
+                    # extraction — give the summarizer a placeholder so its
+                    # vision pass can still run against the frames. Without
+                    # this, every silent .mov / .mp4 was marked FAILED.
+                    if not content or len(content.strip()) <= 10:
+                        content = (
+                            f"Video file: {path.name} "
+                            f"({len(video_content.frames)} frames extracted "
+                            f"for visual description)."
+                        )
+                # Last resort: ffmpeg couldn't decode frames *and* there's no
+                # transcript (codec unsupported, file truncated, encrypted
+                # disk image masquerading as .mov, etc.). Emit metadata so
+                # the file shows up by name instead of being marked FAILED.
+                if not content or len(content.strip()) <= 10:
+                    content = _video_metadata_placeholder(path)
             elif media_type == "image":
                 # For images, we'll let the summarization process handle vision analysis
                 # Just extract basic image info here
@@ -376,8 +400,9 @@ class FileParser:
             logger.debug("Trying MarkItDown extraction", path=str(path))
 
             # Timeout prevents hangs on malformed/malicious files
+            from cosma_backend.pipeline_executor import run_in_pipeline
             result = await asyncio.wait_for(
-                asyncio.to_thread(self.markitdown.convert, str(path)),
+                run_in_pipeline(self.markitdown.convert, str(path)),
                 timeout=120,  # 2 minute max per file
             )
 
@@ -429,6 +454,52 @@ class FileParser:
         for key in self.extraction_stats:
             self.extraction_stats[key] = 0
         logger.info("Extraction statistics reset")
+
+
+def _human_size(num_bytes: int) -> str:
+    """Format a byte count as a human-readable string (e.g. "12.4 MB")."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{int(num_bytes)} B"
+
+
+def _audio_metadata_placeholder(path: Path) -> str:
+    """Build a minimal text body for an audio file when transcription fails.
+
+    Indexes the file by name, extension, and size so it surfaces in search
+    even when whisper produced no usable transcript (silent track, codec
+    not understood, file too short).
+    """
+    try:
+        size = path.stat().st_size
+        size_str = _human_size(size)
+    except OSError:
+        size_str = "unknown size"
+    return (
+        f"Audio file: {path.name}\n"
+        f"Type: {path.suffix.lower().lstrip('.')} audio, {size_str}.\n"
+        f"No speech transcript could be extracted."
+    )
+
+
+def _video_metadata_placeholder(path: Path) -> str:
+    """Build a minimal text body for a video file when both frame and
+    audio extraction failed. See ``_audio_metadata_placeholder`` for why
+    we degrade to metadata instead of failing the file."""
+    try:
+        size = path.stat().st_size
+        size_str = _human_size(size)
+    except OSError:
+        size_str = "unknown size"
+    return (
+        f"Video file: {path.name}\n"
+        f"Type: {path.suffix.lower().lstrip('.')} video, {size_str}.\n"
+        f"No transcript or frames could be extracted "
+        f"(codec unsupported or file unreadable)."
+    )
 
 
 def get_supported_extensions() -> set[str]:

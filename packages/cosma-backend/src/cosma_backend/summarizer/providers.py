@@ -222,10 +222,29 @@ class LlamaCppSummarizer(BaseSummarizer):
         if not (self.model_path or all((self.repo_id, self.filename))):
             raise ValueError("llamacpp.model_path or llamacpp.repo_id + llamacpp.filename must be configured")
 
-        context_length = max_tokens or self.config.llamacpp.context_length
-        super().__init__(config=self.config, max_tokens=context_length, model="llama.cpp")
-
         self.n_ctx = n_ctx or self.config.llamacpp.n_ctx
+        # Reserve headroom in every chunk for the system prompt, user scaffolding
+        # (filename, part-of-N header), image tokens, and generation budget. When
+        # n_ctx is small (e.g. 8192) and a chunk filled it entirely, llama.cpp
+        # rejected the prefill with "Requested tokens (N) exceed context window".
+        # Budget: ~1200 for system+scaffolding+generation, plus image_min_tokens
+        # when vision is enabled.
+        prompt_headroom = 1200
+        if self.chat_handler_name and self.config.llamacpp.image_min_tokens > 0:
+            prompt_headroom += self.config.llamacpp.image_min_tokens
+        raw_context_length = max_tokens or self.config.llamacpp.context_length
+        # Cap chunk size at n_ctx - headroom so a chunk + prompt always fits.
+        context_length = max(512, min(raw_context_length, self.n_ctx - prompt_headroom))
+        if context_length < raw_context_length:
+            logger.info("Reducing chunk size to fit n_ctx with prompt headroom",
+                        configured=raw_context_length, effective=context_length,
+                        n_ctx=self.n_ctx, headroom=prompt_headroom)
+        # Pass the HF tokenizer repo as the model identifier so token counting
+        # uses the real Qwen tokenizer rather than the cl100k_base fallback.
+        # Mismatched counts caused chunks to exceed n_ctx and trip llama.cpp
+        # with "token out of bounds" at prefill.
+        tokenizer_repo = self.config.llamacpp.tokenizer_repo or "llama.cpp"
+        super().__init__(config=self.config, max_tokens=context_length, model=tokenizer_repo)
 
         try:
             import importlib.util
@@ -389,10 +408,67 @@ class LlamaCppSummarizer(BaseSummarizer):
     async def _get_ai_response(self, chunk: str, chunk_num: int, total_chunks: int, images: list[str], filename: str) -> str | None:
         self._ensure_loaded()
         text = self._format_content_with_context(chunk, chunk_num, total_chunks, filename)
-        user_content = self._build_user_content(text, images)
+        sys_prompt = self._get_system_prompt(include_title=(chunk_num == 0))
 
+        # Hard safety net against context-window overflow.
+        #
+        # Upstream chunking uses an HF tokenizer (or a tiktoken / 4-chars
+        # heuristic fallback) whose token counts can disagree with the
+        # GGUF model's real tokenizer by 20-50% for CJK / code / dense
+        # technical text. When the disagreement goes the wrong way, a
+        # chunk that "fits" by upstream count blows past n_ctx at prefill
+        # and llama.cpp aborts with "Requested tokens (N) exceed context
+        # window of M" — which is what the user's failure report showed
+        # across ~17 PDFs.
+        #
+        # We measure the prompt with the *actual* model tokenizer here
+        # and trim the user content from the tail until it fits, so the
+        # call always succeeds with whatever fraction of the chunk we
+        # can carry. Better a partial summary than a hard FAILED.
+        generation_budget = 500
+        chat_template_overhead = 200  # role markers, BOS/EOS, format tokens
+        try:
+            sys_token_count = len(self.llm.tokenize(sys_prompt.encode("utf-8"), add_bos=False, special=True))
+        except Exception:
+            sys_token_count = max(1, len(sys_prompt) // 3)
+        image_tokens = self.config.llamacpp.image_min_tokens if (images and self.chat_handler) else 0
+        available_for_user = (
+            self.n_ctx
+            - sys_token_count
+            - generation_budget
+            - chat_template_overhead
+            - image_tokens
+        )
+        # Floor so impossibly tight n_ctx values still produce *something*.
+        available_for_user = max(256, available_for_user)
+
+        try:
+            text_tokens = self.llm.tokenize(text.encode("utf-8"), add_bos=False, special=False)
+        except Exception:
+            text_tokens = None
+
+        if text_tokens is not None and len(text_tokens) > available_for_user:
+            logger.warning(
+                "User content exceeds n_ctx budget at prefill; truncating to fit",
+                original_tokens=len(text_tokens),
+                kept_tokens=available_for_user,
+                n_ctx=self.n_ctx,
+                sys_tokens=sys_token_count,
+                image_tokens=image_tokens,
+                generation_budget=generation_budget,
+            )
+            try:
+                text = self.llm.detokenize(text_tokens[:available_for_user]).decode("utf-8", errors="ignore")
+            except Exception:
+                # detokenize() can fail on partial multi-byte sequences; fall
+                # back to a character-based trim with the same total budget.
+                approx_chars = available_for_user * 3
+                text = text[:approx_chars]
+            text = text + "\n\n[content truncated to fit model context window]"
+
+        user_content = self._build_user_content(text, images)
         messages = [
-            {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_content},
         ]
 
@@ -401,7 +477,7 @@ class LlamaCppSummarizer(BaseSummarizer):
         response = await asyncio.to_thread(
             self.llm.create_chat_completion,
             messages=messages,
-            max_tokens=500,
+            max_tokens=generation_budget,
             temperature=0.1,
             top_p=0.95,
             stream=False,

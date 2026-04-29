@@ -690,8 +690,9 @@ async def _transcribe_with_whisper_python(audio_path: Path) -> str | None:
             return result
 
         try:
+            from cosma_backend.pipeline_executor import get_pipeline_executor
             result = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, _do_transcribe_with_segments),
+                asyncio.get_event_loop().run_in_executor(get_pipeline_executor(), _do_transcribe_with_segments),
                 timeout=WHISPER_TIMEOUT_SECONDS + 5  # Allow a bit more for cleanup
             )
 

@@ -117,6 +117,31 @@ DEFAULT_INCLUDE_PATTERNS = [
 ]
 
 
+# Structural directory exclusions that should apply in whitelist mode too.
+# A user who whitelists "*.py" does not want the 20k .py files inside every
+# .venv or node_modules on their disk.
+DEFAULT_WHITELIST_EXCLUDE_PATTERNS = [
+    ".git/",
+    ".svn/",
+    ".hg/",
+    "node_modules/",
+    "vendor/",
+    "venv/",
+    ".venv/",
+    "site-packages/",
+    "__pycache__/",
+    "*.egg-info/",
+    "build/",
+    "dist/",
+    "target/",
+    ".idea/",
+    ".vscode/",
+    ".cache/",
+    ".pytest_cache/",
+    ".DS_Store",
+]
+
+
 @dataclass
 class FilterConfig:
     """
@@ -404,11 +429,11 @@ class FilterConfig:
                 blacklist_include = old_include
                 # Initialize whitelist with sensible defaults
                 whitelist_include = default_whitelist
-                whitelist_exclude = []
+                whitelist_exclude = DEFAULT_WHITELIST_EXCLUDE_PATTERNS.copy()
             else:
                 # Old patterns were for whitelist mode
                 whitelist_include = old_include if old_include else default_whitelist
-                whitelist_exclude = old_exclude
+                whitelist_exclude = old_exclude or DEFAULT_WHITELIST_EXCLUDE_PATTERNS.copy()
                 # Initialize blacklist with defaults
                 blacklist_exclude = DEFAULT_EXCLUDE_PATTERNS.copy()
                 blacklist_include = DEFAULT_INCLUDE_PATTERNS.copy()

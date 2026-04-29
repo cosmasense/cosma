@@ -68,6 +68,18 @@ class AutoEmbedder:
                 logger.debug("Local embedder loaded",
                             model=local_embedder.model_name,
                             dimensions=local_embedder.dimensions)
+                # Warmup inference: the first .encode() after load pays the
+                # cost of lazy PyTorch op compilation and MPS graph caching
+                # (~1–3 s on M-series). Without this, the user's first search
+                # after app launch feels laggy even though the model is
+                # "ready". Running a throwaway encode here moves that cost
+                # to startup where the loading indicator already masks it.
+                try:
+                    local_embedder.embed_text("warmup")
+                    logger.info("Local embedder warmup complete")
+                except Exception as warmup_error:
+                    logger.warning("Local embedder warmup failed, first search may be slow",
+                                   error=str(warmup_error))
             else:
                 logger.warning("Local embedder failed to initialize")
 

@@ -253,12 +253,14 @@ class LocalEmbedder(BaseEmbedder):
                     dimensions=self.configured_dimensions)
 
         try:
-            # Generate embeddings asynchronously using asyncio.to_thread
-            embeddings = await asyncio.to_thread(
+            # Generate embeddings on the dedicated pipeline executor so the
+            # default thread pool stays free for API offloads.
+            from cosma_backend.pipeline_executor import run_in_pipeline
+            embeddings = await run_in_pipeline(
                 self.model.encode,
                 texts,
                 normalize_embeddings=True,
-                show_progress_bar=False
+                show_progress_bar=False,
             )
 
             # Truncate to configured dimensions if needed

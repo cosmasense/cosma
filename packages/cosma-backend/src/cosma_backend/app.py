@@ -27,6 +27,7 @@ from platformdirs import PlatformDirs
 from quart import Quart, request
 from quart_schema import QuartSchema
 
+from cosma_backend import bootstrap as _bootstrap_core
 from cosma_backend import db
 from cosma_backend.api import api_blueprint
 from cosma_backend.db.database import Database
@@ -164,6 +165,31 @@ class App(Quart):
         task.add_done_callback(remove_task_callback)
 
         return task
+
+
+async def _wait_for_bootstrap_and_resume(app: Quart) -> None:
+    """Subscribe to bootstrap progress and clear the queue's bootstrap pause
+    when a terminal "complete" event arrives (success or soft-failure).
+
+    Uses the same pub/sub that the /api/bootstrap/events SSE endpoint uses,
+    so a completion that happens before the user even clicks anything
+    (when models are already on disk but the initial status check missed)
+    still unblocks the queue.
+    """
+    q = _bootstrap_core.runner.subscribe()
+    try:
+        while True:
+            evt = await q.get()
+            if evt.done and evt.stage == "complete":
+                break
+            if evt.done and evt.stage == "error":
+                # Soft-fail: unblock the queue anyway so any components that
+                # did land are usable. The status endpoint still reports
+                # ready=False so the frontend can prompt the user.
+                break
+    finally:
+        _bootstrap_core.runner.unsubscribe(q)
+        app.indexing_queue.bootstrap_resume()
 
 
 async def cleanup_excluded_files_on_startup(db: Database, filter_manager: FilterConfigManager) -> int:
@@ -348,6 +374,22 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
         app.scheduler.start()
         app.model_lifecycle.start()
 
+        # If required models aren't on disk yet, gate the queue until the
+        # bootstrap runner finishes. Watcher discovery runs normally so items
+        # queue up and begin processing the instant models arrive.
+        bootstrap_status = await _bootstrap_core.get_status(
+            llama_cfg=settings.summarizer.llamacpp,
+            whisper_cfg=settings.parser.whisper,
+            summ_provider=settings.summarizer.provider,
+        )
+        if not bootstrap_status.ready:
+            app.indexing_queue.bootstrap_pause()
+            app._bootstrap_gate_task = asyncio.ensure_future(
+                _wait_for_bootstrap_and_resume(app)
+            )
+        else:
+            app._bootstrap_gate_task = None
+
         app.watcher = Watcher(
             db=app.db, pipeline=app.pipeline,
             filter_manager=app.filter_manager,
@@ -441,6 +483,14 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
             except (asyncio.CancelledError, Exception):
                 pass
 
+        gate = getattr(app, "_bootstrap_gate_task", None)
+        if gate and not gate.done():
+            gate.cancel()
+            try:
+                await gate
+            except (asyncio.CancelledError, Exception):
+                pass
+
         logger.info("Shutdown: stopping lifecycle manager, scheduler, and indexing queue")
 
         async def _safe(label: str, coro):
@@ -517,6 +567,32 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
                 status_code=response.status_code,
                 duration_seconds=duration
             )
+            # Slow-request probe: when a request exceeds 1 s, capture what the
+            # pipeline was doing so we can correlate latency spikes with work.
+            if duration > 1.0:
+                try:
+                    q = getattr(app, "indexing_queue", None)
+                    queue_ctx = {
+                        "processing": sum(
+                            1 for i in q._items.values()
+                            if i.status.name == "PROCESSING"
+                        ) if q is not None else None,
+                        "waiting": sum(
+                            1 for i in q._items.values()
+                            if i.status.name == "WAITING"
+                        ) if q is not None else None,
+                        "total_items": len(q._items) if q is not None else None,
+                        "is_paused": q.is_paused if q is not None else None,
+                    }
+                except Exception:
+                    queue_ctx = {}
+                logger.warning(
+                    "Slow request",
+                    method=request.method,
+                    path=request.path,
+                    duration_seconds=duration,
+                    **queue_ctx,
+                )
         return response
 
     return app

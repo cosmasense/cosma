@@ -26,6 +26,7 @@ class QueueStatusResponse:
     paused: bool
     manually_paused: bool
     scheduler_paused: bool
+    bootstrap_paused: bool
     total_items: int
     cooling_down: int
     waiting: int
@@ -318,3 +319,29 @@ async def queue_reindex_file() -> tuple[ReindexResponse, int]:
     await current_app.indexing_queue.enqueue(file_path, QueueAction.INDEX)
 
     return ReindexResponse(success=True, message=f"File enqueued for reindexing: {file_path}"), 200
+
+
+# ------------------------------------------------------------------
+# Dev-only: retry all FAILED files in one call (for fix→retry→observe loop)
+# ------------------------------------------------------------------
+
+@queue_bp.post("/retry_all_failed")
+async def queue_retry_all_failed() -> tuple[dict, int]:
+    """Re-enqueue every file currently in FAILED state and truncate the
+    dev failed-items log so the next pass writes a fresh record.
+
+    Gated on COSMA_DEV=1 so production builds can't accidentally blow up
+    their queue with a single call.
+    """
+    from cosma_backend.dev_logging import is_enabled, reset_log
+    from cosma_backend.queue import QueueAction
+
+    if not is_enabled():
+        return {"success": False, "message": "COSMA_DEV=1 required"}, 403
+
+    files, total = await current_app.db.get_files_by_status("FAILED", limit=100000, offset=0)
+    reset_log()
+    for f in files:
+        await current_app.db.delete_file(f.file_path)
+        await current_app.indexing_queue.enqueue(f.file_path, QueueAction.INDEX)
+    return {"success": True, "message": f"Re-enqueued {total} FAILED files", "count": total}, 200

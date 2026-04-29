@@ -34,3 +34,30 @@ Release + PyPI workflow lives in `docs/RELEASING.md`. Read it when tagging
 a new version or debugging a publish. Short version: bump versions →
 `git tag v*` → push tags → GitHub Actions does the rest; clients
 auto-upgrade on next launch.
+
+## Dev loop for pipeline failures (COSMA_DEV=1)
+
+When `COSMA_DEV=1` is set in the backend's environment (the frontend
+propagates it when the same var is set via `launchctl`), every file that
+lands in `FAILED` status gets appended as a JSON line to:
+
+```
+~/Library/Logs/cosma/failed-items.jsonl
+```
+
+Each record has `timestamp, file_path, extension, phase, error` — enough
+to cluster failures by extension or error message.
+
+Iteration loop:
+
+1. Backend runs, some files fail → lines appear in `failed-items.jsonl`.
+2. Tail or `jq` the file to find the next error class worth fixing:
+   `jq -r '.error' ~/Library/Logs/cosma/failed-items.jsonl | sort | uniq -c | sort -rn`
+3. Fix the code in the backend.
+4. Restart the backend (dev mode picks up source changes on restart — no rebuild).
+5. Re-enqueue every FAILED file and wipe the log for a clean slate:
+   `curl -X POST http://localhost:60534/api/queue/retry_all_failed`
+6. Tail `failed-items.jsonl` again; repeat until empty.
+
+The `/api/queue/retry_all_failed` endpoint returns 403 when COSMA_DEV is
+unset, so production users can never hit it.

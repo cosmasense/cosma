@@ -63,9 +63,10 @@ class BaseEmbedder(ABC):
         if hasattr(self, '_embed_text_async'):
             return await self._embed_text_async(text)
 
-        # Fallback to thread pool for legacy implementations
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.embed_text, text)
+        # Fallback: run on the pipeline executor so API handlers that call
+        # asyncio.to_thread aren't blocked behind embedder work.
+        from cosma_backend.pipeline_executor import run_in_pipeline
+        return await run_in_pipeline(self.embed_text, text)
 
     @abstractmethod
     def is_available(self) -> bool:

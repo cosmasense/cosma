@@ -352,18 +352,26 @@ class TestIndexingQueueRaceCondition:
         mock_pipeline.process_file.assert_not_called()
 
     async def test_no_item_loss_with_semaphore_contention(self, queue_config, mock_pipeline, mock_hub):
-        """With max_concurrency=1, an enqueue during semaphore wait should not lose items."""
+        """With max_concurrency=1, an enqueue during the active item's run should not lose items.
+
+        Contract: the queue loop now only claims up to ``max_concurrency`` items
+        per iteration (instead of marking every WAITING item PROCESSING
+        upfront), so at any instant ``status=PROCESSING`` accurately reflects
+        what's truly running. A re-enqueue against the PROCESSING item must
+        still be deferred to ``_pending_reenqueue`` and not lost.
+        """
         config = QueueConfig(cooldown_seconds=0.05, max_concurrency=1, max_retries=3)
         queue = IndexingQueue(pipeline=mock_pipeline, updates_hub=mock_hub, config=config)
 
-        # Enqueue two items so one must wait on the semaphore
+        # Enqueue two items; only one will be claimed per iteration.
         await queue.enqueue("/tmp/a.txt", QueueAction.INDEX)
         await queue.enqueue("/tmp/b.txt", QueueAction.INDEX)
 
         await asyncio.sleep(0.1)  # let cooldowns expire
 
         with patch("cosma_backend.queue.indexing_queue.File") as MockFile:
-            # Make processing slow so one item blocks the semaphore
+            # Make processing slow so the first item stays PROCESSING while
+            # we observe the queue state.
             async def slow_process(f):
                 await asyncio.sleep(0.3)
             mock_pipeline.process_file.side_effect = slow_process
@@ -372,15 +380,18 @@ class TestIndexingQueueRaceCondition:
             await queue.start()
             await asyncio.sleep(0.1)  # let the loop pick up items
 
-            # Both should be PROCESSING (set under the lock)
+            # Only max_concurrency items should be PROCESSING; the rest
+            # stay WAITING until their turn.
             items = list(queue._items.values())
             processing = [i for i in items if i.status == QueueItemStatus.PROCESSING]
-            assert len(processing) == 2
+            waiting = [i for i in items if i.status == QueueItemStatus.WAITING]
+            assert len(processing) == 1
+            assert len(waiting) == 1
 
-            # Now enqueue a new event for /tmp/b.txt while it waits on semaphore
-            await queue.enqueue("/tmp/b.txt", QueueAction.INDEX)
-            # Should be stored as pending re-enqueue since status is PROCESSING
-            assert any("/tmp/b.txt" in k for k in queue._pending_reenqueue)
+            # Re-enqueue the PROCESSING item — should go to pending_reenqueue.
+            active_path = processing[0].file_path
+            await queue.enqueue(active_path, QueueAction.INDEX)
+            assert any(active_path in k for k in queue._pending_reenqueue)
 
             await asyncio.sleep(1)  # let everything finish
             await queue.stop()

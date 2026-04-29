@@ -27,17 +27,24 @@ class SystemMetricsCollector:
         self._idle_since: Optional[float] = None
 
     async def collect(self) -> dict[str, Any]:
-        """Return a snapshot of current system metrics."""
+        """Return a snapshot of current system metrics.
+
+        All synchronous psutil calls go through ``asyncio.to_thread`` so the
+        event loop stays responsive. ``psutil.cpu_percent(interval=0.1)``
+        in particular blocks for 100 ms — on the event loop it stalls every
+        HTTP request. Under processing load, this collector was the top
+        source of slow-request warnings.
+        """
         metrics: dict[str, Any] = {}
 
-        metrics["battery_level"] = self._get_battery_level()
-        metrics["power_source_plugged"] = self._get_power_source()
-        metrics["cpu_percent"] = self._get_cpu_percent()
+        metrics["battery_level"] = await asyncio.to_thread(self._get_battery_level)
+        metrics["power_source_plugged"] = await asyncio.to_thread(self._get_power_source)
+        metrics["cpu_percent"] = await asyncio.to_thread(self._get_cpu_percent)
         metrics["cpu_idle_seconds"] = await self._get_cpu_idle_seconds()
         metrics["cpu_temperature"] = await self._get_cpu_temperature()
         metrics["fan_speed"] = await self._get_fan_speed()
-        metrics["memory_usage"] = self._get_memory_usage()
-        metrics["memory_pressure"] = self._get_memory_pressure()
+        metrics["memory_usage"] = await asyncio.to_thread(self._get_memory_usage)
+        metrics["memory_pressure"] = await asyncio.to_thread(self._get_memory_pressure)
         metrics["gpu_usage"] = await self._get_gpu_usage()
         metrics["low_power_mode"] = await self._get_low_power_mode()
         metrics["collected_at"] = time.time()
@@ -89,7 +96,7 @@ class SystemMetricsCollector:
         """
         try:
             import psutil
-            percent = psutil.cpu_percent(interval=0.1)
+            percent = await asyncio.to_thread(psutil.cpu_percent, 0.1)
             now = time.time()
             if percent < self._CPU_IDLE_THRESHOLD:
                 if self._idle_since is None:
