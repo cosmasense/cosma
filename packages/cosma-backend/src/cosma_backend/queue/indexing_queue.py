@@ -118,6 +118,22 @@ class IndexingQueue:
         # then wait instead of picking up new work.
         self._pre_task_hook: Optional[Callable[[], Awaitable[Any]]] = None
 
+        # Coalescer for QUEUE_ITEM_ADDED bursts during bulk discovery. New
+        # paths land in `_added_buffer`; a single asyncio task drains and
+        # publishes them as one QUEUE_BATCH_ADDED event every
+        # ``_added_flush_interval`` seconds. Without this, a 10k-file
+        # discovery sweep produced 10k SSE events, each triggering frontend
+        # state mutations and re-renders that visibly froze the UI even
+        # after we moved SSE parsing off the main actor.
+        self._added_buffer: list[str] = []
+        self._added_buffer_lock = asyncio.Lock()
+        self._added_flush_task: Optional[asyncio.Task] = None
+        self._added_flush_interval: float = 0.2  # 200 ms
+        # Hard upper bound on the buffer — if discovery is slamming us
+        # faster than 200 ms, force a flush at this many items rather
+        # than letting a single batch grow unbounded.
+        self._added_buffer_max: int = 500
+
     def set_pre_task_hook(self, hook: Optional[Callable[[], Awaitable[Any]]]) -> None:
         """Install a callback invoked once per processing cycle, right
         before ready items are picked. Used by the scheduler to evaluate
@@ -167,6 +183,8 @@ class IndexingQueue:
         if self._processing_task is None or self._processing_task.done():
             self._processing_task = asyncio.create_task(self._processing_loop())
             logger.info("Indexing queue processing loop started")
+        if self._added_flush_task is None or self._added_flush_task.done():
+            self._added_flush_task = asyncio.create_task(self._added_flush_loop())
 
     async def stop(self) -> None:
         """Stop the background processing loop."""
@@ -177,6 +195,57 @@ class IndexingQueue:
             except asyncio.CancelledError:
                 pass
             logger.info("Indexing queue processing loop stopped")
+        if self._added_flush_task is not None and not self._added_flush_task.done():
+            self._added_flush_task.cancel()
+            try:
+                await self._added_flush_task
+            except asyncio.CancelledError:
+                pass
+        # Final drain so anything still in the buffer reaches subscribers
+        # before shutdown. Safe to call from any state.
+        self._flush_added_buffer()
+
+    async def _added_flush_loop(self) -> None:
+        """Periodically drain the QUEUE_ITEM_ADDED coalescing buffer.
+
+        Runs as a long-lived background task. Each tick checks the buffer
+        and, if non-empty, emits a single QUEUE_BATCH_ADDED SSE event with
+        the accumulated paths. The flush is also triggered synchronously
+        from enqueue() when the buffer hits ``_added_buffer_max`` so
+        sustained high-rate enqueueing doesn't let the buffer grow
+        unbounded between ticks.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._added_flush_interval)
+                self._flush_added_buffer()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Queue added-buffer flush failed; continuing")
+
+    def _flush_added_buffer(self) -> None:
+        """Emit one QUEUE_BATCH_ADDED for everything in the buffer.
+
+        Cheap and synchronous (no I/O, no DB) so it's safe to call from
+        either the periodic flusher or directly from enqueue() under the
+        lock when the buffer hits its size cap.
+        """
+        if not self._added_buffer:
+            return
+        paths = self._added_buffer
+        self._added_buffer = []
+        # Single info-level summary per flush so an operator can still
+        # see ingestion progress in logs without the per-file noise.
+        logger.info("Queue enqueue batch flushed", count=len(paths))
+        try:
+            self._updates_hub.publish(Update.create(
+                UpdateOpcode.QUEUE_BATCH_ADDED,
+                count=len(paths),
+                paths=paths,
+            ))
+        except Exception:
+            logger.exception("Failed to publish QUEUE_BATCH_ADDED")
 
     # ------------------------------------------------------------------
     # Pause / Resume
@@ -352,11 +421,20 @@ class IndexingQueue:
                 self._items[key] = item
                 if action == QueueAction.MOVE and dest_key:
                     self._dest_to_src[dest_key] = key
-                self._publish(Update.create(
-                    UpdateOpcode.QUEUE_ITEM_ADDED, **item.to_dict()
-                ))
+                # Buffer the ADDED notification. The flusher publishes a
+                # single QUEUE_BATCH_ADDED every ~200 ms (or when the
+                # buffer hits _added_buffer_max). This collapses the
+                # 10k-event burst from a fresh-folder scan into ~50
+                # batched events with negligible UI cost. See _flush_added_buffer.
+                self._added_buffer.append(key)
+                if len(self._added_buffer) >= self._added_buffer_max:
+                    self._flush_added_buffer()
                 item_to_persist = item
-                logger.info("Item enqueued", file_path=key, action=action.value)
+                # Per-item log demoted to debug — bulk discovery used to
+                # emit thousands of "Item enqueued" lines per second,
+                # crowding out anything actually useful in the log file.
+                # The periodic flusher emits a single info summary instead.
+                logger.debug("Item enqueued", file_path=key, action=action.value)
 
         # Persist outside the lock to avoid blocking concurrent operations.
         if item_to_persist is not None:

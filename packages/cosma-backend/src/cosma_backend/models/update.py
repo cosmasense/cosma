@@ -41,6 +41,11 @@ class UpdateOpcode(enum.Enum):
     
     # Queue updates
     QUEUE_ITEM_ADDED = "queue_item_added"
+    # Coalesced burst of newly-enqueued items, used during bulk discovery
+    # so the SSE stream isn't drowned in per-file events. Payload carries
+    # `paths: list[str]` and a `count` summary; the per-file ADDED event
+    # is suppressed in this window.
+    QUEUE_BATCH_ADDED = "queue_batch_added"
     QUEUE_ITEM_UPDATED = "queue_item_updated"
     QUEUE_ITEM_PROCESSING = "queue_item_processing"
     QUEUE_ITEM_COMPLETED = "queue_item_completed"
