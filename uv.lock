@@ -410,7 +410,7 @@ wheels = [
 
 [[package]]
 name = "cosma"
-version = "0.8.1"
+version = "0.8.2"
 source = { editable = "." }
 dependencies = [
     { name = "click-help-colors" },
@@ -450,7 +450,7 @@ dev = [
 
 [[package]]
 name = "cosma-backend"
-version = "0.8.1"
+version = "0.8.2"
 source = { editable = "packages/cosma-backend" }
 dependencies = [
     { name = "asqlite" },

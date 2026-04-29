@@ -9,6 +9,8 @@
 @Desc    :   Hybrid search combining semantic similarity and keyword matching
 """
 
+import asyncio
+import time
 from dataclasses import dataclass
 
 
@@ -104,7 +106,12 @@ class HybridSearcher:
         Returns:
             List of SearchResult objects sorted by RRF score
         """
-        logger.info("Performing hybrid search with RRF",
+        # Timing chain — every stage logs its own ms so a slow first
+        # search has a single grep-friendly trail. Pre-fix, we had no
+        # idea whether a 30s timeout was the embed call, the FTS5 query,
+        # the rerank, or the response serialization.
+        t_start = time.perf_counter()
+        logger.info("Search request received",
                        query=query,
                        limit=limit,
                        rrf_k=rrf_k,
@@ -117,30 +124,34 @@ class HybridSearcher:
         semantic_list: list[tuple[int, File, float]] = []
         keyword_list: list[tuple[int, File, float]] = []
 
-        # 1. Semantic search
-        try:
-            semantic_matches = await self._semantic_search(query, fetch_limit, semantic_threshold, directory)
-            for file_metadata, distance in semantic_matches:
+        # 1. Semantic + 2. Keyword run in parallel — they're independent
+        # work and there's no reason to serialize them on the event loop.
+        # (The semantic side was previously also synchronous, which made
+        # the parallelism academic; with embed_text_async it's real.)
+        t_lookup = time.perf_counter()
+        sem_task = asyncio.create_task(self._semantic_search(query, fetch_limit, semantic_threshold, directory))
+        kw_task = asyncio.create_task(self._keyword_search(query, fetch_limit, directory))
+        sem_result, kw_result = await asyncio.gather(sem_task, kw_task, return_exceptions=True)
+        lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
+
+        if isinstance(sem_result, Exception):
+            logger.warning("Semantic search failed", error=str(sem_result))
+        else:
+            for file_metadata, distance in sem_result:
                 file_id = file_metadata.id if hasattr(file_metadata, "id") else hash(file_metadata.file_path)
                 semantic_list.append((file_id, file_metadata, distance))
 
-            logger.debug("Semantic search completed", results=len(semantic_list))
-        except Exception as e:
-            logger.warning("Semantic search failed", error=str(e))
-
-        # 2. Keyword search
-        try:
-            keyword_matches = await self._keyword_search(query, fetch_limit, directory)
-            for file_metadata, score in keyword_matches:
+        if isinstance(kw_result, Exception):
+            logger.warning("Keyword search failed", error=str(kw_result))
+        else:
+            for file_metadata, score in kw_result:
                 file_id = file_metadata.id if hasattr(file_metadata, "id") else hash(file_metadata.file_path)
                 keyword_list.append((file_id, file_metadata, score))
 
-            logger.debug("Keyword search completed", results=len(keyword_list))
-        except Exception as e:
-            logger.warning("Keyword search failed", error=str(e))
-
         # 3. Merge using RRF
+        t_rrf = time.perf_counter()
         merged = merge_with_rrf(semantic_list, keyword_list, k=rrf_k)
+        rrf_ms = (time.perf_counter() - t_rrf) * 1000.0
 
         # 4. Build SearchResult objects
         results = []
@@ -154,8 +165,13 @@ class HybridSearcher:
             )
             results.append(result)
 
-        logger.info("Hybrid search completed",
-                       total_results=len(results),
+        total_ms = (time.perf_counter() - t_start) * 1000.0
+        logger.info("Search completed",
+                       query=query,
+                       total_ms=round(total_ms, 1),
+                       lookup_ms=round(lookup_ms, 1),
+                       rrf_ms=round(rrf_ms, 1),
+                       results=len(results),
                        semantic_matches=len(semantic_list),
                        keyword_matches=len(keyword_list))
 
@@ -167,16 +183,32 @@ class HybridSearcher:
             return []
 
         try:
-            # Generate query embedding
-            query_embedding = self.embedder.embed_text(query)
+            # Generate query embedding off the event loop. The previous
+            # synchronous `embed_text(query)` call blocked asyncio while the
+            # SentenceTransformer ran a 50-200 ms forward pass on CPU — and
+            # *much* longer (5-15 s) on the very first call after launch
+            # while the model was lazy-loading. During that window EVERY
+            # other endpoint (status, queue, watch) also stalled, which
+            # surfaced to the user as "the UI is frozen and search times
+            # out." `embed_text_async` delegates to the shared pipeline
+            # executor so other handlers keep running.
+            embed_start = time.perf_counter()
+            query_embedding = await self.embedder.embed_text_async(query)
+            embed_ms = (time.perf_counter() - embed_start) * 1000.0
 
-            # Search similar files
-            return await self.db.search_similar_files(
+            db_start = time.perf_counter()
+            results = await self.db.search_similar_files(
                 query_embedding=query_embedding,
                 limit=limit,
                 threshold=threshold,
                 directory=directory
             )
+            db_ms = (time.perf_counter() - db_start) * 1000.0
+
+            logger.info("Semantic search timing",
+                        query_len=len(query), embed_ms=round(embed_ms, 1),
+                        db_ms=round(db_ms, 1), candidates=len(results))
+            return results
 
 
         except Exception as e:
