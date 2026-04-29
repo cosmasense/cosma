@@ -192,6 +192,72 @@ class Database:
                     return File.from_row(row)
         return None
     
+    async def get_files_under_directory_summary(self, directory_path: str) -> dict[str, tuple[str, datetime.datetime | None]]:
+        """Bulk-load (status, modified) for every file under ``directory_path``.
+
+        Used by `pipeline.enqueue_directory` to avoid issuing one
+        ``SELECT * FROM files WHERE file_path = ?`` per file during
+        directory enumeration. For a 10k-file watched folder, the
+        per-file approach was 10k DB roundtrips per startup discovery
+        sweep — visibly responsible for the post-launch CPU spike. One
+        prefix-LIKE query is dramatically cheaper because SQLite can
+        use the file_path index for the range scan.
+
+        Returns a dict keyed by file_path → (status_str, modified_dt).
+        Empty dict (not None) when nothing matches, so callers can
+        unconditionally `.get()` without a None check.
+        """
+        # Trailing slash on the prefix so we don't match siblings that
+        # share a path prefix with the directory name.
+        prefix = directory_path.rstrip("/") + "/"
+        SQL = "SELECT file_path, status, modified FROM files WHERE file_path LIKE ?"
+        out: dict[str, tuple[str, datetime.datetime | None]] = {}
+
+        def _parse_mtime(value) -> Optional[datetime.datetime]:
+            # Mirror models.file.from_row's parse_timestamp logic so the
+            # caller can compare against File.modified directly. Stored
+            # as a unix timestamp; tolerate already-datetime values for
+            # a future schema change.
+            if not value:
+                return None
+            if isinstance(value, datetime.datetime):
+                return value
+            try:
+                return datetime.datetime.fromtimestamp(value)
+            except (ValueError, TypeError, OSError):
+                return None
+
+        async with self.acquire() as conn:
+            async with conn.execute(SQL, (prefix + "%",)) as cursor:
+                async for row in cursor:
+                    out[row["file_path"]] = (row["status"], _parse_mtime(row["modified"]))
+        return out
+
+    async def touch_files_timestamps(self, file_paths: list[str]) -> int:
+        """Bulk-update updated_at on a list of file_paths in one statement.
+
+        Replaces N individual `update_file_timestamp` calls with a single
+        UPDATE ... WHERE file_path IN (...). Used by enqueue_directory
+        as the "mark this file as still on disk" half of the
+        mark-and-sweep stale-file cleanup.
+
+        Chunked at 500 paths per statement to stay safely under SQLite's
+        SQLITE_LIMIT_VARIABLE_NUMBER (default 32766 in modern SQLite, but
+        older builds capped at 999). Returns total rows affected.
+        """
+        if not file_paths:
+            return 0
+        total = 0
+        CHUNK = 500
+        async with self.acquire() as conn:
+            for i in range(0, len(file_paths), CHUNK):
+                chunk = file_paths[i:i + CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                SQL = f"UPDATE files SET updated_at = (strftime('%s', 'now')) WHERE file_path IN ({placeholders})"
+                cursor = await conn.execute(SQL, tuple(chunk))
+                total += cursor.get_cursor().rowcount
+        return total
+
     async def get_file_by_hash(self, content_hash: str) -> Optional[File]:
         """Get file by content hash."""
         SQL = "SELECT * FROM files WHERE content_hash = ?"

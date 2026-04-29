@@ -157,6 +157,14 @@ class Pipeline:
         files (files that no longer exist in the filesystem).
 
         Returns the number of files enqueued.
+
+        Performance note (v0.8.7+): the per-file path used to issue 3
+        separate DB roundtrips (`update_file_timestamp` + `get_file_by_path`
+        + `enqueue` writes), which scaled badly to 10k-file folders. We
+        now bulk-load the directory's saved (status, modified) state into
+        a dict once, do skip checks in memory, and batch the
+        "mark file as still on disk" timestamp updates into chunked
+        UPDATE ... WHERE file_path IN (...) statements at the end.
         """
         from cosma_backend.queue import QueueAction
 
@@ -165,17 +173,68 @@ class Pipeline:
         started_processing = datetime.now(timezone.utc)
         enqueued = 0
 
+        # One DB query for the whole directory instead of one per file.
+        # Empty dict on error so we degrade to "treat everything as new"
+        # rather than crash the discovery sweep.
+        try:
+            saved_summary = await self.db.get_files_under_directory_summary(str(path))
+        except DatabaseClosingError:
+            logger.debug("Skipping bulk skip-check (DB closing during shutdown)")
+            return enqueued
+        except Exception:
+            logger.exception("Bulk skip-check failed; degrading to per-file path")
+            saved_summary = {}
+
+        # Buffer for batched timestamp touches. Capped so a watched folder
+        # with millions of files doesn't blow up resident memory.
+        TOUCH_BATCH = 1000
+        to_touch: list[str] = []
+
+        async def _flush_touches() -> None:
+            nonlocal to_touch
+            if not to_touch:
+                return
+            try:
+                await self.db.touch_files_timestamps(to_touch)
+            except DatabaseClosingError:
+                logger.debug("Skipping timestamp touch (DB closing during shutdown)")
+            except Exception:
+                logger.exception("Batched timestamp touch failed")
+            to_touch = []
+
         for file in self.discoverer.files_in(path, filter_config=filter_config):
             try:
-                # Touch the timestamp so stale-file cleanup knows this file still exists
-                await self.db.update_file_timestamp(file.file_path)
+                # In-memory skip check using the bulk-loaded summary.
+                # Falls back to the per-file path only when the file is
+                # missing from the summary (a recently-added file the
+                # sweep just discovered).
+                summary = saved_summary.get(file.file_path)
+                if summary is not None:
+                    saved_status, saved_mtime = summary
+                    if (
+                        saved_status in ("COMPLETE", "FAILED")
+                        and saved_mtime is not None
+                        and saved_mtime.replace(microsecond=0) == file.modified.replace(microsecond=0)
+                        and await self.is_supported(file)
+                    ):
+                        # File is up to date in DB. Just touch its timestamp
+                        # so the stale-file sweep below leaves it alone, and
+                        # publish the skip event for UI progress accounting.
+                        to_touch.append(file.file_path)
+                        if len(to_touch) >= TOUCH_BATCH:
+                            await _flush_touches()
+                        self._publish_update(Update.file_skipped(
+                            file.file_path, file.filename, reason="already processed"
+                        ))
+                        continue
 
-                should_skip, _saved = await self._should_skip_file(file)
-                if should_skip:
-                    self._publish_update(Update.file_skipped(
-                        file.file_path, file.filename, reason="already processed"
-                    ))
-                    continue
+                # File is new, modified, or in a non-terminal status —
+                # enqueue and let the queue debounce / pipeline handle it.
+                # We still touch the timestamp because mark-and-sweep is
+                # what protects against deletion of files we just saw.
+                to_touch.append(file.file_path)
+                if len(to_touch) >= TOUCH_BATCH:
+                    await _flush_touches()
 
                 await indexing_queue.enqueue(
                     file.file_path, QueueAction.INDEX,
@@ -184,10 +243,14 @@ class Pipeline:
                 enqueued += 1
             except DatabaseClosingError:
                 logger.debug("Skipping enqueue (DB closing during shutdown)")
+                await _flush_touches()
                 return enqueued
             except Exception:
                 logger.exception("Error enqueueing file", file_path=file.file_path)
                 continue
+
+        # Final flush of any timestamps still buffered.
+        await _flush_touches()
 
         # Stale-file cleanup runs immediately after discovery (all existing
         # files had their timestamps touched above).  Files that were NOT
