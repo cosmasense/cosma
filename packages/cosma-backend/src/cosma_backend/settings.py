@@ -412,6 +412,10 @@ class SettingsManager:
                     toml_data = tomllib.load(f)
                 self._settings = _from_dict(Settings, toml_data)
                 logger.info("Loaded settings from TOML", path=str(self._toml_path))
+                # Apply forward migrations for fields whose defaults moved.
+                # Persists immediately so the next launch reads the new value.
+                if self._migrate_legacy_defaults():
+                    self.save()
             except Exception as e:
                 logger.warning("Failed to load settings TOML, using defaults",
                                path=str(self._toml_path), error=str(e))
@@ -421,6 +425,30 @@ class SettingsManager:
             self.save()
 
         return self._settings
+
+    def _migrate_legacy_defaults(self) -> bool:
+        """Bump fields stuck on a previous release's default value.
+
+        Returns True if anything was migrated (caller should re-save).
+
+        Why this exists: Python dataclass defaults only apply when the
+        field is *missing* from the TOML. Once a value has been written
+        — including writes that just round-tripped the previous default
+        — bumping the dataclass default in code has no effect on
+        existing installs. So users who had `max_file_size_mb = 200`
+        from the v0.8.x default kept failing 200 MB+ files even after
+        the project default became 20 GB. Each entry here is a one-time
+        fix-up that only fires when the user's saved value matches the
+        previous release's default exactly; explicit user choices
+        (anything other than the previous default) are preserved.
+        """
+        migrated = False
+        # parser.max_file_size_mb: 200 → 20480 (v0.8.4)
+        if self._settings.parser.max_file_size_mb == 200:
+            logger.info("Migrating parser.max_file_size_mb from legacy default 200 to 20480 MB")
+            self._settings.parser.max_file_size_mb = 20480
+            migrated = True
+        return migrated
 
     def save(self) -> None:
         """Write current settings to TOML file."""
