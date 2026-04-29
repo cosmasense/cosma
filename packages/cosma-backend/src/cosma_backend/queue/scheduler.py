@@ -258,6 +258,12 @@ class Scheduler:
 
         if met != self._conditions_met:
             self._conditions_met = met
+            # Conditions transitioned — drop any one-shot user override
+            # so the rule decision actually takes effect. Without this,
+            # a user who clicked Resume during a CPU-high window would
+            # keep running long after CPU dropped *and* climbed again.
+            # See IndexingQueue.clear_user_override for the contract.
+            self._queue.clear_user_override()
             if met:
                 self._queue.scheduler_resume()
             else:

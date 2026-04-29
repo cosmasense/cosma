@@ -5,7 +5,7 @@ Endpoints for queue status, pause/resume, item management, and scheduler config.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from quart import Blueprint, current_app, request
 from quart_schema import validate_response
@@ -32,6 +32,12 @@ class QueueStatusResponse:
     waiting: int
     processing: int
     failing_rules: list[str]
+    # One-shot user override on top of the scheduler decision.
+    #   None  = no override, scheduler is in control
+    #   True  = user forced "run now" (overrides a scheduler pause)
+    #   False = user forced "pause now" (overrides a scheduler run)
+    # Auto-cleared on next scheduler transition.
+    user_override: Optional[bool] = None
 
 
 @dataclass

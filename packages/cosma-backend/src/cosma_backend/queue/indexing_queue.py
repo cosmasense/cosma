@@ -101,6 +101,23 @@ class IndexingQueue:
 
         self._manually_paused = False
         self._scheduler_paused = False
+        # User pause/resume now acts as a *one-shot override* on top of
+        # the scheduler decision, instead of a permanent flag:
+        #
+        #   None   → defer to scheduler (rules + bootstrap decide)
+        #   True   → user clicked Resume — force-run even if scheduler
+        #            says "should pause" right now
+        #   False  → user clicked Pause — force-pause even if scheduler
+        #            says "should run" right now
+        #
+        # The override is cleared automatically the next time the
+        # scheduler's evaluated outcome *transitions* (e.g. CPU drops
+        # back below threshold, time window opens). At that point the
+        # user's nudge has served its purpose and the scheduler takes
+        # back over. This keeps `_manually_paused` (which is now a
+        # synonym for the False state of the override) from getting
+        # stuck against an active scheduler rule.
+        self._user_override: Optional[bool] = None
         # Set at startup if bootstrap (llama/whisper model downloads) hasn't
         # finished yet. Cleared once the bootstrap runner emits a "complete"
         # event. Without this gate, any file discovered by the watcher during
@@ -146,15 +163,40 @@ class IndexingQueue:
 
     @property
     def is_paused(self) -> bool:
-        return self._manually_paused or self._scheduler_paused or self._bootstrap_paused
+        # Bootstrap is non-overridable — if model files are still being
+        # downloaded, we MUST stay paused or the pipeline will race the
+        # downloader on the same GGUF.
+        if self._bootstrap_paused:
+            return True
+        # User override beats scheduler in either direction. None means
+        # defer to scheduler.
+        if self._user_override is False:
+            return True
+        if self._user_override is True:
+            return False
+        # No override — keep the existing union of manual + scheduler so
+        # legacy `manual_pause()` callers still pause correctly. (After
+        # the API switch below, manual_pause() routes through
+        # user_override_pause(), so this `_manually_paused` branch is
+        # mostly defensive — it covers any direct test or external
+        # caller that still sets the old flag.)
+        return self._manually_paused or self._scheduler_paused
 
     @property
     def is_manually_paused(self) -> bool:
-        return self._manually_paused
+        # "Manually paused" from the UI's point of view = user explicitly
+        # set the override to False. The legacy `_manually_paused` flag
+        # is kept for backward compat with code that still reads it.
+        return self._manually_paused or self._user_override is False
 
     @property
     def is_scheduler_paused(self) -> bool:
         return self._scheduler_paused
+
+    @property
+    def user_override(self) -> Optional[bool]:
+        """Current one-shot override state. None = defer to scheduler."""
+        return self._user_override
 
     @property
     def is_bootstrap_paused(self) -> bool:
@@ -252,16 +294,45 @@ class IndexingQueue:
     # ------------------------------------------------------------------
 
     def manual_pause(self) -> None:
-        if not self._manually_paused:
-            self._manually_paused = True
+        """User clicked Pause. Acts as a one-shot override that takes
+        effect immediately and is cleared next time the scheduler's
+        evaluated outcome transitions (so the user's nudge doesn't get
+        stuck against rules that were never going to disagree).
+        """
+        # Keep the legacy flag in sync for any external code still
+        # reading `is_manually_paused` directly.
+        self._manually_paused = True
+        if self._user_override is not False:
+            self._user_override = False
             self._publish(Update.create(UpdateOpcode.QUEUE_PAUSED, source="manual"))
-            logger.info("Queue manually paused")
+            logger.info("Queue paused by user override (one-shot)")
 
     def manual_resume(self) -> None:
-        if self._manually_paused:
-            self._manually_paused = False
+        """User clicked Resume. One-shot override that forces the queue
+        to run *now* even if the scheduler's last decision was pause.
+        Cleared on the next scheduler transition.
+        """
+        self._manually_paused = False
+        if self._user_override is not True:
+            self._user_override = True
             self._publish(Update.create(UpdateOpcode.QUEUE_RESUMED, source="manual"))
-            logger.info("Queue manually resumed")
+            logger.info("Queue resumed by user override (one-shot)")
+
+    def clear_user_override(self) -> None:
+        """Drop the one-shot override and let the scheduler decide.
+
+        Called by the scheduler when its evaluated outcome transitions
+        (rules went from passing→failing or failing→passing). Also
+        callable from any caller that wants to explicitly hand control
+        back to the rules — e.g. an admin endpoint.
+        """
+        if self._user_override is not None:
+            prior = self._user_override
+            self._user_override = None
+            # Mirror to the legacy flag so observers stay consistent.
+            self._manually_paused = False
+            logger.info("User override cleared (scheduler resumes control)",
+                        prior=prior)
 
     def scheduler_pause(self) -> None:
         if not self._scheduler_paused:
@@ -516,9 +587,16 @@ class IndexingQueue:
         items = list(self._items.values())
         return {
             "paused": self.is_paused,
-            "manually_paused": self._manually_paused,
+            "manually_paused": self.is_manually_paused,
             "scheduler_paused": self._scheduler_paused,
             "bootstrap_paused": self._bootstrap_paused,
+            # One-shot user override surfaced for the UI:
+            #   None  → button reflects scheduler decision
+            #   True  → user has forced run; button shows "Pause"
+            #   False → user has forced pause; button shows "Resume"
+            # The override clears automatically on the next scheduler
+            # transition; see Scheduler.evaluate_and_apply.
+            "user_override": self._user_override,
             "total_items": len(items),
             "cooling_down": sum(1 for i in items if i.status == QueueItemStatus.COOLING_DOWN),
             "waiting": sum(1 for i in items if i.status == QueueItemStatus.WAITING),

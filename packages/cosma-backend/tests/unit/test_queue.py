@@ -150,17 +150,50 @@ class TestIndexingQueuePause:
         assert queue.is_paused
         assert queue.is_scheduler_paused
 
-    def test_or_semantics_both_paused(self, queue):
-        """Both paused -> resume one -> still paused."""
-        queue.manual_pause()
+    def test_user_override_beats_scheduler(self, queue):
+        """User override is a one-shot toggle on top of the scheduler.
+
+        Contract (see IndexingQueue._user_override docstring):
+          - manual_resume forces run even if scheduler had paused
+          - manual_pause forces pause even if scheduler had resumed
+          - clear_user_override hands control back to the rules
+        """
         queue.scheduler_pause()
         assert queue.is_paused
 
+        # User override flips to "run" — beats the scheduler decision.
         queue.manual_resume()
-        assert queue.is_paused  # scheduler still paused
+        assert not queue.is_paused
+        assert queue.user_override is True
 
+        # Symmetric: scheduler says run, user says pause → paused.
+        queue.scheduler_resume()
+        queue.manual_pause()
+        assert queue.is_paused
+        assert queue.user_override is False
+
+        # Clearing the override drops back to the scheduler's last word.
+        queue.clear_user_override()
+        assert not queue.is_paused
+        assert queue.user_override is None
+
+    def test_scheduler_transition_clears_override(self, queue):
+        """When the scheduler transitions, any user override is cleared.
+
+        Mirrors the production wiring in Scheduler.evaluate_and_apply,
+        which calls queue.clear_user_override() on transition.
+        """
+        queue.scheduler_pause()
+        queue.manual_resume()  # one-shot: force run
+        assert not queue.is_paused
+        assert queue.user_override is True
+
+        # Simulate the scheduler's transition handler calling
+        # clear_user_override + scheduler_resume in lockstep.
+        queue.clear_user_override()
         queue.scheduler_resume()
         assert not queue.is_paused
+        assert queue.user_override is None
 
 
 # ---------------------------------------------------------------------------
