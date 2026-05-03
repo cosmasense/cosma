@@ -253,14 +253,28 @@ async def system_metrics() -> tuple[MetricsResponse, int]:
 def _file_to_list_item(f) -> dict[str, Any]:
     """Convert a File model to a dict suitable for FileListResponse.
 
-    `updated_at` is the DB row's last-write time (when we actually processed
-    the file), NOT the filesystem mtime. We fall back to `modified` only if
-    the column is missing (older DBs).
+    The exposed `updated_at` is the time we actually finished processing
+    the file — NOT the DB column of the same name. The DB's `updated_at`
+    column gets bumped on every disk-scan sweep (mark-and-sweep stale
+    detection in pipeline.enqueue_directory), which means it resets to
+    "now" every time the backend launches. Surfacing that to the
+    frontend made the Recent tab read "Xs ago" for every file right
+    after each launch.
+
+    Pick the most specific completion timestamp available:
+      embedded_at > summarized_at > parsed_at > modified
+    For COMPLETE rows all three pipeline stamps are set, so we get the
+    real "completed at" time. For FAILED rows we fall back to whichever
+    stage actually ran. Filesystem `modified` is the last fallback for
+    pre-pipeline metadata.
     """
     ts = None
-    if getattr(f, "updated_at", None) is not None:
-        ts = int(f.updated_at.timestamp())
-    elif f.modified is not None:
+    for attr in ("embedded_at", "summarized_at", "parsed_at"):
+        value = getattr(f, attr, None)
+        if value is not None:
+            ts = int(value.timestamp())
+            break
+    if ts is None and getattr(f, "modified", None) is not None:
         ts = int(f.modified.timestamp())
     return {
         "file_path": f.file_path,
@@ -301,6 +315,31 @@ async def queue_recent_files() -> tuple[FileListResponse, int]:
     limit = request.args.get("limit", 10000, type=int)
 
     files, total_count = await current_app.db.get_files_by_status("COMPLETE", limit=limit, offset=offset)
+
+    return FileListResponse(
+        files=[_file_to_list_item(f) for f in files],
+        total_count=total_count,
+        offset=offset,
+        limit=limit,
+    ), 200
+
+
+@queue_bp.get("/partial")
+@validate_response(FileListResponse, 200)
+async def queue_partial_files() -> tuple[FileListResponse, int]:
+    """List files with status=INDEXED_PARTIAL.
+
+    These were classified as metadata-only by the user's filter config
+    and indexed by filename + metadata only (no LLM summary). The
+    frontend exposes them as their own tab so the user can review what
+    was opted out of full indexing.
+    """
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", 10000, type=int)
+
+    files, total_count = await current_app.db.get_files_by_status(
+        "INDEXED_PARTIAL", limit=limit, offset=offset
+    )
 
     return FileListResponse(
         files=[_file_to_list_item(f) for f in files],

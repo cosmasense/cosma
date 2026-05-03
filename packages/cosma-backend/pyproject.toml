@@ -1,12 +1,18 @@
 [project]
 name = "cosma-backend"
-version = "1.0.6"
+version = "1.0.7"
 description = "Cosma backend"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "asqlite>=2.0.0",
     "huggingface-hub>=0.26.0",
+    # Bundled static ffmpeg binary — used as the last-resort fallback when
+    # no system ffmpeg is on PATH. macOS apps launched outside a shell
+    # don't inherit the user's shell PATH, so /opt/homebrew/bin/ffmpeg is
+    # invisible to subprocess calls. Without a fallback, every video file
+    # ended up with a "codec unsupported" placeholder.
+    "imageio-ffmpeg>=0.5.0",
     "litellm>=1.77.5",
     "llama-cpp-python>=0.3.0",
     "markitdown[docx,pdf,pptx]>=0.1.4",

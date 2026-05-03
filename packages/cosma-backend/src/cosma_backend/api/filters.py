@@ -32,11 +32,14 @@ class FilterConfigResponse:
     # Legacy fields (deprecated but kept for compatibility)
     exclude: list[str]
     include: list[str]
-    # Mode-specific pattern storage (NEW)
+    # Mode-specific pattern storage
     blacklist_exclude: list[str]
     blacklist_include: list[str]
     whitelist_include: list[str]
     whitelist_exclude: list[str]
+    # v3: third tier — files matching these are indexed by filename
+    # only (no LLM summary). Status = INDEXED_PARTIAL.
+    metadata_only_patterns: list[str]
     config_path: str
 
 
@@ -47,11 +50,13 @@ class UpdateFilterConfigRequest:
     # Legacy fields (deprecated but kept for compatibility)
     exclude: Optional[list[str]] = None
     include: Optional[list[str]] = None
-    # Mode-specific pattern storage (NEW)
+    # Mode-specific pattern storage
     blacklist_exclude: Optional[list[str]] = None
     blacklist_include: Optional[list[str]] = None
     whitelist_include: Optional[list[str]] = None
     whitelist_exclude: Optional[list[str]] = None
+    # v3: metadata-only patterns
+    metadata_only_patterns: Optional[list[str]] = None
     # Control whether to apply changes immediately
     apply_immediately: bool = True  # If False, just update config without cleaning DB
 
@@ -144,6 +149,7 @@ async def get_filter_config() -> tuple[FilterConfigResponse, int]:
         blacklist_include=config.blacklist_include,
         whitelist_include=config.whitelist_include,
         whitelist_exclude=config.whitelist_exclude,
+        metadata_only_patterns=config.metadata_only_patterns,
         config_path=str(config.config_path) if config.config_path else "",
     ), 200
 
@@ -179,7 +185,7 @@ async def update_filter_config(data: UpdateFilterConfigRequest) -> tuple[UpdateF
                 success=False,
                 message=f"Invalid mode: {data.mode}. Must be 'blacklist' or 'whitelist'",
                 config=FilterConfigResponse(
-                    version=2,
+                    version=3,
                     mode="blacklist",
                     exclude=[],
                     include=[],
@@ -187,6 +193,7 @@ async def update_filter_config(data: UpdateFilterConfigRequest) -> tuple[UpdateF
                     blacklist_include=[],
                     whitelist_include=[],
                     whitelist_exclude=[],
+                    metadata_only_patterns=[],
                     config_path="",
                 ),
                 removed_count=0,
@@ -201,6 +208,7 @@ async def update_filter_config(data: UpdateFilterConfigRequest) -> tuple[UpdateF
         blacklist_include=data.blacklist_include,
         whitelist_include=data.whitelist_include,
         whitelist_exclude=data.whitelist_exclude,
+        metadata_only_patterns=data.metadata_only_patterns,
     )
 
     # Clean up excluded files from database only if apply_immediately=True
@@ -220,6 +228,7 @@ async def update_filter_config(data: UpdateFilterConfigRequest) -> tuple[UpdateF
             blacklist_include=new_config.blacklist_include,
             whitelist_include=new_config.whitelist_include,
             whitelist_exclude=new_config.whitelist_exclude,
+            metadata_only_patterns=new_config.metadata_only_patterns,
             config_path=str(new_config.config_path) if new_config.config_path else "",
         ),
         removed_count=removed_count,
@@ -456,7 +465,7 @@ async def get_default_config() -> tuple[FilterConfigResponse, int]:
     ]
 
     return FilterConfigResponse(
-        version=2,
+        version=3,
         mode="blacklist",
         exclude=DEFAULT_EXCLUDE_PATTERNS,
         include=DEFAULT_INCLUDE_PATTERNS,
@@ -464,6 +473,7 @@ async def get_default_config() -> tuple[FilterConfigResponse, int]:
         blacklist_include=DEFAULT_INCLUDE_PATTERNS,
         whitelist_include=default_whitelist_include,
         whitelist_exclude=[],
+        metadata_only_patterns=[],
         config_path="",
     ), 200
 
@@ -500,6 +510,7 @@ async def apply_filter_changes() -> tuple[UpdateFilterConfigResponse, int]:
             blacklist_include=config.blacklist_include,
             whitelist_include=config.whitelist_include,
             whitelist_exclude=config.whitelist_exclude,
+            metadata_only_patterns=config.metadata_only_patterns,
             config_path=str(config.config_path) if config.config_path else "",
         ),
         removed_count=removed_count,
@@ -543,6 +554,7 @@ async def reset_to_defaults() -> tuple[UpdateFilterConfigResponse, int]:
             blacklist_include=new_config.blacklist_include,
             whitelist_include=new_config.whitelist_include,
             whitelist_exclude=new_config.whitelist_exclude,
+            metadata_only_patterns=new_config.metadata_only_patterns,
             config_path=str(new_config.config_path) if new_config.config_path else "",
         ),
         removed_count=removed_count,
@@ -555,49 +567,106 @@ async def reset_to_defaults() -> tuple[UpdateFilterConfigResponse, int]:
 
 async def cleanup_excluded_files() -> int:
     """
-    Remove files from the database that now match exclusion patterns.
+    Reconcile every file in the DB against the current filter config.
 
-    Returns:
-        Number of files removed
+    Three actions per file, depending on the new classification:
+      * EXCLUDED  — delete the row (and its embeddings via cascade).
+      * PARTIAL   — if status is COMPLETE, delete the row and re-enqueue
+                    so the pipeline runs the embed-only path. If already
+                    INDEXED_PARTIAL or FAILED, leave alone.
+      * FULL      — if status is INDEXED_PARTIAL, delete and re-enqueue
+                    so the pipeline runs the full parse → summarize →
+                    embed pass. If COMPLETE or FAILED, leave alone.
+
+    Returns the count of files *removed* from the DB. Files that were
+    re-enqueued are also counted in the removed total because their old
+    rows were deleted; the "removed" terminology is preserved for the
+    existing API contract (UpdateFilterConfigResponse.removed_count).
     """
+    from cosma_backend.filter import FilterDecision
     from cosma_backend.logging import get_logger
-    import logging
 
     logger = get_logger(__name__)
 
     db = current_app.db
     filter_manager = current_app.filter_manager
+    indexing_queue = getattr(current_app, "indexing_queue", None)
 
-    # Get all watched directories
     watched_dirs = await db.get_watched_directories(active_only=True)
-
     if not watched_dirs:
         return 0
 
     removed_count = 0
+    requeued_partial = 0
+    requeued_full = 0
 
-    # For each watched directory, check files against filter
+    # Local import to avoid a circular dep at module load time.
+    try:
+        from cosma_backend.queue import QueueAction
+    except Exception:
+        QueueAction = None  # graceful no-op if queue module isn't ready
+
     for watched_dir in watched_dirs:
         base_path = watched_dir.path
         config = filter_manager.get_config_for_directory(base_path)
 
-        # Get all files under this directory from database
-        # We need to add a method to get files by directory prefix
         async with db.acquire() as conn:
             rows = await conn.fetchall(
-                "SELECT id, file_path FROM files WHERE file_path LIKE ? || '/%' OR file_path = ?",
-                (str(base_path), str(base_path))
+                "SELECT id, file_path, status FROM files "
+                "WHERE file_path LIKE ? || '/%' OR file_path = ?",
+                (str(base_path), str(base_path)),
             )
 
             for row in rows:
                 file_path = Path(row["file_path"])
+                status = row["status"]
+                decision = config.classify(file_path, base_path)
 
-                if not config.should_include(file_path, base_path):
-                    # File should be excluded, delete it
-                    await conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
+                if decision == FilterDecision.EXCLUDED:
+                    await conn.execute(
+                        "DELETE FROM files WHERE id = ?", (row["id"],)
+                    )
                     removed_count += 1
                     logger.info("Removed excluded file from index",
-                                  file_path=str(file_path))
+                                file_path=str(file_path))
+                    continue
 
-    logger.info("Cleanup completed", removed_count=removed_count)
+                # Re-enqueue iff the file's terminal status disagrees
+                # with the new classification. We delete first so the
+                # pipeline doesn't see a "skip — already indexed" hit.
+                needs_requeue_partial = (
+                    decision == FilterDecision.PARTIAL
+                    and status == "COMPLETE"
+                )
+                needs_requeue_full = (
+                    decision == FilterDecision.FULL
+                    and status == "INDEXED_PARTIAL"
+                )
+                if needs_requeue_partial or needs_requeue_full:
+                    await conn.execute(
+                        "DELETE FROM files WHERE id = ?", (row["id"],)
+                    )
+                    removed_count += 1
+                    if indexing_queue is not None and QueueAction is not None:
+                        try:
+                            await indexing_queue.enqueue(
+                                str(file_path), QueueAction.INDEX
+                            )
+                            if needs_requeue_partial:
+                                requeued_partial += 1
+                            else:
+                                requeued_full += 1
+                        except Exception as e:
+                            logger.warning(
+                                "Reclassify re-enqueue failed; row deleted",
+                                file_path=str(file_path),
+                                error=str(e),
+                            )
+
+    logger.info(
+        "Filter reconciliation complete",
+        removed=removed_count,
+        requeued_partial=requeued_partial,
+        requeued_full=requeued_full,
+    )
     return removed_count

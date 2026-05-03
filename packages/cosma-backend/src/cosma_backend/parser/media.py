@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Optional, Dict, TYPE_CHECKING
 
 from ..logging import get_logger
+from .ffmpeg_runtime import ffmpeg_path, ffprobe_path, have_system_ffmpeg
 
 if TYPE_CHECKING:
     from cosma_backend.settings import ParserConfig
@@ -45,6 +46,15 @@ logger = get_logger(__name__)
 WHISPER_TIMEOUT_SECONDS = 30  # Max time for transcription
 FFMPEG_EXTRACT_TIMEOUT_SECONDS = 60  # Max time for audio extraction from video
 FRAME_EXTRACT_TIMEOUT_SECONDS = 30  # Max time for frame extraction
+# Transcode-to-proxy: cap on time spent reencoding a stubborn video
+# into a clean H.264/AAC mp4 before retrying extraction. Generous to
+# accommodate large iPhone HEVC files that can take ~30s to reencode
+# at -preset ultrafast on a laptop.
+TRANSCODE_TIMEOUT_SECONDS = 180
+# Cap on the proxy's longest side. We're throwing away resolution
+# because the only consumers are whisper (audio-only — resolution
+# doesn't matter) and frame extraction at 512px (already smaller).
+TRANSCODE_MAX_HEIGHT = 720
 
 # Video frame extraction settings
 DEFAULT_NUM_FRAMES = 4  # Number of frames to extract from videos
@@ -164,6 +174,15 @@ async def extract_video_content(
     """
     Extract transcript and key frames from video file.
 
+    Two-pass strategy: first try ffmpeg directly against the source
+    file (fast). If both audio and frame extraction come back empty —
+    typical for an HEVC iPhone video that some ffmpeg builds can
+    decode but ours can't, or for a container ffmpeg got partway
+    through and gave up on — transcode the source to a small
+    H.264/AAC mp4 proxy and retry. The proxy step is slow but covers
+    most "weird codec" cases where the input is technically decodable
+    but the direct path fails on stream selection or seeking.
+
     Args:
         path: Path to video file
         backend: Backend to use ('openai' | 'local' | None for auto)
@@ -173,18 +192,72 @@ async def extract_video_content(
     Returns:
         VideoContent with transcript and frames
     """
-    result = VideoContent()
-
     if not path.exists():
         logger.warning("Video file not found", path=str(path))
-        return result
+        return VideoContent()
 
     logger.info("Extracting video content",
                path=str(path),
                backend=backend,
                num_frames=num_frames if extract_frames else 0)
 
-    # Extract frames and audio in parallel
+    # Pass 1: extract directly from the source.
+    result = await _extract_video_pass(path, backend, num_frames, extract_frames)
+    if _video_pass_succeeded(result, extract_frames):
+        logger.info("Video content extracted (direct)",
+                   path=str(path),
+                   has_transcript=result.transcript is not None,
+                   num_frames=len(result.frames))
+        return result
+
+    # Pass 2: transcode to a clean H.264/AAC proxy and retry. This
+    # rescues files where the source codec defeated direct extraction
+    # but ffmpeg can still decode-and-reencode the stream to something
+    # universally decodable.
+    logger.info("Direct extraction empty; trying transcoded proxy",
+                path=str(path))
+    proxy = await _transcode_to_proxy(path)
+    if proxy is None:
+        logger.warning("Transcode-to-proxy failed; giving up on video",
+                      path=str(path))
+        return result
+
+    try:
+        proxy_result = await _extract_video_pass(
+            proxy, backend, num_frames, extract_frames
+        )
+        # Merge: keep whichever data each pass produced.
+        if proxy_result.transcript and not result.transcript:
+            result.transcript = proxy_result.transcript
+        if proxy_result.frames and not result.frames:
+            result.frames = proxy_result.frames
+        logger.info("Video content extracted (via proxy)",
+                   path=str(path),
+                   has_transcript=result.transcript is not None,
+                   num_frames=len(result.frames))
+        return result
+    finally:
+        proxy.unlink(missing_ok=True)
+
+
+def _video_pass_succeeded(result: VideoContent, extract_frames: bool) -> bool:
+    """A pass is "good enough" if we got either some transcript text
+    or at least one frame. Empty-on-both = retry via proxy."""
+    if result.transcript and result.transcript.strip():
+        return True
+    if extract_frames and result.frames:
+        return True
+    return False
+
+
+async def _extract_video_pass(
+    path: Path,
+    backend: str | None,
+    num_frames: int,
+    extract_frames: bool,
+) -> VideoContent:
+    """Single-pass: parallel frame + audio extraction against `path`."""
+    result = VideoContent()
     tasks = []
 
     if extract_frames:
@@ -194,7 +267,6 @@ async def extract_video_content(
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Process results
     if extract_frames:
         frames_result = results[0]
         transcript_result = results[1]
@@ -210,12 +282,75 @@ async def extract_video_content(
     elif isinstance(transcript_result, Exception):
         logger.warning("Transcript extraction failed", error=str(transcript_result))
 
-    logger.info("Video content extracted",
-               path=str(path),
-               has_transcript=result.transcript is not None,
-               num_frames=len(result.frames))
-
     return result
+
+
+async def _transcode_to_proxy(path: Path) -> Path | None:
+    """Transcode `path` to a small H.264/AAC mp4 in $TMPDIR.
+
+    Settings:
+      * libx264 ultrafast / crf 28 → fast, decent quality.
+      * Cap height at TRANSCODE_MAX_HEIGHT; -2 keeps width aspect-correct
+        and even (libx264 requires even dimensions).
+      * AAC 64k mono — whisper only needs intelligible speech.
+      * +faststart so the moov atom lands at the front, helping any
+        retry that uses fast-seek (-ss before -i).
+
+    Returns the proxy path on success, or None if transcode failed.
+    Caller must unlink the result.
+    """
+    proxy = Path(tempfile.mktemp(suffix=".mp4"))
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path(),
+            "-y",
+            "-i", str(path),
+            "-vf", f"scale=-2:'min({TRANSCODE_MAX_HEIGHT},ih)'",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-c:a", "aac",
+            "-b:a", "64k",
+            "-ac", "1",
+            "-movflags", "+faststart",
+            str(proxy),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.warning("Transcode-to-proxy timed out",
+                          path=str(path), timeout=TRANSCODE_TIMEOUT_SECONDS)
+            proxy.unlink(missing_ok=True)
+            return None
+
+        if process.returncode == 0 and proxy.exists() and proxy.stat().st_size > 0:
+            logger.info("Transcoded to proxy",
+                       source=str(path),
+                       proxy=str(proxy),
+                       size=proxy.stat().st_size)
+            return proxy
+
+        logger.warning("Transcode-to-proxy failed",
+                      path=str(path),
+                      returncode=process.returncode,
+                      stderr=stderr.decode(errors="replace")[:400])
+        proxy.unlink(missing_ok=True)
+        return None
+    except FileNotFoundError:
+        logger.error("No ffmpeg available for transcode-to-proxy")
+        proxy.unlink(missing_ok=True)
+        return None
+    except Exception as e:
+        logger.exception("Transcode-to-proxy error", path=str(path), error=str(e))
+        proxy.unlink(missing_ok=True)
+        return None
 
 
 async def _extract_and_transcribe_audio(path: Path, backend: str | None = None) -> str | None:
@@ -294,10 +429,18 @@ async def _extract_video_frames(path: Path, num_frames: int = DEFAULT_NUM_FRAMES
 
 
 async def _get_video_duration(path: Path) -> float | None:
-    """Get video duration in seconds using ffprobe."""
+    """Get video duration in seconds.
+
+    Tries ffprobe first (cheapest, structured output) and falls back to
+    parsing ``ffmpeg -i`` stderr. The fallback exists because
+    imageio-ffmpeg's bundled binary ships ffmpeg only — no ffprobe — so
+    on systems without a Homebrew install we'd otherwise lose duration
+    detection and skip frame extraction entirely.
+    """
+    # Path 1: dedicated ffprobe.
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffprobe",
+            ffprobe_path(),
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
@@ -313,7 +456,31 @@ async def _get_video_duration(path: Path) -> float | None:
             return float(duration_str)
 
     except (asyncio.TimeoutError, ValueError, FileNotFoundError) as e:
-        logger.warning("Failed to get video duration", path=str(path), error=str(e))
+        logger.debug("ffprobe duration lookup failed; trying ffmpeg fallback",
+                     path=str(path), error=str(e))
+
+    # Path 2: ffmpeg -i ... -f null -. ffmpeg writes "Duration: HH:MM:SS.MS"
+    # to stderr during input analysis even when no output is requested,
+    # so we just read stderr and grep for it.
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path(),
+            "-i", str(path),
+            "-f", "null",
+            "-",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+        text = stderr.decode(errors="replace")
+        # Format: "  Duration: 00:01:23.45, start: ..., bitrate: ..."
+        import re
+        match = re.search(r"Duration:\s+(\d+):(\d+):([\d.]+)", text)
+        if match:
+            hours, minutes, seconds = match.groups()
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (asyncio.TimeoutError, ValueError, FileNotFoundError) as e:
+        logger.warning("ffmpeg duration lookup failed", path=str(path), error=str(e))
 
     return None
 
@@ -323,7 +490,7 @@ async def _extract_single_frame(path: Path, timestamp: float) -> bytes | None:
     try:
         # Use ffmpeg to extract frame as JPEG
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
+            ffmpeg_path(),
             "-ss", str(timestamp),
             "-i", str(path),
             "-vframes", "1",
@@ -761,28 +928,14 @@ def unload_whisper_model() -> None:
 
 async def _extract_audio_from_video(video_path: Path) -> Path | None:
     """Extract audio track from video file using ffmpeg."""
-    try:
-        # Check if ffmpeg is available
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, "ffmpeg")
-        
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.error("ffmpeg not available - required for video processing")
-        return None
-    
+    ffmpeg = ffmpeg_path()
     try:
         # Create temporary audio file
         temp_audio = Path(tempfile.mktemp(suffix='.wav'))
-        
+
         # Extract audio with ffmpeg
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
+            ffmpeg,
             "-i", str(video_path),
             "-vn",  # No video
             "-acodec", "pcm_s16le",  # PCM 16-bit
@@ -895,17 +1048,20 @@ async def validate_media_backends() -> dict[str, bool]:
     # Test whisper.cpp
     results["whisper_cpp"] = await _check_whisper_cpp_available()
     
-    # Test ffmpeg
+    # Test ffmpeg via the same resolver the extractors use, so a probe
+    # that succeeds here means real extraction will also succeed.
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-version",
+            ffmpeg_path(), "-version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         await process.communicate()
         results["ffmpeg"] = process.returncode == 0
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        results["ffmpeg_system"] = have_system_ffmpeg()
+    except FileNotFoundError:
         results["ffmpeg"] = False
-    
+        results["ffmpeg_system"] = False
+
     logger.info("Media backend availability", **results)
     return results

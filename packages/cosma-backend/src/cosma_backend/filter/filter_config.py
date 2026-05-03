@@ -142,6 +142,28 @@ DEFAULT_WHITELIST_EXCLUDE_PATTERNS = [
 ]
 
 
+# --- Three-tier classification ---------------------------------------
+#
+# Per the user-visible filter UI:
+#   * EXCLUDED: never enters the database. Equivalent to today's
+#     blacklist — caches, .git, node_modules, etc.
+#   * PARTIAL:  metadata-only. DB row + filename embedding, no parser,
+#     no LLM. For movie folders, downloads dumps, backups — searchable
+#     by name without spending compute on description.
+#   * FULL:     parse → summarize → embed (current default behavior).
+#
+# Matching order is excluded → partial → full. A pattern in
+# `metadata_only_patterns` that also happens to match an exclude rule
+# is treated as excluded (stricter rule wins).
+
+
+class FilterDecision(str, Enum):
+    """Three-tier classification result."""
+    EXCLUDED = "excluded"
+    PARTIAL = "partial"
+    FULL = "full"
+
+
 @dataclass
 class FilterConfig:
     """
@@ -150,29 +172,39 @@ class FilterConfig:
     Supports both global config and per-folder config.
     Per-folder configs extend (not replace) global patterns.
 
-    NEW: Stores separate pattern lists for each mode to prevent data loss
+    Stores separate pattern lists for each mode to prevent data loss
     when switching modes. When mode changes, patterns switch to the
     appropriate list without semantic confusion.
+
+    v3 adds `metadata_only_patterns` — a third bucket for files the
+    user wants indexed by filename only (no LLM summary). Files
+    matching these patterns end up with status=INDEXED_PARTIAL.
     """
     mode: FilterMode = FilterMode.BLACKLIST
 
-    # Mode-specific pattern storage (NEW)
+    # Mode-specific pattern storage
     blacklist_exclude: list[str] = field(default_factory=list)
     blacklist_include: list[str] = field(default_factory=list)
     whitelist_include: list[str] = field(default_factory=list)
     whitelist_exclude: list[str] = field(default_factory=list)
+
+    # v3: third bucket — metadata-only patterns. Applied AFTER the
+    # exclude/include rules. A file matches this list iff it would
+    # otherwise be FULL-indexed (so excluded files stay excluded).
+    metadata_only_patterns: list[str] = field(default_factory=list)
 
     # Legacy fields for backward compatibility (deprecated)
     # These are auto-populated based on current mode
     exclude: list[str] = field(default_factory=list)
     include: list[str] = field(default_factory=list)
 
-    version: int = 2  # Bumped to version 2 for new structure
+    version: int = 3  # Bumped to v3 for metadata_only_patterns
     config_path: Optional[Path] = None
 
     # Cached compiled patterns for performance
     _exclude_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
     _include_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
+    _metadata_only_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         """Compile patterns after initialization."""
@@ -200,6 +232,11 @@ class FilterConfig:
             self._include_regex = self._patterns_to_regex(self.include)
         else:
             self._include_regex = None
+
+        if self.metadata_only_patterns:
+            self._metadata_only_regex = self._patterns_to_regex(self.metadata_only_patterns)
+        else:
+            self._metadata_only_regex = None
 
     @staticmethod
     def _pattern_to_regex(pattern: str) -> str:
@@ -304,6 +341,42 @@ class FilterConfig:
             return False
         return regex.search(relative_path) is not None
 
+    def classify(self, file_path: Path, base_path: Path) -> FilterDecision:
+        """
+        Classify a file as EXCLUDED / PARTIAL / FULL.
+
+        Order: exclusion rules first (so an excluded file is never
+        promoted to PARTIAL just because it also matches a
+        metadata-only pattern). Then the metadata-only check decides
+        whether the file is partial or full.
+
+        Args:
+            file_path: Absolute path to the file
+            base_path: Watched directory root
+
+        Returns:
+            FilterDecision.EXCLUDED — drop entirely (no DB row)
+            FilterDecision.PARTIAL  — embed-only (no LLM)
+            FilterDecision.FULL     — parse + summarize + embed
+        """
+        if not self.should_include(file_path, base_path):
+            return FilterDecision.EXCLUDED
+
+        # Compute relative path the same way should_include does so
+        # the metadata-only patterns match against the same string
+        # the user wrote them against.
+        try:
+            relative_path = str(file_path.relative_to(base_path))
+        except ValueError:
+            relative_path = file_path.name
+        filename = file_path.name
+
+        if self._matches_patterns(relative_path, self._metadata_only_regex) or \
+           self._matches_patterns(filename, self._metadata_only_regex):
+            return FilterDecision.PARTIAL
+
+        return FilterDecision.FULL
+
     def should_include(self, file_path: Path, base_path: Path) -> bool:
         """
         Determine if a file should be included based on filter config.
@@ -375,6 +448,8 @@ class FilterConfig:
             "blacklist_include": self.blacklist_include,
             "whitelist_include": self.whitelist_include,
             "whitelist_exclude": self.whitelist_exclude,
+            # v3: metadata-only patterns
+            "metadata_only_patterns": self.metadata_only_patterns,
             # Legacy fields for backward compatibility
             "exclude": self.exclude,
             "include": self.include,
@@ -439,23 +514,33 @@ class FilterConfig:
                 blacklist_include = DEFAULT_INCLUDE_PATTERNS.copy()
 
             return cls(
-                version=2,  # Upgrade to v2
+                version=3,  # Upgrade to current
                 mode=mode,
                 blacklist_exclude=blacklist_exclude,
                 blacklist_include=blacklist_include,
                 whitelist_include=whitelist_include,
                 whitelist_exclude=whitelist_exclude,
+                metadata_only_patterns=[],
                 config_path=config_path,
             )
 
+        # Version 2 → v3 migration: just initialize the new bucket
+        # to empty. v2 files round-trip cleanly because the field has
+        # a default. We bump `version` to 3 in the resulting config so
+        # the next save writes the new shape.
+        if version == 2:
+            logger.info("Migrating filter config from v2 to v3 (added metadata_only_patterns)",
+                        path=str(config_path) if config_path else "unknown")
+
         # Version 2+ format
         return cls(
-            version=version,
+            version=max(version, 3),
             mode=mode,
             blacklist_exclude=data.get("blacklist_exclude", []),
             blacklist_include=data.get("blacklist_include", []),
             whitelist_include=data.get("whitelist_include", []),
             whitelist_exclude=data.get("whitelist_exclude", []),
+            metadata_only_patterns=data.get("metadata_only_patterns", []),
             config_path=config_path,
         )
 
@@ -599,12 +684,16 @@ class FilterConfig:
         ]
 
         config = cls(
-            version=2,
+            version=3,
             mode=FilterMode.BLACKLIST,
             blacklist_exclude=DEFAULT_EXCLUDE_PATTERNS.copy(),
             blacklist_include=DEFAULT_INCLUDE_PATTERNS.copy(),
             whitelist_include=default_whitelist_include,
             whitelist_exclude=[],
+            # No default metadata-only patterns: this is purely a
+            # power-user feature for opting specific folders into
+            # filename-only indexing (e.g. ~/Movies, ~/Downloads).
+            metadata_only_patterns=[],
             config_path=global_path,
         )
         config.save_to_file()
@@ -649,6 +738,7 @@ class FilterConfig:
         # Mode comes from global only
         merged_exclude = list(global_config.exclude)
         merged_include = list(global_config.include)
+        merged_metadata_only = list(global_config.metadata_only_patterns)
 
         # Add per-folder patterns (avoid duplicates)
         for pattern in folder_config.exclude:
@@ -659,12 +749,17 @@ class FilterConfig:
             if pattern not in merged_include:
                 merged_include.append(pattern)
 
+        for pattern in folder_config.metadata_only_patterns:
+            if pattern not in merged_metadata_only:
+                merged_metadata_only.append(pattern)
+
         # Populate mode-specific fields so __post_init__ preserves them
         if global_config.mode == FilterMode.BLACKLIST:
             merged = cls(
                 mode=global_config.mode,
                 blacklist_exclude=merged_exclude,
                 blacklist_include=merged_include,
+                metadata_only_patterns=merged_metadata_only,
                 config_path=folder_config_path,
             )
         else:
@@ -672,6 +767,7 @@ class FilterConfig:
                 mode=global_config.mode,
                 whitelist_exclude=merged_exclude,
                 whitelist_include=merged_include,
+                metadata_only_patterns=merged_metadata_only,
                 config_path=folder_config_path,
             )
 
@@ -788,6 +884,8 @@ class FilterConfigManager:
         blacklist_include: Optional[list[str]] = None,
         whitelist_include: Optional[list[str]] = None,
         whitelist_exclude: Optional[list[str]] = None,
+        # v3: metadata-only patterns
+        metadata_only_patterns: Optional[list[str]] = None,
     ) -> FilterConfig:
         """
         Update the global config.
@@ -809,6 +907,15 @@ class FilterConfigManager:
         # Determine new mode
         new_mode = mode if mode is not None else config.mode
 
+        # Resolve final metadata-only patterns: if caller passed a
+        # value (even an empty list), use it; otherwise preserve the
+        # existing patterns.
+        new_metadata_only = (
+            metadata_only_patterns
+            if metadata_only_patterns is not None
+            else config.metadata_only_patterns
+        )
+
         # Handle mode-specific updates
         if blacklist_exclude is not None or blacklist_include is not None or \
            whitelist_include is not None or whitelist_exclude is not None:
@@ -819,6 +926,7 @@ class FilterConfigManager:
                 blacklist_include=blacklist_include if blacklist_include is not None else config.blacklist_include,
                 whitelist_include=whitelist_include if whitelist_include is not None else config.whitelist_include,
                 whitelist_exclude=whitelist_exclude if whitelist_exclude is not None else config.whitelist_exclude,
+                metadata_only_patterns=new_metadata_only,
                 config_path=config.config_path,
             )
         else:
@@ -842,6 +950,7 @@ class FilterConfigManager:
                 blacklist_include=new_blacklist_include,
                 whitelist_include=new_whitelist_include,
                 whitelist_exclude=new_whitelist_exclude,
+                metadata_only_patterns=new_metadata_only,
                 config_path=config.config_path,
             )
 
@@ -866,3 +975,8 @@ class FilterConfigManager:
         """
         config = self.get_config_for_directory(base_directory)
         return config.should_include(file_path, base_directory)
+
+    def classify_file(self, file_path: Path, base_directory: Path) -> FilterDecision:
+        """Three-tier classification for a single file path."""
+        config = self.get_config_for_directory(base_directory)
+        return config.classify(file_path, base_directory)

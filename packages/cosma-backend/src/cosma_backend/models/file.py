@@ -77,6 +77,27 @@ class File:
     # Transient data (not persisted to DB)
     # Used to pass video frames to the summarizer for vision analysis
     extra_images: Optional[List[bytes]] = None  # JPEG-encoded frames
+    # True when the file is taking the embed-only path (no LLM
+    # summary). Two distinct reasons trigger this — distinguished by
+    # `partial_kind` below:
+    #   * "parser_failed": the parser could only build a synthetic
+    #     metadata placeholder (codec unsupported, no transcript,
+    #     ffmpeg missing). Final status = FAILED, surfaces in Failed
+    #     tab so the user can debug.
+    #   * "user_elected": the user-configured filter classified this
+    #     file as metadata-only. Final status = INDEXED_PARTIAL —
+    #     this is intentional, not a failure. Surfaces in its own
+    #     count, never in Failed.
+    # In both cases the file gets an embedding (filename + available
+    # metadata) so semantic search can still surface it.
+    metadata_only: bool = False
+    # Human-readable explanation. Surfaced as processing_error on the
+    # row so the user can see *why* a file is partial.
+    metadata_only_reason: Optional[str] = None
+    # Distinguishes which final status the pipeline should write. See
+    # the docstring on `metadata_only` for what each value means.
+    # Values: "parser_failed" | "user_elected" | None.
+    partial_kind: Optional[str] = None
     
     @classmethod
     def from_path(cls, path: Path) -> Self:

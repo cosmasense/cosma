@@ -317,12 +317,24 @@ class FileParser:
             if media_type == "audio":
                 content = await extract_audio_transcript(path, self.config)
                 # Audio with no decodable speech (silent track, broken codec,
-                # whisper produced empty segments) used to fail the whole
-                # file. Fall back to a metadata placeholder so the file is at
-                # least indexed by name/extension and findable in search —
-                # the user's report had >40 .mov / .mp3 files in this hole.
+                # whisper produced empty segments) — flag as metadata-only
+                # so the pipeline routes it to FAILED + embed (it's still
+                # findable by filename in semantic search; just no LLM
+                # summary, and the user can see it in the Failed tab).
                 if not content or len(content.strip()) <= 10:
                     content = _audio_metadata_placeholder(path)
+                    if file is not None:
+                        file.metadata_only = True
+                        # Don't overwrite a user_elected classification —
+                        # the discoverer may have already flagged this
+                        # file as partial-on-purpose. Parser-failure only
+                        # claims partial_kind when nothing else has.
+                        if file.partial_kind is None:
+                            file.partial_kind = "parser_failed"
+                        file.metadata_only_reason = (
+                            "Audio: no usable speech transcript "
+                            "(silent track, codec issue, or whisper unavailable)"
+                        )
             elif media_type == "video":
                 # Extract both transcript and frames for vision analysis
                 video_content = await extract_video_content(path)
@@ -333,23 +345,30 @@ class FileParser:
                     logger.debug("Attached video frames for vision analysis",
                                  path=str(path),
                                  num_frames=len(video_content.frames))
-                    # A silent video (camera footage, B-roll) has no speech
-                    # to transcribe, but we DID get frames. Don't fail the
-                    # extraction — give the summarizer a placeholder so its
-                    # vision pass can still run against the frames. Without
-                    # this, every silent .mov / .mp4 was marked FAILED.
+                    # Silent video with frames — still PARSED success: the
+                    # summarizer's vision pass will run against the frames.
                     if not content or len(content.strip()) <= 10:
                         content = (
                             f"Video file: {path.name} "
                             f"({len(video_content.frames)} frames extracted "
                             f"for visual description)."
                         )
-                # Last resort: ffmpeg couldn't decode frames *and* there's no
-                # transcript (codec unsupported, file truncated, encrypted
-                # disk image masquerading as .mov, etc.). Emit metadata so
-                # the file shows up by name instead of being marked FAILED.
+                # Last resort: ffmpeg couldn't decode frames *and* there's
+                # no transcript. We still surface metadata so the file is
+                # findable by name, but flag metadata_only so the pipeline
+                # routes it to FAILED + embed-only (no LLM summary on the
+                # synthetic placeholder text).
                 if not content or len(content.strip()) <= 10:
                     content = _video_metadata_placeholder(path)
+                    if file is not None:
+                        file.metadata_only = True
+                        if file.partial_kind is None:
+                            file.partial_kind = "parser_failed"
+                        file.metadata_only_reason = (
+                            "Video: no transcript or frames extracted "
+                            "(codec unreadable even after H.264 transcode "
+                            "fallback, or ffmpeg unavailable)"
+                        )
             elif media_type == "image":
                 # For images, we'll let the summarization process handle vision analysis
                 # Just extract basic image info here
@@ -478,27 +497,68 @@ def _audio_metadata_placeholder(path: Path) -> str:
         size_str = _human_size(size)
     except OSError:
         size_str = "unknown size"
+
+    try:
+        from cosma_backend.parser import whisper_local
+        whisper_present = whisper_local.is_available()
+    except Exception:
+        whisper_present = True
+
+    reason = (
+        "no usable speech detected (silent track, music-only, or speech below the model's confidence threshold)"
+        if whisper_present
+        else "local whisper backend not installed"
+    )
+
     return (
         f"Audio file: {path.name}\n"
         f"Type: {path.suffix.lower().lstrip('.')} audio, {size_str}.\n"
-        f"No speech transcript could be extracted."
+        f"No speech transcript could be extracted ({reason})."
     )
 
 
 def _video_metadata_placeholder(path: Path) -> str:
     """Build a minimal text body for a video file when both frame and
     audio extraction failed. See ``_audio_metadata_placeholder`` for why
-    we degrade to metadata instead of failing the file."""
+    we degrade to metadata instead of failing the file.
+
+    Checks ffmpeg availability via the resolver so the placeholder can
+    distinguish "ffmpeg missing entirely" from "ffmpeg present but the
+    codec defeated us" — the second case used to be the only diagnostic
+    we surfaced, which led users to think their iPhone HEVC files had
+    a codec issue when in reality the backend just couldn't find ffmpeg.
+    """
     try:
         size = path.stat().st_size
         size_str = _human_size(size)
     except OSError:
         size_str = "unknown size"
+
+    try:
+        from cosma_backend.parser.ffmpeg_runtime import have_system_ffmpeg
+        from cosma_backend.parser import whisper_local
+        ffmpeg_present = have_system_ffmpeg()
+        # The bundled imageio-ffmpeg fallback covers the no-system case,
+        # so "ffmpeg present" here means *something* is on disk; we
+        # surface the system-vs-bundled distinction only in logs.
+        whisper_present = whisper_local.is_available()
+    except Exception:
+        ffmpeg_present = True
+        whisper_present = True
+
+    reasons: list[str] = []
+    if not whisper_present:
+        reasons.append("local whisper not installed (transcription unavailable)")
+    if ffmpeg_present:
+        reasons.append("codec unreadable even after transcoding to a clean H.264/AAC proxy")
+    else:
+        reasons.append("no ffmpeg available — install via Homebrew (`brew install ffmpeg`) for full media support")
+    detail = "; ".join(reasons)
+
     return (
         f"Video file: {path.name}\n"
         f"Type: {path.suffix.lower().lstrip('.')} video, {size_str}.\n"
-        f"No transcript or frames could be extracted "
-        f"(codec unsupported or file unreadable)."
+        f"No transcript or frames could be extracted ({detail})."
     )
 
 

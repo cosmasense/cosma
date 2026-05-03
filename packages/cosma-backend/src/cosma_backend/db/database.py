@@ -900,7 +900,14 @@ class Database:
 
     async def get_files_by_status(self, status: str, limit: int = 50, offset: int = 0) -> tuple[list[File], int]:
         """
-        Get files filtered by processing status, ordered by updated_at DESC.
+        Get files filtered by processing status, ordered by actual
+        completion time (most recent first).
+
+        Ordering note: we COALESCE the per-stage timestamps and fall
+        back to `modified` so the result reflects "when was this file
+        actually finished processing?" — NOT the row's `updated_at`,
+        which gets bumped on every disk-scan sweep and would re-order
+        every file to "just now" right after each backend launch.
 
         Args:
             status: Processing status string (e.g. 'FAILED', 'COMPLETE')
@@ -914,7 +921,7 @@ class Database:
         SELECT_SQL = """
             SELECT * FROM files
             WHERE status = ?
-            ORDER BY updated_at DESC
+            ORDER BY COALESCE(embedded_at, summarized_at, parsed_at, modified, updated_at) DESC
             LIMIT ? OFFSET ?
         """
 

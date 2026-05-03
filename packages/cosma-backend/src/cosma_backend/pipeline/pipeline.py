@@ -42,6 +42,18 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _human_size_compact(num_bytes: int) -> str:
+    """Compact byte-count formatter for embedding text. Matches the
+    parser's `_human_size` shape but lives here so this module doesn't
+    depend on the parser package for a string format helper."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{int(num_bytes)} B"
+
+
 class PipelineResult:
     """Results from processing a batch of files."""
     def __init__(self):
@@ -356,6 +368,15 @@ class Pipeline:
                 ))
                 return
 
+            # User-elected partial: filter classified this file as
+            # metadata-only. Skip the parser entirely (we'd be
+            # parsing just to throw the content away), build a
+            # filename-and-metadata text body, embed it, and mark
+            # INDEXED_PARTIAL. Cheap path — no GPU, no LLM.
+            if file.metadata_only and file.partial_kind == "user_elected":
+                await self._run_partial_only(file, saved_file=saved_file)
+                return
+
             # Resume-aware orchestration. Each stage method takes its own
             # semaphore so files in different stages run in parallel
             # (parse on CPU, summarize on GPU, embed on MPS) without
@@ -406,6 +427,68 @@ class Pipeline:
                 logger.info("Resuming from PARSED state",
                             file=file.file_path,
                             saved_status=resume_status.name)
+
+            # Metadata-only after a parse attempt. Two sub-cases:
+            #   * partial_kind="parser_failed" (codec issue, no
+            #     transcript, ffmpeg missing): final status = FAILED.
+            #     The Failed tab is the right place — the user can
+            #     reindex or report it.
+            #   * partial_kind="user_elected": shouldn't reach here
+            #     because we short-circuited before parse, but if a
+            #     parser somehow set metadata_only on a user-elected
+            #     file, honor the user's choice (status=INDEXED_PARTIAL).
+            # In both sub-cases, embed the available metadata so the
+            # file is searchable by name; skip the LLM summary so we
+            # don't generate fake "summaries" of placeholder text.
+            if file.metadata_only:
+                logger.info(
+                    "Routing metadata-only file to embed-only",
+                    file=file.file_path,
+                    partial_kind=file.partial_kind,
+                    reason=file.metadata_only_reason,
+                )
+                first_embed = (
+                    saved_file is None
+                    or saved_file.status != ProcessingStatus.COMPLETE
+                )
+                # Title = filename minus extension. Keeps search-by-name
+                # working without claiming the LLM summarized it.
+                if not file.title:
+                    file.title = file.path.stem
+                try:
+                    self._publish_update(
+                        Update.file_embedding(file.file_path, file.filename)
+                    )
+                    await self.embedder.embed(file)
+                    await self._save_embeddings(file, first_embed=first_embed)
+                    self._publish_update(
+                        Update.file_embedded(file.file_path, file.filename)
+                    )
+                except Exception as embed_err:
+                    logger.warning(
+                        "Metadata-only embed failed; persisting without vectors",
+                        file=file.file_path, error=str(embed_err),
+                    )
+                if file.partial_kind == "user_elected":
+                    file.status = ProcessingStatus.INDEXED_PARTIAL
+                    file.processing_error = file.metadata_only_reason
+                    await self._save_to_db(file)
+                    self._publish_update(Update.file_complete(
+                        file.file_path, file.filename,
+                    ))
+                else:
+                    file.status = ProcessingStatus.FAILED
+                    file.processing_error = (
+                        file.metadata_only_reason
+                        or "Metadata-only: parser could not extract content"
+                    )
+                    await self._save_to_db(file)
+                    self._publish_update(Update.file_failed(
+                        file.file_path,
+                        file.filename,
+                        error=file.processing_error,
+                    ))
+                return
 
             # Stage 2: Summarize (skipped if resuming from SUMMARIZED+).
             need_summarize = resume_status != ProcessingStatus.SUMMARIZED
@@ -476,6 +559,99 @@ class Pipeline:
     # from scratch. See cosma/docs/STAGE_PIPELINING_DESIGN.md.
     # ------------------------------------------------------------------
 
+    async def _run_partial_only(
+        self,
+        file: File,
+        *,
+        saved_file: "File | None",
+    ) -> None:
+        """User-elected metadata-only path.
+
+        Skips parser + summarizer. Builds a short text body from
+        filename + extension + path components + size and embeds it.
+        Final status = INDEXED_PARTIAL.
+
+        Embedding context: the text is intentionally kept under ~200
+        characters (filename + parent dirs + size). Sentence-Transformers
+        truncates at 512 tokens internally so we never overflow the
+        model's context, and chunking is unnecessary at this size — the
+        whole document fits in one vector.
+        """
+        self._publish_update(Update.file_parsing(file.file_path, file.filename))
+
+        # Title = filename without extension. Honest signal — the user
+        # named the file, we're indexing what they named it. No LLM
+        # claims here.
+        if not file.title:
+            file.title = file.path.stem
+
+        # Embedding text: filename + parent path + size. We deliberately
+        # do NOT include the placeholder line about being metadata-only,
+        # because the user wants the embedding to score for the file's
+        # *name*, not for "this is a metadata-only entry."
+        from datetime import datetime, timezone
+
+        size_str = ""
+        try:
+            size_str = _human_size_compact(file.file_size)
+        except Exception:
+            size_str = ""
+        parent_str = (
+            str(file.path.parent) if file.path is not None else ""
+        )
+        ext_clean = (file.extension or "").lstrip(".")
+        parts = [
+            f"Filename: {file.filename}",
+            f"Type: {ext_clean}" if ext_clean else "",
+            f"Size: {size_str}" if size_str else "",
+            f"Folder: {parent_str}" if parent_str else "",
+        ]
+        embedding_body = " | ".join(p for p in parts if p)
+        file.content = embedding_body
+        file.parsed_at = datetime.now(timezone.utc)
+
+        # Reuse the embedder. _prepare_embedding_text uses title +
+        # summary + keywords; we have title set and our embedding_body
+        # in `content`. Set summary to a thin description so the
+        # embedder has something to work with — but mark it short and
+        # honest, not LLM-generated.
+        if not file.summary:
+            file.summary = embedding_body
+
+        first_embed = (
+            saved_file is None
+            or saved_file.status != ProcessingStatus.COMPLETE
+        )
+
+        async with self._embed_sem:
+            try:
+                self._publish_update(
+                    Update.file_embedding(file.file_path, file.filename)
+                )
+                await self.embedder.embed(file)
+                # embedder.embed sets status=COMPLETE — override to
+                # INDEXED_PARTIAL so the count stays distinct from
+                # fully-summarized files.
+                file.status = ProcessingStatus.INDEXED_PARTIAL
+                file.processing_error = file.metadata_only_reason
+                await self._save_embeddings(file, first_embed=first_embed)
+                self._publish_update(
+                    Update.file_embedded(file.file_path, file.filename)
+                )
+            except Exception as embed_err:
+                logger.warning(
+                    "Partial-only embed failed; persisting row without vectors",
+                    file=file.file_path, error=str(embed_err),
+                )
+                file.status = ProcessingStatus.INDEXED_PARTIAL
+                file.processing_error = file.metadata_only_reason
+                await self._save_to_db(file)
+
+        # Treat completion of a partial file the same as a normal
+        # completion for SSE consumers — they care about "this file
+        # is done processing", not about which path it took.
+        self._publish_update(Update.file_complete(file.file_path, file.filename))
+
     async def _run_parse_stage(self, file: File) -> None:
         """Parse the file, set status=PARSED, persist."""
         async with self._parse_sem:
@@ -544,8 +720,17 @@ class Pipeline:
 
         saved_file = await self.db.get_file_by_path(file.file_path)
 
-        # File not in DB or not yet fully processed - don't skip
-        if not saved_file or saved_file.status not in (ProcessingStatus.COMPLETE, ProcessingStatus.FAILED):
+        # File not in DB or not yet fully processed - don't skip.
+        # INDEXED_PARTIAL counts as "fully processed" for skip
+        # purposes — its row is final, and unless the user changes
+        # the filter rules (which invalidates everything anyway) we
+        # don't want to re-embed it on every restart.
+        terminal_statuses = (
+            ProcessingStatus.COMPLETE,
+            ProcessingStatus.FAILED,
+            ProcessingStatus.INDEXED_PARTIAL,
+        )
+        if not saved_file or saved_file.status not in terminal_statuses:
             logger.debug("File needs processing", file=file.file_path, status=saved_file.status if saved_file else "not in DB")
             return False, saved_file
 

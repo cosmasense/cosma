@@ -96,3 +96,98 @@ class TestFilterPatternSplitting:
         )
         assert config.should_include(Path("/tmp/doc.pdf"), Path("/tmp")) is True
         assert config.should_include(Path("/tmp/doc.txt"), Path("/tmp")) is False
+
+
+@pytest.mark.unit
+class TestThreeTierClassification:
+    """The classify() method returns EXCLUDED / PARTIAL / FULL."""
+
+    def test_full_when_no_metadata_only_patterns(self):
+        from cosma_backend.filter import FilterDecision
+
+        config = FilterConfig(
+            mode=FilterMode.BLACKLIST,
+            blacklist_exclude=["*.log"],
+        )
+        assert config.classify(Path("/tmp/doc.pdf"), Path("/tmp")) == FilterDecision.FULL
+
+    def test_excluded_short_circuits_partial(self):
+        """Exclude rules win over metadata_only rules — a file
+        excluded by blacklist_exclude is EXCLUDED even if it also
+        matches a metadata-only pattern."""
+        from cosma_backend.filter import FilterDecision
+
+        config = FilterConfig(
+            mode=FilterMode.BLACKLIST,
+            blacklist_exclude=["*.log"],
+            metadata_only_patterns=["*.log"],
+        )
+        # *.log: excluded wins.
+        assert config.classify(Path("/tmp/app.log"), Path("/tmp")) == FilterDecision.EXCLUDED
+
+    def test_partial_classification(self):
+        """A file matching metadata_only patterns but not exclude
+        patterns lands in PARTIAL."""
+        from cosma_backend.filter import FilterDecision
+
+        config = FilterConfig(
+            mode=FilterMode.BLACKLIST,
+            blacklist_exclude=[],
+            metadata_only_patterns=["*.mkv", "Movies/"],
+        )
+        assert config.classify(
+            Path("/Volumes/Media/Movies/Kill Bill.mkv"),
+            Path("/Volumes/Media"),
+        ) == FilterDecision.PARTIAL
+
+    def test_partial_dir_pattern_matches_subfiles(self):
+        """A directory metadata-only pattern matches files under it."""
+        from cosma_backend.filter import FilterDecision
+
+        config = FilterConfig(
+            mode=FilterMode.BLACKLIST,
+            metadata_only_patterns=["Downloads/"],
+        )
+        assert config.classify(
+            Path("/Users/ethan/Downloads/installer.dmg"),
+            Path("/Users/ethan"),
+        ) == FilterDecision.PARTIAL
+
+    def test_full_in_whitelist_when_partial_pattern_misses(self):
+        """In whitelist mode, the metadata_only check still applies
+        on top of the whitelist decision."""
+        from cosma_backend.filter import FilterDecision
+
+        config = FilterConfig(
+            mode=FilterMode.WHITELIST,
+            whitelist_include=["*.pdf", "*.mkv"],
+            metadata_only_patterns=["*.mkv"],
+        )
+        assert config.classify(Path("/tmp/doc.pdf"), Path("/tmp")) == FilterDecision.FULL
+        assert config.classify(Path("/tmp/movie.mkv"), Path("/tmp")) == FilterDecision.PARTIAL
+        # Whitelist excludes everything else
+        assert config.classify(Path("/tmp/notes.txt"), Path("/tmp")) == FilterDecision.EXCLUDED
+
+    def test_v2_to_v3_migration_preserves_data(self):
+        """Loading a v2 dict into v3 keeps all existing patterns and
+        initializes metadata_only_patterns to []."""
+        v2_data = {
+            "version": 2,
+            "mode": "blacklist",
+            "blacklist_exclude": ["*.log"],
+            "blacklist_include": [".env.example"],
+            "whitelist_include": ["*.pdf"],
+            "whitelist_exclude": [],
+        }
+        config = FilterConfig.from_dict(v2_data)
+        assert config.version == 3
+        assert config.blacklist_exclude == ["*.log"]
+        assert config.metadata_only_patterns == []
+
+    def test_to_dict_round_trip_preserves_metadata_only(self):
+        config = FilterConfig(
+            mode=FilterMode.BLACKLIST,
+            metadata_only_patterns=["*.mkv"],
+        )
+        round_tripped = FilterConfig.from_dict(config.to_dict())
+        assert round_tripped.metadata_only_patterns == ["*.mkv"]
