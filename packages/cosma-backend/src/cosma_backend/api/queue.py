@@ -38,6 +38,10 @@ class QueueStatusResponse:
     #   False = user forced "pause now" (overrides a scheduler run)
     # Auto-cleared on next scheduler transition.
     user_override: Optional[bool] = None
+    # True for ~10s after every /api/search/ hit, so the queue UI can
+    # render a "paused for search" badge instead of looking stuck.
+    # See QueueConfig.search_preempt_seconds.
+    search_preempted: bool = False
 
 
 @dataclass

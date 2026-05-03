@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -222,7 +223,12 @@ class LlamaCppSummarizer(BaseSummarizer):
         if not (self.model_path or all((self.repo_id, self.filename))):
             raise ValueError("llamacpp.model_path or llamacpp.repo_id + llamacpp.filename must be configured")
 
-        self.n_ctx = n_ctx or self.config.llamacpp.n_ctx
+        # n_ctx scales with the user's machine: a 16 GB Mac gets a
+        # smaller window than a 64 GB Studio. resolved_n_ctx returns
+        # the explicit value if set, else picks one from RAM. Avoids
+        # OOM on small machines AND under-using big ones.
+        from cosma_backend.utils.hardware import resolved_n_ctx
+        self.n_ctx = n_ctx or resolved_n_ctx(self.config.llamacpp.n_ctx)
         # Reserve headroom in every chunk for the system prompt, user scaffolding
         # (filename, part-of-N header), image tokens, and generation budget. When
         # n_ctx is small (e.g. 8192) and a chunk filled it entirely, llama.cpp
@@ -255,6 +261,19 @@ class LlamaCppSummarizer(BaseSummarizer):
         self.llm = None
         self.chat_handler = None
         self._last_used_at: float = 0.0
+
+        # llama.cpp is NOT thread-safe. The Pipeline's summarize
+        # semaphore (concurrency=1) normally guarantees one asyncio
+        # task in summarize at a time, but cancel_in_flight() can
+        # release that semaphore mid-call: the asyncio task is
+        # cancelled while its `to_thread`-dispatched
+        # create_chat_completion is still running on a worker thread,
+        # and the next task can race in for a SECOND concurrent call
+        # against the same Llama instance → SIGBUS / Fatal Python
+        # error. The first random10bench_real run (2026-05-01)
+        # reproduced this every time. This Lock serializes inference
+        # calls at the C boundary regardless of asyncio bookkeeping.
+        self._inference_lock = threading.Lock()
 
     @property
     def last_used_at(self) -> float:
@@ -335,15 +354,25 @@ class LlamaCppSummarizer(BaseSummarizer):
                 "n_gpu_layers": self.config.llamacpp.n_gpu_layers,
                 "verbose": self.config.llamacpp.verbose,
             }
+            # Optional perf flags. SIGABRT-on-incompatible-build is a
+            # real risk (e.g. flash_attn=True + Qwen3VLChatHandler in
+            # cosmasense v0.3.32-metal crashed at 2026-05-01). We
+            # default these OFF and let users opt in via settings.toml
+            # once verified against their own llama-cpp-python build.
+            if getattr(self.config.llamacpp, "flash_attn", False):
+                llama_kwargs["flash_attn"] = True
+            if getattr(self.config.llamacpp, "kv_cache_quant", False):
+                # GGML_TYPE_Q8_0 = 8. Quality loss <0.1 perplexity.
+                # Only meaningful with flash_attn=True; without FA,
+                # llama.cpp dequantizes the cache every attention
+                # call, which is *slower* than not quantizing.
+                llama_kwargs["type_k"] = 8
+                llama_kwargs["type_v"] = 8
             if self.chat_handler:
                 llama_kwargs["chat_handler"] = self.chat_handler
 
+            # Resolve the model file path once.
             if self.repo_id and self.filename:
-                # Route through our shared downloader so the GGUF lands in
-                # cosma/models/llama/ and is skipped on subsequent starts.
-                # Llama() is then constructed against the local file path
-                # rather than .from_pretrained() (which would re-resolve
-                # into the HF cache dir).
                 from cosma_backend.downloads import download_hf_file
                 result = download_hf_file(
                     repo_id=self.repo_id,
@@ -352,24 +381,66 @@ class LlamaCppSummarizer(BaseSummarizer):
                     subdir="gguf",
                     stage_label="llama-gguf",
                 )
-                self.llm = Llama(
-                    model_path=str(result.path),
-                    **llama_kwargs,
-                )
-                logger.info("llama.cpp model loaded",
-                            repo_id=self.repo_id,
-                            filename=self.filename,
-                            n_ctx=self.n_ctx,
-                            vision=self.chat_handler is not None)
+                model_path_resolved = str(result.path)
             else:
-                self.llm = Llama(
-                    model_path=self.model_path,
-                    **llama_kwargs,
+                model_path_resolved = self.model_path
+
+            # Older llama-cpp-python builds may not accept flash_attn /
+            # type_k / type_v. Try the optimized kwargs first; fall
+            # back gracefully if the Llama constructor rejects them so
+            # we never crash a user who's behind on llama-cpp-python
+            # versions. Logged so the regression is visible.
+            try:
+                self.llm = Llama(model_path=model_path_resolved, **llama_kwargs)
+                logger.info(
+                    "llama.cpp model loaded",
+                    model_path=model_path_resolved,
+                    n_ctx=self.n_ctx,
+                    vision=self.chat_handler is not None,
+                    flash_attn=llama_kwargs.get("flash_attn", False),
+                    kv_quant=("type_k" in llama_kwargs),
                 )
-                logger.info("llama.cpp model loaded",
-                            model_path=self.model_path,
+            except TypeError as e:
+                logger.warning(
+                    "llama-cpp-python rejected one of the optional perf "
+                    "kwargs — retrying without them.",
+                    error=str(e),
+                )
+                for k in ("flash_attn", "type_k", "type_v"):
+                    llama_kwargs.pop(k, None)
+                self.llm = Llama(model_path=model_path_resolved, **llama_kwargs)
+                logger.info("llama.cpp model loaded (legacy kwargs)",
+                            model_path=model_path_resolved,
                             n_ctx=self.n_ctx,
                             vision=self.chat_handler is not None)
+
+            # Prompt caching. The system prompt is byte-identical on
+            # every chunk's create_chat_completion call (see
+            # base._get_system_prompt). Without a cache, llama.cpp
+            # re-tokenizes and re-prefills those ~250 tokens every
+            # call. LlamaRAMCache skips prefill when the next request
+            # shares a prefix. Gated by config so it can be turned off
+            # if a build interaction surfaces.
+            if getattr(self.config.llamacpp, "prompt_cache_enabled", True):
+                try:
+                    from llama_cpp import LlamaRAMCache
+                    capacity_mib = int(getattr(
+                        self.config.llamacpp,
+                        "prompt_cache_capacity_mib",
+                        200,
+                    ))
+                    self.llm.set_cache(LlamaRAMCache(
+                        capacity_bytes=capacity_mib * 1024 * 1024,
+                    ))
+                    logger.info(
+                        "LlamaRAMCache enabled "
+                        "(system-prompt prefill cached)",
+                        capacity_mib=capacity_mib,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to enable LlamaRAMCache (non-fatal)",
+                    )
         except Exception as e:
             logger.error("Failed to load llama.cpp model", error=str(e))
             raise AIProviderError(f"Failed to load llama.cpp: {str(e)}")
@@ -474,14 +545,19 @@ class LlamaCppSummarizer(BaseSummarizer):
 
         # Offload synchronous llama.cpp inference to a thread so it doesn't
         # block the async event loop (inference can take several seconds).
-        response = await asyncio.to_thread(
-            self.llm.create_chat_completion,
-            messages=messages,
-            max_tokens=generation_budget,
-            temperature=0.1,
-            top_p=0.95,
-            stream=False,
-        )
+        # The threading.Lock serializes the actual C call; see
+        # `_inference_lock` doc in __init__ for why it has to be at the
+        # C boundary, not the asyncio one.
+        def _run_inference() -> Any:
+            with self._inference_lock:
+                return self.llm.create_chat_completion(
+                    messages=messages,
+                    max_tokens=generation_budget,
+                    temperature=0.1,
+                    top_p=0.95,
+                    stream=False,
+                )
+        response = await asyncio.to_thread(_run_inference)
 
         self._last_used_at = time.time()
         response_content = response['choices'][0]['message']['content'].strip()

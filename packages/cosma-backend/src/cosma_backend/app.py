@@ -50,8 +50,14 @@ from cosma_backend.watcher import Watcher
 load_dotenv()
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-# Limit PyTorch MPS memory usage (set before torch is imported)
+# Limit PyTorch MPS memory usage (set before torch is imported).
+# BOTH watermarks must be set explicitly. When only HIGH is set,
+# PyTorch's auto-derivation for LOW lands at 1.4 (HIGH × 1.86) which
+# is invalid (>1.0), and SentenceTransformer's MPS load aborts with
+# "invalid low watermark ratio 1.4". Forcing LOW < HIGH < 1.0 fixes
+# it. See `embedder/providers.py` MPS-load fallback.
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.75")
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.5")
 
 configure_logging()
 logger = get_logger(__name__)
@@ -296,6 +302,28 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
         Phase 2 (background): Load embedding model + start indexing + watcher
                → Search becomes available, then indexing starts
         """
+        # ── Startup banner ──
+        # Single, easy-to-grep line that lands at the top of every
+        # backend launch's log so the user can confirm which build is
+        # running without reading the whole startup spam.
+        import platform as _platform
+        from cosma_backend import __version__, __api_version__
+        try:
+            torch_mod = __import__("torch")
+            mps_ok = bool(torch_mod.backends.mps.is_available())
+        except Exception:
+            mps_ok = False
+        logger.info(
+            "cosma-backend starting",
+            version=__version__,
+            api_version=__api_version__,
+            python=_platform.python_version(),
+            platform=f"{_platform.system()} {_platform.machine()}",
+            mps=mps_ok,
+            host=app.config.get("HOST"),
+            port=app.config.get("PORT"),
+        )
+
         # ── Phase 1: Fast startup — get the API responding ──
         logger.info("Phase 1: Initializing database and core services")
         app.db = await db.connect(app.config['DATABASE_PATH'])
@@ -337,6 +365,20 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
             note="llama.cpp uses n_gpu_layers; Ollama uses its own env config",
         )
 
+        # Size the shared pipeline thread pool to cover parse + embed
+        # in flight at the same time. The pool is what MarkItDown,
+        # Spotlight extraction, and the embedder all use to offload
+        # blocking work; if it's too small, parse_concurrency is
+        # silently capped by it. See pipeline_executor.py.
+        from cosma_backend.pipeline_executor import configure_pipeline_executor
+        configure_pipeline_executor(
+            max_workers=(
+                settings.queue.parse_concurrency
+                + settings.queue.embed_concurrency
+                + 1   # whisper headroom
+            ),
+        )
+
         discoverer = Discoverer()
         parser = FileParser(config=settings.parser)
         summarizer = AutoSummarizer(config=settings.summarizer)
@@ -348,6 +390,9 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
             db=app.db, updates_hub=app.updates_hub,
             parser=parser, discoverer=discoverer,
             summarizer=summarizer, embedder=embedder,
+            parse_concurrency=settings.queue.parse_concurrency,
+            summarize_concurrency=settings.queue.summarize_concurrency,
+            embed_concurrency=settings.queue.embed_concurrency,
         )
         app.searcher = HybridSearcher(db=app.db, embedder=embedder)
 
@@ -363,9 +408,14 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
 
         logger.info("Phase 1 complete — API is ready")
 
-        # ── Phase 2: Background — load models and start indexing ──
-        # Start indexing services immediately (non-blocking async)
-        await app.indexing_queue.start()
+        # ── Phase 2: Background — load models, then start indexing ──
+        # IMPORTANT: do NOT start the indexing queue yet. Indexing competes
+        # with both the embedder load and (via summarize) the llama.cpp
+        # load for GPU/CPU. Starting it eagerly turned the demo's first
+        # search into a 5–10 s freeze. We start the queue only after
+        # _deferred_heavy_init has loaded the embedder, pre-warmed the
+        # LLM, and observed an `indexing_start_grace_seconds` quiet
+        # window. See cosma/docs/STARTUP_PROFILE_FINDINGS.md.
         app.scheduler = Scheduler(
             queue=app.indexing_queue, updates_hub=app.updates_hub,
             config=settings.scheduler,
@@ -418,11 +468,16 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
                     pass
 
         async def _deferred_heavy_init():
-            """Load embedding model in a thread so it doesn't block the event loop.
+            """Load models, pre-warm the LLM, then start indexing.
 
-            This lets Uvicorn start accepting connections immediately after Phase 1
-            instead of waiting ~8s for the SentenceTransformer model to load.
-            Cancellation-safe: if SIGTERM arrives mid-load, the task is cancelled.
+            Order is intentional: embedder first so semantic search becomes
+            usable as soon as possible, LLM second to pay its load cost
+            behind the loading indicator (otherwise it lands on the first
+            file's summarize call and blocks the event loop), then a short
+            grace window before starting the indexing queue so any user
+            search at app launch has the GPU to itself.
+
+            Cancellation-safe: SIGTERM mid-load cancels this task.
             """
             try:
                 app._deferred_init_progress = 0.05
@@ -436,8 +491,25 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
                     await asyncio.to_thread(embedder._eagerly_initialize_models)
                     app._model_loading_done.set()
                     await progress_task
-                app._deferred_init_progress = 0.80
+                app._deferred_init_progress = 0.60
                 logger.info("Embedding model loaded — search is ready")
+
+                # Pre-warm the LLM so the first user-triggered summarize
+                # doesn't pay the multi-second Llama.from_pretrained cost
+                # on the event loop.  AutoSummarizer._get_llamacpp_summarizer
+                # already runs the constructor in a thread (see auto.py),
+                # so awaiting it here is non-blocking for the loop.
+                logger.info("Phase 2: Pre-warming LLM (summarizer)...")
+                try:
+                    if hasattr(app.pipeline.summarizer, "_get_llamacpp_summarizer"):
+                        await app.pipeline.summarizer._get_llamacpp_summarizer()
+                    logger.info("LLM pre-warmed")
+                except Exception:
+                    # LLM pre-warm is best-effort — if it fails the queue
+                    # still starts and the user gets a real error on the
+                    # first summarize. Don't block search on this.
+                    logger.exception("LLM pre-warm failed (non-fatal)")
+                app._deferred_init_progress = 0.80
 
                 logger.info("Running startup cleanup")
                 removed = await cleanup_excluded_files_on_startup(app.db, app.filter_manager)
@@ -446,8 +518,24 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
                 app._deferred_init_progress = 0.90
 
                 await app.watcher.initialize_from_database()
+
+                # Grace window: let any in-flight user search finish on a
+                # quiet GPU before indexing kicks in. Configurable via
+                # settings.queue.indexing_start_grace_seconds (default 5s).
+                grace = float(getattr(
+                    settings.queue, "indexing_start_grace_seconds", 5.0,
+                ))
+                if grace > 0:
+                    logger.info(
+                        "Phase 2: Holding indexing for grace window",
+                        grace_seconds=grace,
+                    )
+                    await asyncio.sleep(grace)
+
+                logger.info("Phase 2: Starting indexing queue")
+                await app.indexing_queue.start()
                 app._deferred_init_progress = 1.0
-                logger.info("Phase 2 complete — indexing is ready")
+                logger.info("Phase 2 complete — indexing is running")
             except asyncio.CancelledError:
                 logger.info("Phase 2 cancelled (shutdown in progress)")
             except Exception:
@@ -548,24 +636,26 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
     @app.before_request
     async def log_request():
         request.start_time = datetime.datetime.now()
-        logger.info(
+        # Per-request log lines are demoted to DEBUG. They were the
+        # single biggest source of noise in production logs (~200
+        # lines/min on a busy frontend) and the slow-request probe
+        # below already surfaces anything interesting at WARNING.
+        logger.debug(
             "Incoming request",
             method=request.method,
             path=request.path,
-            remote_addr=request.remote_addr,
-            user_agent=request.headers.get('User-Agent')
         )
 
     @app.after_request
     async def log_response(response):
         if hasattr(request, 'start_time'):
             duration = (datetime.datetime.now() - request.start_time).total_seconds()
-            logger.info(
+            logger.debug(
                 "Request completed",
                 method=request.method,
                 path=request.path,
                 status_code=response.status_code,
-                duration_seconds=duration
+                duration_seconds=duration,
             )
             # Slow-request probe: when a request exceeds 1 s, capture what the
             # pipeline was doing so we can correlate latency spikes with work.

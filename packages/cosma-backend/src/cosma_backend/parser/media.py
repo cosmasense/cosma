@@ -506,7 +506,7 @@ async def _transcribe_with_openai(audio_path: Path, config: Optional[Dict[str, A
 
 
 # Vision processing is now integrated into the summarization system
-# See main.summarizer.summarizer.AutoSummarizer.summarize_with_image()
+# See cosma_backend.summarizer.AutoSummarizer.summarize_with_image()
 
 
 # =============================================================================
@@ -752,7 +752,7 @@ def unload_whisper_model() -> None:
 
 
 # Local vision processing is now integrated into the summarization system
-# See main.summarizer.summarizer.AutoSummarizer._summarize_with_vision_local()
+# See cosma_backend.summarizer.AutoSummarizer._summarize_with_vision_local()
 
 
 # =============================================================================

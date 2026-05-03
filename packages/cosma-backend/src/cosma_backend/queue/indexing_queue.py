@@ -125,6 +125,25 @@ class IndexingQueue:
         # a lazy HF download racing the bootstrap on the same GGUF.
         self._bootstrap_paused = False
 
+        # Search-preempts-indexing: every /api/search/ hit calls
+        # search_preempt(), which sets `_search_preempt_until` to
+        # `now + search_preempt_seconds`. While we're inside that window,
+        # `is_paused` reports True so no new items are dispatched. In-flight
+        # items finish normally — we only block the dispatch decision.
+        self._search_preempt_until: float = 0.0
+        self._search_preempt_seconds: float = float(getattr(
+            self._config, "search_preempt_seconds", 10.0,
+        ))
+
+        # In-flight task tracking for `cancel_in_flight()`. Keyed by
+        # file_path so a search-typing nudge can cancel exactly the
+        # tasks currently consuming GPU/CPU. Crash-safe progress
+        # (status PARSED/SUMMARIZED durably persisted between stages)
+        # means a cancelled task's work isn't lost — its DB row stays
+        # at the last completed stage and the pipeline resumes from
+        # there on the next dispatch.
+        self._in_flight_tasks: dict[str, asyncio.Task] = {}
+
         self._processing_task: Optional[asyncio.Task] = None
         self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
 
@@ -168,6 +187,12 @@ class IndexingQueue:
         # downloader on the same GGUF.
         if self._bootstrap_paused:
             return True
+        # Search preemption is also non-overridable: while a user is
+        # actively searching, indexing must yield the GPU to the embedder
+        # / LLM so query latency stays low. The window is short
+        # (default 10 s) so this doesn't meaningfully slow indexing.
+        if self.is_search_preempted:
+            return True
         # User override beats scheduler in either direction. None means
         # defer to scheduler.
         if self._user_override is False:
@@ -181,6 +206,40 @@ class IndexingQueue:
         # mostly defensive — it covers any direct test or external
         # caller that still sets the old flag.)
         return self._manually_paused or self._scheduler_paused
+
+    @property
+    def is_search_preempted(self) -> bool:
+        return time.time() < self._search_preempt_until
+
+    def search_preempt(self) -> None:
+        """Note that a user-driven search is happening right now. Pauses
+        new dispatch for `search_preempt_seconds`. Repeated calls extend
+        the pause from "now"."""
+        self._search_preempt_until = time.time() + self._search_preempt_seconds
+
+    def cancel_in_flight(self) -> int:
+        """Cancel every currently-processing item so the GPU/CPU is
+        immediately freed for a user search. Cancelled items' partial
+        progress is durable in the DB (status=PARSED or =SUMMARIZED
+        depending on which stage they were in) thanks to the persisted-
+        progress refactor — they'll be picked up automatically on the
+        next dispatch.
+
+        Returns the number of tasks cancelled.
+
+        Note: Python can't safely interrupt OS threads, so an in-flight
+        blocking call inside `parser.parse_file` (e.g. a Spotlight
+        subprocess wait) finishes its current sub-call. What we cancel
+        is the *asyncio orchestrator* that would have run summarize +
+        embed for that file; the file ends up at its last persisted
+        stage instead of progressing.
+        """
+        n = 0
+        for path, task in list(self._in_flight_tasks.items()):
+            if not task.done():
+                task.cancel()
+                n += 1
+        return n
 
     @property
     def is_manually_paused(self) -> bool:
@@ -222,11 +281,57 @@ class IndexingQueue:
     async def start(self) -> None:
         """Load persisted items and start the background processing loop."""
         await self._load_from_db()
+        # Crash recovery: any file row in a non-terminal status from a
+        # prior run (DISCOVERED / PARSED / SUMMARIZED) means the previous
+        # process exited mid-pipeline. Re-enqueue them — the pipeline's
+        # resume-aware process_file will pick up where each one left off.
+        # Must run before the processing loop starts (or the watcher
+        # delivers any new events) so we don't double-process.
+        await self._recover_in_flight_files()
         if self._processing_task is None or self._processing_task.done():
             self._processing_task = asyncio.create_task(self._processing_loop())
             logger.info("Indexing queue processing loop started")
         if self._added_flush_task is None or self._added_flush_task.done():
             self._added_flush_task = asyncio.create_task(self._added_flush_loop())
+
+    async def _recover_in_flight_files(self) -> None:
+        """Re-enqueue files left in non-terminal states by a prior crash.
+
+        Looks for status IN (DISCOVERED, PARSED, SUMMARIZED) and pushes
+        each onto the queue as a normal INDEX action. The pipeline's
+        process_file resumes at the right stage based on the saved row
+        (see Pipeline.process_file in pipeline/pipeline.py).
+
+        This is best-effort — a DB error here must not block the queue
+        from starting, so we log and continue.
+        """
+        if self._db is None:
+            return
+        recovered = 0
+        try:
+            for status_name in ("DISCOVERED", "PARSED", "SUMMARIZED"):
+                files, total = await self._db.get_files_by_status(
+                    status_name, limit=100000, offset=0,
+                )
+                for f in files:
+                    # Skip if a queue item already exists (loaded by
+                    # _load_from_db) — that path is already scheduled.
+                    if f.file_path in self._items:
+                        continue
+                    # Re-enqueue as INDEX. Use a 0-cooldown override so
+                    # recovery is prompt; the normal debounce only matters
+                    # for live filesystem events, not crashed-mid-flight
+                    # files we already know about.
+                    await self.enqueue(
+                        Path(f.file_path), QueueAction.INDEX,
+                        cooldown_seconds=0,
+                    )
+                    recovered += 1
+            if recovered:
+                logger.info("Crash recovery: re-enqueued non-terminal files",
+                            count=recovered)
+        except Exception:
+            logger.exception("Crash recovery scan failed (non-fatal)")
 
     async def stop(self) -> None:
         """Stop the background processing loop."""
@@ -438,7 +543,7 @@ class IndexingQueue:
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                         ))
                         item_to_persist = existing
-                        logger.info("Queue item fast-tracked to DELETE", file_path=key)
+                        logger.debug("Queue item fast-tracked to DELETE", file_path=key)
 
                     else:
                         # Otherwise reset the cooldown timer
@@ -452,7 +557,7 @@ class IndexingQueue:
                             UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                         ))
                         item_to_persist = existing
-                        logger.info("Queue item cooldown reset", file_path=key)
+                        logger.debug("Queue item cooldown reset", file_path=key)
 
                 elif existing.status == QueueItemStatus.WAITING:
                     # Item is ready but hasn't been dispatched yet; reset it
@@ -469,8 +574,8 @@ class IndexingQueue:
                         UpdateOpcode.QUEUE_ITEM_UPDATED, **existing.to_dict()
                     ))
                     item_to_persist = existing
-                    logger.info("Queue item reset from WAITING to cooldown",
-                                file_path=key, action=action.value)
+                    logger.debug("Queue item reset from WAITING to cooldown",
+                                 file_path=key, action=action.value)
 
             if item_to_persist is None and existing is not None:
                 # Handled above (PROCESSING stash) — already returned
@@ -590,6 +695,11 @@ class IndexingQueue:
             "manually_paused": self.is_manually_paused,
             "scheduler_paused": self._scheduler_paused,
             "bootstrap_paused": self._bootstrap_paused,
+            # New: while True, the queue is paused because a user search
+            # just happened. Auto-clears after search_preempt_seconds.
+            # Frontend uses this to render a "paused for search" reason
+            # badge so users don't think indexing is broken.
+            "search_preempted": self.is_search_preempted,
             # One-shot user override surfaced for the UI:
             #   None  → button reflects scheduler decision
             #   True  → user has forced run; button shows "Pause"
@@ -674,7 +784,21 @@ class IndexingQueue:
                     await self._save_item(item)
 
                 if ready_items:
-                    tasks = [self._process_item(item) for item in ready_items]
+                    # Wrap each item in an asyncio.Task and register it
+                    # under its file_path so cancel_in_flight() can find
+                    # and cancel exactly the tasks consuming hardware.
+                    # Task callbacks deregister on completion.
+                    tasks: list[asyncio.Task] = []
+                    for item in ready_items:
+                        t = asyncio.create_task(self._process_item(item))
+                        self._in_flight_tasks[item.file_path] = t
+                        # bind file_path to the closure to deregister
+                        # the right entry; default-arg trick avoids
+                        # late-binding bugs.
+                        def _done(fut, fp=item.file_path):
+                            self._in_flight_tasks.pop(fp, None)
+                        t.add_done_callback(_done)
+                        tasks.append(t)
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 await asyncio.sleep(0.5)
@@ -740,11 +864,27 @@ class IndexingQueue:
                     UpdateOpcode.QUEUE_ITEM_COMPLETED, **item.to_dict()
                 ))
                 await self._delete_item_from_db(item.id)
-                logger.info("Queue item completed", file_path=item.file_path, action=item.action.value)
+                logger.debug("Queue item completed", file_path=item.file_path, action=item.action.value)
 
             except DatabaseClosingError:
                 logger.debug("Queue worker stopping (DB closing during shutdown)")
                 return
+            except asyncio.CancelledError:
+                # cancel_in_flight() reached us. Reset the queue item
+                # to WAITING with a fresh cooldown so the next dispatch
+                # pass picks it up. The file's row in `files` keeps its
+                # last persisted stage (PARSED or SUMMARIZED) so the
+                # pipeline resumes from the right point — no work lost.
+                # Crucially: re-raise CancelledError so asyncio's task
+                # bookkeeping is correct. Anything we set on `item`
+                # below is fine to do before re-raising.
+                logger.info("Queue item cancelled mid-flight",
+                            file_path=item.file_path, action=item.action.value)
+                async with self._lock:
+                    item.status = QueueItemStatus.WAITING
+                    item.cooldown_expires_at = time.time() + self._config.initial_cooldown_seconds
+                await self._save_item(item)
+                raise
             except Exception as e:
                 item.retry_count += 1
                 # Deterministic failures should not be retried

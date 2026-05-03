@@ -16,6 +16,92 @@ from cosma_backend.utils.decorators import async_wrap
 logger = get_logger(__name__)
 
 
+# Sentence-splitting machinery. Used by chunk_content to break content
+# on real sentence boundaries instead of the previous brittle
+# `content.split('. ')`. Documented at the call site.
+
+# Common abbreviations whose trailing period must NOT end a sentence.
+# Keep this conservative — a missing entry just means an extra split,
+# not a wrong one.
+_ABBREVIATIONS = (
+    "Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr",
+    "vs", "etc", "e.g", "i.e", "Inc", "Ltd", "Co", "Corp",
+    "U.S", "U.K", "E.U", "U.N",
+    "St", "Ave", "Rd", "Blvd",
+    "approx", "Fig", "fig", "No", "no",
+    "Ph.D", "M.D", "B.A", "M.A", "B.S", "M.S",
+    "a.m", "p.m", "A.M", "P.M",
+    "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Sept",
+    "Oct", "Nov", "Dec",
+)
+
+# Placeholder used to mask periods inside abbreviations + decimals so
+# the actual sentence splitter doesn't see them. Chosen to be a
+# string that won't appear in real text. Restored at the end.
+_DOT_PLACEHOLDER = "\x00DOT\x00"
+
+# Pre-built alternation of abbreviations with a literal `.`. Used to
+# mask "Mr." → "Mr<placeholder>" before splitting, then restored.
+_ABBREV_RE = re.compile(
+    r"\b(" + "|".join(re.escape(a) for a in _ABBREVIATIONS) + r")\.",
+)
+# Decimal numbers like 3.14, $12.50, v3.14. Mask the period so we
+# don't split mid-number.
+_DECIMAL_RE = re.compile(r"(\d)\.(\d)")
+
+# Sentence-final punctuation followed by whitespace and a likely
+# next-sentence start. Latin uppercase OR CJK OR opening quote/paren.
+# Python's `re` doesn't allow variable-width lookbehind; use lookahead
+# only and rely on the abbreviation/decimal masking to keep us out of
+# the wrong places.
+_SENTENCE_END_RE = re.compile(
+    r"(?<=[.!?。!?])\s+(?=[A-Z一-鿿ぁ-ヿ\(\[\"'])",
+)
+
+# Paragraph breaks always count.
+_PARAGRAPH_BREAK_RE = re.compile(r"\n\s*\n")
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    """Robust-enough sentence splitter.
+
+    Beats `text.split('. ')` on:
+      - "Mr. Smith asked Dr. Wong." → 1 sentence, not 2
+      - "Use v3.14 of pi." → 1 sentence, not 3
+      - "First. Second!" → 2 sentences
+      - Multi-paragraph text → split on \\n\\n boundaries too
+      - Chinese / Japanese punctuation supported
+
+    Implementation: mask abbreviation- and decimal-internal periods
+    with a placeholder, split on real sentence boundaries, then
+    restore the periods. Avoids Python's no-variable-width-lookbehind
+    limitation that bit the first version of this code.
+    """
+    if not text:
+        return []
+
+    # First split on paragraph breaks — unambiguous boundaries that
+    # don't depend on punctuation (markdown headings, logs).
+    paragraphs = _PARAGRAPH_BREAK_RE.split(text)
+    sentences: List[str] = []
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        # Mask periods inside abbreviations and decimals so the
+        # sentence-end regex won't trip on them.
+        masked = _ABBREV_RE.sub(lambda m: m.group(1) + _DOT_PLACEHOLDER, para)
+        masked = _DECIMAL_RE.sub(lambda m: m.group(1) + _DOT_PLACEHOLDER + m.group(2), masked)
+
+        parts = _SENTENCE_END_RE.split(masked)
+        for p in parts:
+            p = p.replace(_DOT_PLACEHOLDER, ".").strip()
+            if p:
+                sentences.append(p)
+    return sentences
+
+
 def get_encoding_for_model(model: str) -> tiktoken.Encoding:
     """
     Get a tiktoken encoding for OpenAI-family model names.
@@ -151,8 +237,18 @@ async def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50,
         if await estimate_tokens(content, model, use_fast=False) <= max_tokens:
             return [content]
 
-    # Use sentence-based chunking with fast estimation for efficiency
-    sentences = content.split('. ')
+    # Use sentence-based chunking with fast estimation for efficiency.
+    # The previous version used `content.split('. ')`, which:
+    #   * mis-splits "Mr. Smith", "U.S.A.", "v3.14" into pseudo-sentences
+    #   * loses every legitimate sentence-final period (the trailing
+    #     ". " was the delimiter so it gets stripped)
+    #   * does nothing with "?" / "!" / Asian punctuation / line breaks
+    # The split below uses a regex with negative lookbehinds for the
+    # most common abbreviations and decimal patterns, splits on real
+    # sentence-final punctuation followed by whitespace, AND keeps the
+    # delimiter on the previous sentence so reconstructed chunks read
+    # naturally.
+    sentences = _split_into_sentences(content)
     chunks = []
     current_chunk = []
     current_tokens = 0
@@ -167,8 +263,10 @@ async def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50,
 
         if current_tokens + sentence_tokens > (max_tokens - safety_buffer) and current_chunk:
             logger.info("Chunk created", chunk=len(chunks) + 1, tokens=current_tokens)
-            # Finalize current chunk and verify it's within limits
-            chunk_text = '. '.join(current_chunk) + '.'
+            # Sentences already carry their terminators (the new
+            # _split_into_sentences keeps them), so reassembly is a
+            # plain ' ' join instead of '. '+suffix.
+            chunk_text = ' '.join(current_chunk)
 
             # Safety check: verify the chunk doesn't exceed the limit with accurate tokenization
             accurate_tokens = await estimate_tokens(chunk_text, model, use_fast=False)
@@ -180,16 +278,16 @@ async def chunk_content(content: str, max_tokens: int, overlap_tokens: int = 50,
 
             # Start new chunk with overlap (fast estimation)
             overlap_sentences = max(1, overlap_tokens // 50)  # Rough overlap in sentences
-            overlap_content = '. '.join(current_chunk[-overlap_sentences:])
+            overlap_content = ' '.join(current_chunk[-overlap_sentences:])
             current_chunk = [overlap_content, sentence] if overlap_content else [sentence]
-            current_tokens = await estimate_tokens('. '.join(current_chunk), model, use_fast=True)
+            current_tokens = await estimate_tokens(' '.join(current_chunk), model, use_fast=True)
         else:
             current_chunk.append(sentence)
             current_tokens += sentence_tokens
 
     # Add final chunk with safety check
     if current_chunk:
-        chunk_text = '. '.join(current_chunk) + '.'
+        chunk_text = ' '.join(current_chunk)
         accurate_tokens = await estimate_tokens(chunk_text, model, use_fast=False)
         if accurate_tokens > max_tokens:
             chunk_text = await _oversized_chunk_fix(chunk_text, max_tokens, model)

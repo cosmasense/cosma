@@ -230,7 +230,12 @@ class WatcherJob:
 
                 elif isinstance(event, (FileCreatedEvent, FileModifiedEvent)):
                     event_type = "created" if isinstance(event, FileCreatedEvent) else "modified"
-                    logger.info(f"File {event_type}", path=event.src_path)
+                    # File-level create/modify hits hundreds per second
+                    # under tools that touch many files (git, build
+                    # systems, etc.). The queue's coalesced
+                    # ``Queue enqueue batch flushed count=N`` already
+                    # gives an aggregate progress signal at INFO.
+                    logger.debug(f"File {event_type}", path=event.src_path)
                     path = Path(str(event.src_path)).resolve()
 
                     if self._is_config_file(path):

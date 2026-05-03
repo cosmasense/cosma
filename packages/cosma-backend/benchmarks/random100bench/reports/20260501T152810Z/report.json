@@ -1,0 +1,196 @@
+{
+  "system_info": {
+    "timestamp": "2026-05-01T15:25:23.275924+00:00",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "system": "Darwin",
+    "machine": "arm64",
+    "python": "3.13.9",
+    "cosma_backend_version": "0.8.8",
+    "cosma_backend_api_version": 1,
+    "cpu_count_logical": 8,
+    "cpu_count_physical": 8,
+    "cpu_freq_mhz": 3204,
+    "ram_total_gib": 16.0,
+    "ram_available_gib": 5.71
+  },
+  "config": {
+    "n_requested": 100,
+    "n_actual": 100,
+    "seed": 42,
+    "source": "/Users/ethanpan/Downloads",
+    "n_queries": 10,
+    "ai_mode": "mocked (real parser, mock summarize+embed)",
+    "manifest_seed": 42
+  },
+  "selection": {
+    "examined": 3284,
+    "unsupported": 2520,
+    "too_large": 94,
+    "unreadable": 0,
+    "supported": 670
+  },
+  "manifest_existing_at_run": 100,
+  "manifest_missing_at_run": 0,
+  "timings": {
+    "enqueue_total_s": 0.018,
+    "indexing_wall_s": 166.347,
+    "theoretical_min_s": 55.31,
+    "efficiency_pct": 33.2,
+    "parse": {
+      "n": 100,
+      "min": 0.1682,
+      "p50": 1.7112,
+      "p99": 6.4628,
+      "max": 7.6343,
+      "mean": 2.1273,
+      "total": 212.7294
+    },
+    "summarize": {
+      "n": 100,
+      "min": 0.0,
+      "p50": 0.0,
+      "p99": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "total": 0.0024
+    },
+    "embed": {
+      "n": 100,
+      "min": 0.0001,
+      "p50": 0.0001,
+      "p99": 0.0003,
+      "max": 0.0162,
+      "mean": 0.0003,
+      "total": 0.0311
+    }
+  },
+  "resource_usage": {
+    "samples": 1635,
+    "peak_cpu_pct": 205.1,
+    "mean_cpu_pct_active": 6.0,
+    "baseline_rss_mib": 269.8,
+    "peak_rss_mib": 921.5,
+    "rss_growth_mib": 651.7
+  },
+  "outcomes_by_db_status": {
+    "COMPLETE": 100
+  },
+  "failed_files": [],
+  "failed_files_total": 0,
+  "queries": [
+    {
+      "i": 0,
+      "t_offset": 6.608,
+      "query": "summary",
+      "latency_ms": 4.1,
+      "results": 9,
+      "completed_at_query_time": 9,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 1,
+      "t_offset": 22.056,
+      "query": "log",
+      "latency_ms": 5.0,
+      "results": 10,
+      "completed_at_query_time": 18,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 2,
+      "t_offset": 40.528,
+      "query": "music",
+      "latency_ms": 5.3,
+      "results": 10,
+      "completed_at_query_time": 27,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 3,
+      "t_offset": 55.177,
+      "query": "archive",
+      "latency_ms": 4.7,
+      "results": 10,
+      "completed_at_query_time": 36,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 4,
+      "t_offset": 71.171,
+      "query": "document",
+      "latency_ms": 5.5,
+      "results": 10,
+      "completed_at_query_time": 45,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 5,
+      "t_offset": 86.032,
+      "query": "data",
+      "latency_ms": 5.0,
+      "results": 10,
+      "completed_at_query_time": 54,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 6,
+      "t_offset": 101.803,
+      "query": "spreadsheet",
+      "latency_ms": 5.2,
+      "results": 10,
+      "completed_at_query_time": 63,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 7,
+      "t_offset": 115.561,
+      "query": "presentation",
+      "latency_ms": 5.0,
+      "results": 10,
+      "completed_at_query_time": 72,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 8,
+      "t_offset": 136.642,
+      "query": "invoice",
+      "latency_ms": 251.0,
+      "results": 10,
+      "completed_at_query_time": 81,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 9,
+      "t_offset": 150.93,
+      "query": "image",
+      "latency_ms": 4.3,
+      "results": 10,
+      "completed_at_query_time": 90,
+      "preempted": true,
+      "ok": true
+    }
+  ],
+  "query_summary": {
+    "total": 10,
+    "ok": 10,
+    "failed": 0,
+    "latency_ms": {
+      "n": 10,
+      "min": 4.1,
+      "p50": 5.0,
+      "p99": 5.5,
+      "max": 251.0,
+      "mean": 29.51,
+      "total": 295.1
+    }
+  }
+}

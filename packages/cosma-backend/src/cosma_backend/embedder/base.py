@@ -49,24 +49,26 @@ class BaseEmbedder(ABC):
             Numpy array of embeddings (single vector or matrix)
         """
 
-    async def embed_text_async(self, text: str | list[str]) -> np.ndarray:
+    async def embed_text_async(
+        self, text: str | list[str], *, priority: bool = False,
+    ) -> np.ndarray:
         """
         Async version of embed_text that runs in a thread pool.
 
-        Args:
-            text: Single text or list of texts to embed
-
-        Returns:
-            Numpy array of embeddings (single vector or matrix)
+        priority=True signals "user-driven search query — get the encoder
+        ASAP." Subclasses use this to jump ahead of any indexing-side
+        encodes that haven't started yet. Defaults to False so all
+        existing call sites (indexing pipeline) keep their normal
+        ordering.
         """
-        # Check if this is an OnlineEmbedder with direct async support
         if hasattr(self, '_embed_text_async'):
-            return await self._embed_text_async(text)
+            return await self._embed_text_async(text, priority=priority)
 
-        # Fallback: run on the pipeline executor so API handlers that call
-        # asyncio.to_thread aren't blocked behind embedder work.
-        from cosma_backend.pipeline_executor import run_in_pipeline
-        return await run_in_pipeline(self.embed_text, text)
+        # Fallback: use asyncio.to_thread (default pool), NOT the
+        # pipeline executor. Embedder work is small per call; sharing
+        # the pipeline pool with parsers caused search query embeds to
+        # queue behind multi-second markitdown parses.
+        return await asyncio.to_thread(self.embed_text, text)
 
     @abstractmethod
     def is_available(self) -> bool:

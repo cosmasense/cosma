@@ -44,7 +44,11 @@ class OnlineConfig:
 @dataclass
 class LlamaCppConfig:
     context_length: int = 10000
-    n_ctx: int = 16384
+    # 0 means "let the app pick at startup based on detected RAM" — see
+    # cosma_backend.utils.hardware.choose_n_ctx_for_ram. Explicit values
+    # in TOML still win. Previous hardcoded 16384 worked on a 16 GB Mac
+    # but underused 32+ GB systems and risked OOM on smaller ones.
+    n_ctx: int = 0
     n_threads: int = 4
     # n_gpu_layers = -1 offloads all transformer layers to Metal on Apple
     # Silicon. Override to 0 for CPU-only machines.
@@ -55,7 +59,13 @@ class LlamaCppConfig:
     # and fast enough for interactive file summarization on M-series Macs.
     # Defaults here drive the bootstrap downloader.
     repo_id: str = "unsloth/Qwen3-VL-2B-Instruct-GGUF"
-    filename: str = "*Q4_K_M.gguf"
+    # Q4_0 (vs Q4_K_M previously): on Apple Silicon, Q4_0's bandwidth
+    # exactly matches the M-series memory subsystem — the recommended
+    # quant for token generation on Metal. ~10–15% faster decode than
+    # Q4_K_M with negligible quality loss for summarization. See
+    # cosma/docs/STAGE_PIPELINING_DESIGN.md notes + the May-2026
+    # llama.cpp guidance threads.
+    filename: str = "*Q4_0.gguf"
     clip_model_path: str = ""
     clip_repo_id: str = "unsloth/Qwen3-VL-2B-Instruct-GGUF"
     clip_filename: str = "mmproj-F16.gguf"
@@ -70,6 +80,14 @@ class LlamaCppConfig:
     # "token out of bounds" failures at llama.cpp prefill when a chunk
     # actually exceeds n_ctx.
     tokenizer_repo: str = "Qwen/Qwen3-VL-2B-Instruct"
+    # Apple-Silicon LLM perf flags. Defaults reflect what we've
+    # validated against the cosmasense llama-cpp-python build. Users
+    # on a different build can flip these off via settings.toml if
+    # something incompatible surfaces.
+    flash_attn: bool = True
+    kv_cache_quant: bool = True
+    prompt_cache_enabled: bool = True
+    prompt_cache_capacity_mib: int = 200
 
 
 @dataclass
@@ -85,6 +103,25 @@ class SummarizerConfig:
     chunk_overlap_tokens: int = 1000
     max_chunks: int = 10
     idle_unload_seconds: int = 60
+    # "Fast mode": cap every file at exactly one chunk's worth of
+    # summarize work. Trades coverage for throughput — useful for
+    # demos, large-corpus first passes, or low-end Macs where the
+    # full multi-chunk path is too slow. The first chunk usually
+    # carries the document's first ~6k tokens (with the configured
+    # n_ctx) which is enough to produce a reasonable title +
+    # summary + keywords for most files. Long docs end up with a
+    # head-only summary; the partial-coverage note from the budget
+    # logic still applies.
+    fast_mode: bool = False
+    # Per-file wall-clock budget for the summarize stage. Once we
+    # exceed this, the summarizer stops dispatching new chunks and
+    # finalizes with whatever chunk summaries it already has — the
+    # file ends as COMPLETE with a partial-coverage flag instead of
+    # FAILED on a long PDF that never finishes. 0 = no budget (legacy).
+    # Default 60 s comes from the user-experience math: a single 25 s
+    # mean / 7 s p99 chunk usually fits 1-2 chunks; 60 s comfortably
+    # covers the typical 1–3 chunk file but caps the long-tail.
+    summarize_budget_seconds: float = 60.0
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     online: OnlineConfig = field(default_factory=OnlineConfig)
     llamacpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
@@ -250,10 +287,32 @@ SCHEDULER_RULE_TYPES: dict[str, dict[str, Any]] = {
 class QueueConfig:
     cooldown_seconds: int = 60
     initial_cooldown_seconds: int = 5
-    max_concurrency: int = 2
+    # Total in-flight files across the pipeline. With per-stage limits
+    # below set to 4/1/1, the natural ceiling is 4 + 1 + 1 = 6, so
+    # max_concurrency below that just throttles parse. Default raised
+    # to 6 to take advantage of stage parallelism.
+    max_concurrency: int = 6
     max_retries: int = 3
     file_processing_timeout: int = 300  # seconds per file (5 min default)
     gpu_memory_cap: float = 0.75  # fraction of GPU memory to use (0.0-1.0, default 75%)
+    # Per-stage concurrency caps. Each Pipeline stage holds its own
+    # asyncio.Semaphore at this size, so files in different stages run
+    # in parallel (parse on CPU, summarize on Metal, embed on MPS)
+    # without fighting for the same hardware. Tune based on your box:
+    #   - parse: I/O + CPU bound; safe to overlap heavily.
+    #   - summarize: single Metal LLM context; keep at 1.
+    #   - embed: single MPS device; keep at 1 unless you have multiple GPUs.
+    # See cosma/docs/STAGE_PIPELINING_DESIGN.md.
+    parse_concurrency: int = 4
+    summarize_concurrency: int = 1
+    embed_concurrency: int = 1
+    # Hold-off after model load before indexing starts, so a user search
+    # at app launch has the GPU/CPU to itself. See app.py Phase 2.
+    indexing_start_grace_seconds: float = 5.0
+    # When a search arrives, pause indexing dispatch for this many seconds
+    # so the embedder/LLM can serve the query immediately. New searches
+    # within the window extend the pause. See queue/indexing_queue.py.
+    search_preempt_seconds: float = 10.0
 
 
 @dataclass

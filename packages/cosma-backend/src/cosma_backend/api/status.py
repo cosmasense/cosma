@@ -36,3 +36,23 @@ async def status():
         "embedder_ready": embedder_ready,
         "init_progress": round(init_progress, 2),
     }
+
+
+@status_bp.get("/version")  # type: ignore[return-value]
+async def version():
+    """Backend version handshake — the frontend pins against api_version
+    on launch and refuses to operate if the running backend exposes a
+    higher number than the bundled Swift constant. This is what stops a
+    stale frontend from talking to a backend that an auto-upgrade pulled
+    forward past it. See cosma_backend/__init__.py for bump procedure.
+    """
+    from cosma_backend import (
+        __version__,
+        __api_version__,
+        __min_frontend_api_version__,
+    )
+    return {
+        "backend_version": __version__,
+        "api_version": __api_version__,
+        "min_frontend_api_version": __min_frontend_api_version__,
+    }

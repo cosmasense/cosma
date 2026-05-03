@@ -1,6 +1,6 @@
 [project]
 name = "cosma-backend"
-version = "0.8.8"
+version = "1.0.0"
 description = "Cosma backend"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -71,7 +71,8 @@ markers = [
     "unit: Unit tests (fast, no external dependencies)",
     "integration: Integration tests (database, file system)",
     "slow: Slow tests (network calls, AI services)",
-    "async_test: Tests that use async/await"
+    "async_test: Tests that use async/await",
+    "benchmark: End-to-end benchmarks (read real files, write reports). Off by default — opt in with `pytest -m benchmark`."
 ]
 
 [tool.uv.sources]

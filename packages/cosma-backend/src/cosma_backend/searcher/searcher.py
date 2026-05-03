@@ -193,7 +193,12 @@ class HybridSearcher:
             # out." `embed_text_async` delegates to the shared pipeline
             # executor so other handlers keep running.
             embed_start = time.perf_counter()
-            query_embedding = await self.embedder.embed_text_async(query)
+            # priority=True jumps the embedder's per-model gate ahead of
+            # any indexing-side encode that hasn't started yet, and
+            # asyncio.to_thread (used by the async path) keeps us off
+            # the parser thread pool so a multi-second markitdown parse
+            # can't queue us behind it.
+            query_embedding = await self.embedder.embed_text_async(query, priority=True)
             embed_ms = (time.perf_counter() - embed_start) * 1000.0
 
             db_start = time.perf_counter()

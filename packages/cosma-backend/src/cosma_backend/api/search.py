@@ -20,6 +20,44 @@ search_bp = Blueprint('search', __name__)
 
 
 @dataclass
+class TypingNudgeResponse:
+    paused_until: float
+    cancelled_in_flight: int
+
+
+@search_bp.post("/typing")  # type: ignore[return-value]
+@validate_response(TypingNudgeResponse, 200)
+async def typing_nudge() -> tuple[TypingNudgeResponse, int]:
+    """Frontend signals "user is interacting with the search bar".
+
+    Debounce on the frontend (~200 ms) and POST here on every change.
+    The backend (a) extends the search-preempt window so dispatch
+    pauses, and (b) cancels in-flight indexing tasks so the embedder
+    + LLM get the hardware *now* instead of waiting for the current
+    summarize call to finish.
+
+    Cancelled work isn't lost — the persisted-progress refactor
+    saves PARSED/SUMMARIZED durably between stages, so the file
+    resumes at its last completed stage on the next dispatch pass.
+
+    The endpoint is idempotent and cheap. Spam it as often as the
+    user types.
+    """
+    iq = getattr(current_app, "indexing_queue", None)
+    cancelled = 0
+    if iq is not None:
+        if hasattr(iq, "search_preempt"):
+            iq.search_preempt()
+        if hasattr(iq, "cancel_in_flight"):
+            cancelled = iq.cancel_in_flight()
+    paused_until = float(getattr(iq, "_search_preempt_until", 0.0))
+    return TypingNudgeResponse(
+        paused_until=paused_until,
+        cancelled_in_flight=cancelled,
+    ), 200
+
+
+@dataclass
 class SearchRequest:
     """Request body for searching files"""
     query: str
@@ -48,11 +86,18 @@ class SearchResponse:
 @validate_response(SearchResponse, 200)
 async def search(data: SearchRequest) -> tuple[SearchResponse, int]:
     """Search for files based on query"""
-    # TODO: Implement search functionality
-    # 1. Parse query and filters
-    # 2. Search database (could use FTS if implemented)
-    # 3. Rank results by relevance
-    # 4. Return sorted results
+    # Tell the indexing queue a user search is happening so it pauses
+    # dispatch and lets the embedder / LLM serve the query immediately.
+    # See QueueConfig.search_preempt_seconds.
+    iq = getattr(current_app, "indexing_queue", None)
+    if iq is not None and hasattr(iq, "search_preempt"):
+        iq.search_preempt()
+        # Submitting a query is a hard signal — also cancel anything
+        # currently consuming hardware so the embedder gets the GPU/
+        # CPU immediately. The cancelled tasks resume from their last
+        # persisted stage on the next dispatch pass.
+        if hasattr(iq, "cancel_in_flight"):
+            iq.cancel_in_flight()
     results = await current_app.searcher.search(data.query, directory=data.directory)
     total_count = len(results)
     paginated = results[data.offset:data.offset + data.limit]

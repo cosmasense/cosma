@@ -212,18 +212,15 @@ class AutoEmbedder:
         logger.error(error_msg, preferred_provider=self.preferred_provider)
         raise EmbedderError(error_msg)
 
-    async def embed_text_async(self, text: str | list[str]) -> np.ndarray:
-        """
-        Async version of embed_text with fallback providers.
+    async def embed_text_async(
+        self, text: str | list[str], *, priority: bool = False,
+    ) -> np.ndarray:
+        """Async version of embed_text with fallback providers.
 
-        Args:
-            text: Text or list of texts to embed
-
-        Returns:
-            Numpy array of embeddings
-
-        Raises:
-            EmbedderError: If no embedders are available or all fail
+        ``priority=True`` flags this as a user-driven search query so
+        the local embedder lets it jump the encode gate ahead of any
+        indexing-side encode (see ``LocalEmbedder._encode_with_priority``).
+        Indexing callers omit the flag and run at normal priority.
         """
         providers = []
 
@@ -241,7 +238,7 @@ class AutoEmbedder:
                 try:
                     logger.debug("Attempting async embedding generation",
                                 provider=type(embedder).__name__)
-                    return await embedder.embed_text_async(text)
+                    return await embedder.embed_text_async(text, priority=priority)
                 except Exception as e:
                     logger.warning("Async embedder failed, trying next provider",
                                  provider=type(embedder).__name__,

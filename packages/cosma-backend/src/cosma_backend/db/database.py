@@ -67,6 +67,26 @@ class Database:
             # WAL mode: crash-safe journaling that survives sudden termination
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL is the SQLite-recommended setting for WAL.
+            # It still survives application crashes and OS crashes — the
+            # only loss window is a power failure during the last in-flight
+            # transaction. Cuts the per-commit fsync count in half. See
+            # https://sqlite.org/wal.html#performance_considerations.
+            conn.execute("PRAGMA synchronous=NORMAL")
+            # Memory-map up to 256 MiB of the DB file for reads. SQLite
+            # serves hot pages directly from the kernel page cache without
+            # going through pread(). Speeds up bulk skip-check + FTS
+            # MATCH against a warm DB. No memory cost when the DB is
+            # smaller than the cap.
+            conn.execute("PRAGMA mmap_size=268435456")
+            # 20 MiB page cache (10× the SQLite default). Keeps recently-
+            # touched files, FTS tokens, and queue items in memory across
+            # the request churn instead of paging through pread().
+            conn.execute("PRAGMA cache_size=-20000")
+            # Sort/aggregate scratch space lives in RAM, not in a temp
+            # file. Tiny win on `get_files_under_directory_summary` and
+            # any GROUP_CONCAT path through the FTS triggers.
+            conn.execute("PRAGMA temp_store=MEMORY")
             # Cap the WAL at ~32 MB and trigger an automatic checkpoint
             # every 1000 dirty pages. SQLite's default auto-checkpoint is
             # 1000 pages too, but it can be inhibited by long-lived
@@ -227,10 +247,20 @@ class Database:
             except (ValueError, TypeError, OSError):
                 return None
 
+        # asqlite's Cursor supports `await cursor.fetchall()` but not
+        # `async for cursor` (no __aiter__). The previous code crashed
+        # with TypeError the first time it was actually exercised —
+        # discovered when test_db_bench hit this path for the first
+        # time. fetchall() loads the whole rowset into memory; that's
+        # fine for this method's use case (one bulk skip-check per
+        # directory enqueue, capped by the watched-folder size).
         async with self.acquire() as conn:
-            async with conn.execute(SQL, (prefix + "%",)) as cursor:
-                async for row in cursor:
-                    out[row["file_path"]] = (row["status"], _parse_mtime(row["modified"]))
+            cursor = await conn.execute(SQL, (prefix + "%",))
+            rows = await cursor.fetchall()
+            for row in rows:
+                out[row["file_path"]] = (
+                    row["status"], _parse_mtime(row["modified"]),
+                )
         return out
 
     async def touch_files_timestamps(self, file_paths: list[str]) -> int:
@@ -379,15 +409,21 @@ class Database:
         # Truncate to target dimensions
         return embedding[:target_dimensions]
                 
-    async def upsert_file_embeddings(self, file: File) -> None:
+    async def upsert_file_embeddings(
+        self, file: File, *, first_embed: bool = False,
+    ) -> None:
         """
         Insert or update embedding for a file.
 
         Args:
-            file_id: ID of the file
-            embedding: Embedding vector as numpy array
-            model_name: Name of the model used
-            dimensions: Actual dimensions of the embedding
+            file: file with .id, .embedding, .embedding_model, .embedding_dimensions set.
+            first_embed: True iff the caller knows this file has never had an
+                embedding row before (e.g., resuming from PARSED/SUMMARIZED, or
+                a brand-new file). Lets us skip the leading DELETE — vec0
+                doesn't support INSERT OR REPLACE so we usually have to delete
+                first, but on a first-time insert there's nothing to delete and
+                the round-trip is wasted. Saves ~0.5 ms per file on a hot DB,
+                more on cold.
         """
         logger.debug("Inserting embedding", file_id=file.id, model=file.embedding_model, dimensions=file.embedding_dimensions)
 
@@ -396,11 +432,14 @@ class Database:
         embedding_blob = self._serialize_vector(normalized_embedding)
 
         async with self.acquire() as conn:
-            # vec0 virtual tables don't support INSERT OR REPLACE, so delete first
-            await conn.execute(
-                "DELETE FROM file_embeddings WHERE file_id = ?",
-                (file.id,)
-            )
+            if not first_embed:
+                # vec0 virtual tables don't support INSERT OR REPLACE.
+                # Re-embed paths must clear the prior row; first-time
+                # embed paths skip this round-trip entirely.
+                await conn.execute(
+                    "DELETE FROM file_embeddings WHERE file_id = ?",
+                    (file.id,)
+                )
 
             # Insert into vec0 table with normalized dimensions
             await conn.execute(

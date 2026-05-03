@@ -1,0 +1,46 @@
+{
+  "system_info": {
+    "timestamp": "2026-05-01T16:36:22.277728+00:00",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.13.9",
+    "cosma_backend_version": "0.8.8",
+    "cosma_backend_api_version": 1,
+    "cpu_count_logical": 8,
+    "ram_total_gib": 16.0,
+    "ram_available_gib": 5.96
+  },
+  "n_files": 10,
+  "embedder_load_s": 7.037246291998599,
+  "llm_load_s": 114.99082445800013,
+  "indexing_wall_s": 443.4753909169958,
+  "db_status": {
+    "COMPLETE": 8,
+    "PARSED": 2
+  },
+  "failed": [],
+  "peak_cpu": 171.8,
+  "avg_cpu_active": 3.2505166475315725,
+  "baseline_rss_mib": 2644.703125,
+  "peak_rss_mib": 5659.421875,
+  "queries": [
+    {
+      "query": "report",
+      "latency_ms": 54.7,
+      "results": 3,
+      "t_offset": 74.91
+    },
+    {
+      "query": "invoice",
+      "latency_ms": 62.5,
+      "results": 3,
+      "t_offset": 76.97
+    },
+    {
+      "query": "screenshot",
+      "latency_ms": 57.4,
+      "results": 3,
+      "t_offset": 79.03
+    }
+  ]
+}

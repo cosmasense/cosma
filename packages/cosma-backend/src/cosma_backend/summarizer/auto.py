@@ -4,6 +4,7 @@ AutoSummarizer - automatic provider selection with fallback support.
 
 from __future__ import annotations
 
+import asyncio
 from typing import List, Optional, TYPE_CHECKING
 
 from cosma_backend.logging import get_logger
@@ -49,10 +50,26 @@ class AutoSummarizer:
         if "llamacpp" not in self.summarizers:
             try:
                 logger.info("llama.cpp summarizer initializing")
-                summarizer = LlamaCppSummarizer(config=self.config)
+                # The constructor only validates config and reserves the
+                # Lock; it does NOT load the GGUF or call into llama.cpp.
+                # That happens in `_ensure_loaded`. So just constructing
+                # is fast (~ms).
+                summarizer = await asyncio.to_thread(
+                    LlamaCppSummarizer, config=self.config,
+                )
+                # Force the model load now, in a thread, so we pay the
+                # multi-second GGUF mmap + Metal context init cost
+                # behind the loading indicator at startup — NOT on
+                # the first user-triggered summarize. The previous
+                # version skipped this and the first file in
+                # random10bench_real took 70+ s before any progress
+                # because the load happened lazily on its first
+                # `_get_ai_response` call.
                 if await summarizer.is_available():
+                    await asyncio.to_thread(summarizer._ensure_loaded)
+                if await summarizer.is_available() and summarizer.llm is not None:
                     self.summarizers["llamacpp"] = summarizer
-                    logger.info("llama.cpp summarizer available")
+                    logger.info("llama.cpp summarizer available + warmed")
                 else:
                     self.summarizers["llamacpp"] = None
                     logger.warning(

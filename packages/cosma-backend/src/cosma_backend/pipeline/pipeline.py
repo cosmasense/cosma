@@ -16,6 +16,7 @@ Key behaviors:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +68,9 @@ class Pipeline:
         parser: Optional[FileParser] = None,
         summarizer: Optional[AutoSummarizer] = None,
         embedder: Optional[AutoEmbedder] = None,
+        parse_concurrency: int = 4,
+        summarize_concurrency: int = 1,
+        embed_concurrency: int = 1,
     ):
         self.db = db
         self.updates_hub = updates_hub
@@ -74,6 +78,18 @@ class Pipeline:
         self.parser = parser or FileParser()
         self.summarizer = summarizer or AutoSummarizer()
         self.embedder = embedder or AutoEmbedder()
+
+        # Per-stage semaphores so files moving through the pipeline don't
+        # all collide on the same resource. While file A holds the
+        # summarize semaphore (single Metal LLM context), file B can
+        # already be embedding on MPS and files C/D can be parsing on
+        # CPU. asyncio.Semaphore is the implicit backpressure: a
+        # finished-parse waits at `await summarize_sem.acquire()` for
+        # zero CPU until the GPU frees up. See
+        # cosma/docs/STAGE_PIPELINING_DESIGN.md.
+        self._parse_sem = asyncio.Semaphore(parse_concurrency)
+        self._summarize_sem = asyncio.Semaphore(summarize_concurrency)
+        self._embed_sem = asyncio.Semaphore(embed_concurrency)
     
     async def process_directory(
         self,
@@ -202,52 +218,90 @@ class Pipeline:
                 logger.exception("Batched timestamp touch failed")
             to_touch = []
 
-        for file in self.discoverer.files_in(path, filter_config=filter_config):
-            try:
-                # In-memory skip check using the bulk-loaded summary.
-                # Falls back to the per-file path only when the file is
-                # missing from the summary (a recently-added file the
-                # sweep just discovered).
-                summary = saved_summary.get(file.file_path)
+        # File walk + filter + skip decision run in a thread, in chunks.
+        #
+        # Why: ``discoverer.files_in()`` is a synchronous generator
+        # that walks the filesystem (os.scandir, stat, filter regex)
+        # for every file. Iterating it directly on the event loop
+        # blocks every other coroutine for the duration — and in the
+        # already-indexed path there are no real awaits to break it
+        # up (is_supported is sync-wrapped, the touch is batched
+        # every 1000 files). With multiple watchers, ``asyncio.sleep(0)``
+        # yields aren't enough either: 3 concurrent enqueue_directory
+        # tasks split each yield round between themselves and starve
+        # other tasks. Result: a 5-second ``asyncio.sleep`` in the
+        # Phase 2 grace took 42 seconds to fire, search requests sat
+        # for 30+ s and timed out (see temp/log.txt 20:01:15 → 20:01:57).
+        #
+        # Fix: pull files in chunks of ``CHUNK_SIZE`` from the sync
+        # generator on a background thread, doing the filter +
+        # already-indexed check there. The async side wakes once
+        # per chunk, calls ``indexing_queue.enqueue`` (brief, yields)
+        # for items that need work, and goes back for the next chunk.
+        # Loop is never blocked synchronously regardless of folder
+        # size or number of watchers.
+        is_supported_fn = self.parser.is_supported
+        generator = self.discoverer.files_in(path, filter_config=filter_config)
+        CHUNK_SIZE = 200
+
+        def _discover_chunk() -> tuple[list[tuple[str, "File"]], bool]:
+            """Pull up to CHUNK_SIZE files off the sync generator and
+            tag each with its disposition. Runs in a worker thread."""
+            out: list[tuple[str, "File"]] = []
+            done_flag = False
+            for _ in range(CHUNK_SIZE):
+                try:
+                    f = next(generator)
+                except StopIteration:
+                    done_flag = True
+                    break
+                if not is_supported_fn(f):
+                    out.append(("unsupported", f))
+                    continue
+                summary = saved_summary.get(f.file_path)
                 if summary is not None:
                     saved_status, saved_mtime = summary
                     if (
                         saved_status in ("COMPLETE", "FAILED")
                         and saved_mtime is not None
-                        and saved_mtime.replace(microsecond=0) == file.modified.replace(microsecond=0)
-                        and await self.is_supported(file)
+                        and saved_mtime.replace(microsecond=0)
+                        == f.modified.replace(microsecond=0)
                     ):
-                        # File is up to date in DB. Just touch its timestamp
-                        # so the stale-file sweep below leaves it alone, and
-                        # publish the skip event for UI progress accounting.
-                        to_touch.append(file.file_path)
-                        if len(to_touch) >= TOUCH_BATCH:
-                            await _flush_touches()
+                        out.append(("skip", f))
+                        continue
+                out.append(("enqueue", f))
+            return out, done_flag
+
+        done = False
+        while not done:
+            chunk, done = await asyncio.to_thread(_discover_chunk)
+            for action, file in chunk:
+                if action == "unsupported":
+                    continue
+                try:
+                    to_touch.append(file.file_path)
+                    if len(to_touch) >= TOUCH_BATCH:
+                        await _flush_touches()
+                    if action == "skip":
                         self._publish_update(Update.file_skipped(
-                            file.file_path, file.filename, reason="already processed"
+                            file.file_path, file.filename,
+                            reason="already processed",
                         ))
                         continue
-
-                # File is new, modified, or in a non-terminal status —
-                # enqueue and let the queue debounce / pipeline handle it.
-                # We still touch the timestamp because mark-and-sweep is
-                # what protects against deletion of files we just saw.
-                to_touch.append(file.file_path)
-                if len(to_touch) >= TOUCH_BATCH:
+                    # action == "enqueue"
+                    await indexing_queue.enqueue(
+                        file.file_path, QueueAction.INDEX,
+                        cooldown_seconds=indexing_queue.initial_cooldown_seconds,
+                    )
+                    enqueued += 1
+                except DatabaseClosingError:
+                    logger.debug("Skipping enqueue (DB closing during shutdown)")
                     await _flush_touches()
-
-                await indexing_queue.enqueue(
-                    file.file_path, QueueAction.INDEX,
-                    cooldown_seconds=indexing_queue.initial_cooldown_seconds,
-                )
-                enqueued += 1
-            except DatabaseClosingError:
-                logger.debug("Skipping enqueue (DB closing during shutdown)")
-                await _flush_touches()
-                return enqueued
-            except Exception:
-                logger.exception("Error enqueueing file", file_path=file.file_path)
-                continue
+                    return enqueued
+                except Exception:
+                    logger.exception("Error enqueueing file",
+                                     file_path=file.file_path)
+                    continue
 
         # Final flush of any timestamps still buffered.
         await _flush_touches()
@@ -287,44 +341,101 @@ class Pipeline:
         #     result = PipelineResult()
 
         try:
-            # Stage 1: Parse
-            self._publish_update(Update.file_parsing(file.file_path, file.filename))
-            await self.parser.parse_file(file)
-            self._publish_update(Update.file_parsed(file.file_path, file.filename))
-
-            # Check if file hash is different before proceeding
-            if not await self._has_file_changed(file):
-                logger.info("Skipping processing file, hashed not changed", file=file)
+            # Pre-parse skip check: if the file is already COMPLETE/FAILED in
+            # the DB and its mtime hasn't changed, don't re-parse. The watcher
+            # enqueues every FileModifiedEvent without consulting the DB, so
+            # without this guard noisy filesystem events (or repeated initial
+            # discoveries) cause the same file to be parsed/summarized/embedded
+            # over and over. _should_skip_file also rejects unsupported types.
+            should_skip, saved_file = await self._should_skip_file(file)
+            if should_skip:
                 self._publish_update(Update.file_skipped(
                     file.file_path,
                     file.filename,
-                    reason="content not changed"
+                    reason="already indexed (mtime unchanged)"
                 ))
                 return
 
-            # Delete any existing partial data so a crash-recovery retry
-            # starts from a clean slate (cascades to embeddings, keywords, FTS).
-            await self.db.delete_file(file.file_path)
+            # Resume-aware orchestration. Each stage method takes its own
+            # semaphore so files in different stages run in parallel
+            # (parse on CPU, summarize on GPU, embed on MPS) without
+            # fighting for the same resource. Persisting after every
+            # stage means a crash leaves the row at the last completed
+            # state — next launch resumes from there instead of redoing
+            # parse + summarize from scratch. See
+            # cosma/docs/STAGE_PIPELINING_DESIGN.md.
 
-            # Stage 2: Summarize
-            self._publish_update(Update.file_summarizing(file.file_path, file.filename))
-            await self.summarizer.summarize(file)
-            await self._save_to_db(file)
-            self._publish_update(Update.file_summarized(file.file_path, file.filename))
-            
-            # Stage 3: Embed — non-fatal; file is still FTS-searchable without embeddings
-            try:
-                self._publish_update(Update.file_embedding(file.file_path, file.filename))
-                await self.embedder.embed(file)
-                await self._save_embeddings(file)
-                self._publish_update(Update.file_embedded(file.file_path, file.filename))
-            except Exception as embed_err:
-                logger.warning("Embedding failed, file saved without embeddings",
-                               file=file.file_path, error=str(embed_err))
-                # File is still COMPLETE for FTS — just missing semantic search
-                file.status = ProcessingStatus.COMPLETE
+            # Stage 1: Parse (always runs unless we're resuming from
+            # PARSED+ where we already have the content). For FAILED rows
+            # we re-run from scratch — the previous failure may have left
+            # partial fields the user wants overwritten.
+            resume_status = saved_file.status if saved_file else None
+            need_parse = resume_status not in (
+                ProcessingStatus.PARSED,
+                ProcessingStatus.SUMMARIZED,
+            )
+            if need_parse:
+                await self._run_parse_stage(file)
 
-            # Mark as complete
+                # Hash-level check (catches mtime-changed-but-content-same).
+                # Only meaningful when we just re-parsed; if we resumed
+                # from PARSED+, content_hash is already settled.
+                if not await self._has_file_changed(file, saved_file=saved_file):
+                    logger.info("Skipping processing file, hash not changed",
+                                file=file)
+                    self._publish_update(Update.file_skipped(
+                        file.file_path,
+                        file.filename,
+                        reason="content not changed"
+                    ))
+                    # Touch the row so stale-file sweep leaves it alone.
+                    if saved_file is not None:
+                        try:
+                            await self.db.update_file_timestamp(file.file_path)
+                        except Exception:
+                            logger.debug("update_file_timestamp failed",
+                                         file=file.file_path)
+                    return
+            else:
+                # Hydrate the in-memory File with what's already in the DB
+                # so summarize/embed don't have to re-parse.
+                file.content = saved_file.content
+                file.content_hash = saved_file.content_hash
+                file.content_type = saved_file.content_type
+                file.parsed_at = saved_file.parsed_at
+                logger.info("Resuming from PARSED state",
+                            file=file.file_path,
+                            saved_status=resume_status.name)
+
+            # Stage 2: Summarize (skipped if resuming from SUMMARIZED+).
+            need_summarize = resume_status != ProcessingStatus.SUMMARIZED
+            if need_summarize:
+                await self._run_summarize_stage(file)
+            else:
+                # Hydrate summary/title/keywords from DB.
+                file.title = saved_file.title
+                file.summary = saved_file.summary
+                file.keywords = saved_file.keywords
+                file.summarized_at = saved_file.summarized_at
+                logger.info("Resuming from SUMMARIZED state",
+                            file=file.file_path)
+
+            # Stage 3: Embed — non-fatal; file is still FTS-searchable
+            # without embeddings.
+            #
+            # `first_embed` lets the DB layer skip the leading
+            # `DELETE FROM file_embeddings` when there is nothing to
+            # delete. True iff this file has not previously reached the
+            # COMPLETE status, which is also the only case where a row
+            # could already exist in the vec0 embeddings table.
+            first_embed = (
+                saved_file is None
+                or saved_file.status != ProcessingStatus.COMPLETE
+            )
+            await self._run_embed_stage(file, first_embed=first_embed)
+
+            # Mark as complete (UI event; row was already persisted by
+            # the embed stage with status=COMPLETE).
             self._publish_update(Update.file_complete(file.file_path, file.filename))
             
         except DatabaseClosingError:
@@ -356,6 +467,68 @@ class Pipeline:
 
             raise
             
+    # ------------------------------------------------------------------
+    # Per-stage methods (used by process_file). Each holds its own
+    # semaphore so different files in different stages don't fight for
+    # the same resource. Each persists progress on success so a crash
+    # mid-pipeline leaves a resumable DB state — the next run picks up
+    # at the last completed stage instead of redoing parse + summarize
+    # from scratch. See cosma/docs/STAGE_PIPELINING_DESIGN.md.
+    # ------------------------------------------------------------------
+
+    async def _run_parse_stage(self, file: File) -> None:
+        """Parse the file, set status=PARSED, persist."""
+        async with self._parse_sem:
+            self._publish_update(Update.file_parsing(file.file_path, file.filename))
+            await self.parser.parse_file(file)
+            self._publish_update(Update.file_parsed(file.file_path, file.filename))
+
+            # Persist parsed content + content_hash so a crash here is
+            # recoverable. The status flip to PARSED is the durable
+            # checkpoint: on next launch, crash recovery will route this
+            # file to the summarize stage instead of re-parsing.
+            file.status = ProcessingStatus.PARSED
+            await self._save_to_db(file)
+
+    async def _run_summarize_stage(self, file: File) -> None:
+        """Summarize, set status=SUMMARIZED, persist."""
+        async with self._summarize_sem:
+            self._publish_update(Update.file_summarizing(file.file_path, file.filename))
+            await self.summarizer.summarize(file)
+            file.status = ProcessingStatus.SUMMARIZED
+            await self._save_to_db(file)
+            self._publish_update(Update.file_summarized(file.file_path, file.filename))
+
+    async def _run_embed_stage(
+        self, file: File, *, first_embed: bool = True,
+    ) -> None:
+        """Embed, set status=COMPLETE, persist embeddings.
+
+        ``first_embed=True`` (the default) tells the DB layer this file
+        has no pre-existing row in the vec0 embeddings table, so it
+        can skip the leading DELETE. Pass False on a re-embed (e.g.
+        forced reindex of a previously-COMPLETE file) so stale vectors
+        are cleared.
+
+        Embedding failure is non-fatal — the file is still searchable
+        via FTS5 even without semantic vectors, so we mark COMPLETE
+        and log a warning instead of failing the whole pipeline.
+        """
+        async with self._embed_sem:
+            try:
+                self._publish_update(Update.file_embedding(file.file_path, file.filename))
+                await self.embedder.embed(file)
+                file.status = ProcessingStatus.COMPLETE
+                await self._save_embeddings(file, first_embed=first_embed)
+                self._publish_update(Update.file_embedded(file.file_path, file.filename))
+            except Exception as embed_err:
+                logger.warning(
+                    "Embedding failed, file saved without embeddings",
+                    file=file.file_path, error=str(embed_err),
+                )
+                file.status = ProcessingStatus.COMPLETE
+                await self._save_to_db(file)
+
     async def is_supported(self, file: File) -> bool:
         """Check if a file is supported for processing"""
         return self.parser.is_supported(file)
@@ -455,10 +628,13 @@ class Pipeline:
         """Save file data to database."""
         await self.db.upsert_file(file)
         
-    async def _save_embeddings(self, file: File) -> None:
-        """Save file embeddings to database."""
+    async def _save_embeddings(
+        self, file: File, *, first_embed: bool = False,
+    ) -> None:
+        """Save file embeddings to database. See db.upsert_file_embeddings
+        for the meaning of `first_embed`."""
         await self._save_to_db(file)
-        await self.db.upsert_file_embeddings(file)
+        await self.db.upsert_file_embeddings(file, first_embed=first_embed)
             
     def _publish_update(self, update: Any):
         if self.updates_hub:

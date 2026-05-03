@@ -39,14 +39,38 @@ def _lower_priority() -> None:
 
 
 _PIPELINE_EXECUTOR: ThreadPoolExecutor | None = None
+# Default pool size. Sized to cover the parse stage's typical
+# concurrency (4) plus one slot each for embed and whisper that may
+# overlap with parsing. The previous default of 2 was the actual
+# parse-parallelism ceiling — even with parse_concurrency=4 in the
+# Pipeline semaphore, MarkItDown's `run_in_pipeline` calls bottlenecked
+# on this 2-worker pool, dragging real-world parse throughput down to
+# 50% of theoretical. Discovered by random100bench (2026-05-01) which
+# measured efficiency at 45% before this fix.
+_DEFAULT_MAX_WORKERS = 6
 
 
-def get_pipeline_executor() -> ThreadPoolExecutor:
-    """Return the process-wide pipeline executor, creating it on first use."""
+def configure_pipeline_executor(*, max_workers: int) -> None:
+    """Set the pool size before first use. App startup calls this with
+    a value derived from QueueConfig.parse_concurrency. No-op once the
+    executor has already been constructed (tests and the app share the
+    process-wide pool, so the first caller wins)."""
     global _PIPELINE_EXECUTOR
     if _PIPELINE_EXECUTOR is None:
         _PIPELINE_EXECUTOR = ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=max_workers,
+            thread_name_prefix="pipeline-",
+            initializer=_lower_priority,
+        )
+
+
+def get_pipeline_executor() -> ThreadPoolExecutor:
+    """Return the process-wide pipeline executor, creating it with
+    `_DEFAULT_MAX_WORKERS` on first use if not already configured."""
+    global _PIPELINE_EXECUTOR
+    if _PIPELINE_EXECUTOR is None:
+        _PIPELINE_EXECUTOR = ThreadPoolExecutor(
+            max_workers=_DEFAULT_MAX_WORKERS,
             thread_name_prefix="pipeline-",
             initializer=_lower_priority,
         )

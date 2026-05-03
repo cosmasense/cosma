@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -122,7 +123,15 @@ class BaseSummarizer(ABC):
             approx_chars = max(1, self.max_tokens * 3)
             return [content[:approx_chars]]
 
-        max_chunks = self.config.max_chunks
+        # Fast mode collapses the per-file budget to a single chunk:
+        # trades long-doc coverage for throughput. The chunk we keep
+        # is the first one, which (because chunk_content() splits in
+        # document order) covers the document head — usually where
+        # the title, abstract, and signal-rich first paragraphs live.
+        max_chunks = (
+            1 if getattr(self.config, "fast_mode", False)
+            else self.config.max_chunks
+        )
 
         # Use fast estimation for chunk statistics (sample a few chunks for accurate check)
         if len(chunks) <= max_chunks:
@@ -142,7 +151,16 @@ class BaseSummarizer(ABC):
             logger.info("Content chunked", num_chunks=len(chunks), avg_chunk_tokens=avg_chunk_tokens, max_chunk_sample=max_chunk_tokens)
 
         if len(chunks) > max_chunks:
-            logger.warning("Too many chunks, processing first N only", chunks=len(chunks), max_chunks=max_chunks)
+            reason = "fast_mode" if getattr(self.config, "fast_mode", False) else "max_chunks cap"
+            logger.warning(
+                "Too many chunks, processing first N only",
+                chunks=len(chunks), max_chunks=max_chunks, reason=reason,
+            )
+            # Stash the original count so summarize() can annotate the
+            # final summary with the partial-coverage note. Survives
+            # only as a transient attribute on this instance — fine
+            # because Pipeline summarize is gated to concurrency=1.
+            self._truncated_chunks_total = len(chunks)
             chunks = chunks[:max_chunks]
 
         return chunks
@@ -303,22 +321,60 @@ class BaseSummarizer(ABC):
             raise ValueError(f"Invalid JSON response: {str(e)}")
 
     def _get_system_prompt(self, include_title: bool = False) -> str:
+        # Prompt-engineering notes:
+        #
+        # 1. The system prompt is prefilled on every chunk. Every token
+        #    here costs prefill time on every file. Stay terse.
+        #
+        # 2. The model is being used as a *retrieval indexer* — its
+        #    summaries feed FTS5 and embedding-based search. Optimize
+        #    for "would the user search for these words?" not for
+        #    narrative quality. That's why the instructions say
+        #    "concrete nouns" and "what someone would type", not
+        #    "elegant prose".
+        #
+        # 3. The 1-shot example shows the EXACT output shape we want.
+        #    Models follow shape examples more reliably than instructions.
+        #    The example is short (avoids prefill bloat) but realistic
+        #    (file-content-shaped).
+        #
+        # 4. Hard "ONLY JSON, no prose" line — open-ended models love
+        #    to say "Here is the summary:" before the JSON. Specific
+        #    forbidden phrases save retry rounds.
+        #
+        # 5. No `{{ }}` Jinja escapes — those weren't being templated,
+        #    they were rendered literally to the model and confused it.
         if include_title:
             return (
-                "You are a concise summarization assistant. "
-                "**Return valid JSON only** with keys `title`, `summary`, and `keywords` (array). "
-                "Title should be an extremely concise, 1-5 word title for the content. "
-                "Summary should be 1-2 sentences capturing the main topic and key points. "
-                "Keywords should be 5-12 relevant nouns or noun-phrases that describe the content."
-                "Example: {{'title': 'Proper Title', 'summary': 'A concise summary of the file content', 'keywords': ['keyword1', 'keyword2', 'keyword3']}}"
+                "You index file content for search. Output ONE JSON object, "
+                "nothing else — no prose, no code fences, no 'Here is'.\n"
+                "Schema:\n"
+                '  {"title": "<1-5 word title>",\n'
+                '   "summary": "<1-2 sentences naming the topic and key '
+                'concrete nouns a searcher would type>",\n'
+                '   "keywords": ["<5-12 distinctive nouns or noun-phrases, '
+                'lowercase>"]}\n'
+                "Example for a Q3 financial report:\n"
+                '  {"title": "Q3 Earnings Report",\n'
+                '   "summary": "Q3 2025 earnings: revenue up 12%, AWS '
+                'driving cloud growth, margins steady.",\n'
+                '   "keywords": ["q3 earnings", "revenue growth", "aws", '
+                '"cloud", "margins"]}'
             )
         else:
             return (
-                "You are a concise summarization assistant. "
-                "**Return valid JSON only** with keys `summary` and `keywords` (array). "
-                "Summary should be 1-2 sentences capturing the main topic and key points. "
-                "Keywords should be 5-12 relevant nouns or noun-phrases that describe the content."
-                "Example: {{'summary': 'A concise summary of the file content', 'keywords': ['keyword1', 'keyword2', 'keyword3']}}"
+                "You index file content for search. Output ONE JSON object, "
+                "nothing else — no prose, no code fences, no 'Here is'.\n"
+                "Schema:\n"
+                '  {"summary": "<1-2 sentences naming the topic and key '
+                'concrete nouns a searcher would type>",\n'
+                '   "keywords": ["<5-12 distinctive nouns or noun-phrases, '
+                'lowercase>"]}\n'
+                "Example for a Q3 earnings continuation chunk:\n"
+                '  {"summary": "Continued Q3 cloud-segment detail: AWS '
+                'revenue $26B, operating margin 36%.",\n'
+                '   "keywords": ["aws revenue", "cloud segment", '
+                '"operating margin"]}'
             )
 
     def _format_content_with_context(self, chunk: str, chunk_num: int, total_chunks: int, filename: str) -> str:
@@ -335,7 +391,19 @@ class BaseSummarizer(ABC):
         raise NotImplementedError
 
     async def summarize(self, file_metadata: File) -> File:
-        """Summarize file content with chunking support."""
+        """Summarize file content with chunking support.
+
+        Coverage policy: a per-file wall-clock budget caps how many
+        chunks we'll attempt. When the budget elapses, we stop
+        dispatching new chunks and finalize with whatever chunk
+        summaries we already have. Files that would otherwise have
+        failed at the queue's hard timeout (long PDFs that don't fit
+        in the budget) end as COMPLETE with a partial-coverage flag
+        in the summary, instead of FAILED. This is "good enough"
+        coverage — better an indexed-but-partial file than nothing.
+        Set `summarize_budget_seconds = 0` in SummarizerConfig to
+        disable.
+        """
         if not self._validate_content(file_metadata):
             return file_metadata
 
@@ -349,9 +417,33 @@ class BaseSummarizer(ABC):
 
             images = await self._prepare_images(file_metadata)
 
+            # Wall-clock budget. 0 (or negative) → no budget. Read off
+            # the SummarizerConfig, default 60 s.
+            budget = float(getattr(self.config, "summarize_budget_seconds", 60.0))
+            t_start = time.monotonic()
+            stopped_early = False
+            chunks_attempted = 0
+
             # Process each chunk with per-chunk retry
             total_chunks = len(content_chunks)
             for i, chunk in enumerate(content_chunks):
+                # Budget check BEFORE dispatching a new chunk. We always
+                # let chunk 0 run so a single-chunk file still has a
+                # chance even if the model is unusually slow that boot.
+                elapsed = time.monotonic() - t_start
+                if i > 0 and budget > 0 and elapsed >= budget:
+                    logger.warning(
+                        "Summarize budget elapsed; stopping early with partial coverage",
+                        filename=file_metadata.filename,
+                        elapsed_s=round(elapsed, 2),
+                        budget_s=budget,
+                        chunks_done=len(chunk_summaries),
+                        total_chunks=total_chunks,
+                    )
+                    stopped_early = True
+                    break
+
+                chunks_attempted = i + 1
                 logger.info(f"Processing chunk {i+1}/{total_chunks}", length=len(chunk), images=len(images))
                 parsed = False
                 for attempt in range(3):
@@ -380,6 +472,26 @@ class BaseSummarizer(ABC):
 
             # Combine chunk summaries
             final_summary, final_keywords = self._combine_chunk_summaries(chunk_summaries)
+
+            # If we stopped early — either by exceeding the wall-clock
+            # budget OR by being truncated upstream (max_chunks /
+            # fast_mode) — annotate the summary so search results are
+            # honest about coverage.
+            truncated_total = getattr(self, "_truncated_chunks_total", None)
+            self._truncated_chunks_total = None  # consume / reset
+            if stopped_early and len(chunk_summaries) < total_chunks:
+                final_summary = (
+                    f"{final_summary} "
+                    f"[partial: covered {len(chunk_summaries)} of "
+                    f"{total_chunks} chunks before {budget:.0f}s budget]"
+                )
+            elif truncated_total and truncated_total > total_chunks:
+                final_summary = (
+                    f"{final_summary} "
+                    f"[partial: covered first {total_chunks} of "
+                    f"{truncated_total} chunks "
+                    f"({'fast mode' if getattr(self.config, 'fast_mode', False) else 'max_chunks cap'})]"
+                )
 
             # Update file metadata
             file_metadata.title = resolved_title

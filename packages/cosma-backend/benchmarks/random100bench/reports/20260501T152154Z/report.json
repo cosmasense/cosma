@@ -1,0 +1,186 @@
+{
+  "system_info": {
+    "timestamp": "2026-05-01T15:20:32.768622+00:00",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "system": "Darwin",
+    "machine": "arm64",
+    "python": "3.13.9",
+    "cosma_backend_version": "0.8.8",
+    "cosma_backend_api_version": 1,
+    "cpu_count_logical": 8,
+    "cpu_count_physical": 8,
+    "cpu_freq_mhz": 3204,
+    "ram_total_gib": 16.0,
+    "ram_available_gib": 5.97
+  },
+  "config": {
+    "n_requested": 100,
+    "n_actual": 100,
+    "seed": 42,
+    "source": "/Users/ethanpan/Downloads",
+    "n_queries": 10,
+    "ai_mode": "mocked (real parser, mock summarize+embed)",
+    "manifest_seed": 42
+  },
+  "selection": {
+    "examined": 3284,
+    "unsupported": 2520,
+    "too_large": 94,
+    "unreadable": 0,
+    "supported": 670
+  },
+  "manifest_existing_at_run": 100,
+  "manifest_missing_at_run": 0,
+  "timings": {
+    "enqueue_total_s": 0.022,
+    "indexing_wall_s": 80.623,
+    "theoretical_min_s": 36.696,
+    "efficiency_pct": 45.5,
+    "parse": {
+      "n": 100,
+      "min": 0.0285,
+      "p50": 0.9338,
+      "p99": 5.9326,
+      "max": 6.5718,
+      "mean": 1.4114,
+      "total": 141.1375
+    },
+    "summarize": {
+      "n": 100,
+      "min": 0.0,
+      "p50": 0.0,
+      "p99": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "total": 0.0023
+    },
+    "embed": {
+      "n": 100,
+      "min": 0.0,
+      "p50": 0.0001,
+      "p99": 0.0003,
+      "max": 0.0065,
+      "mean": 0.0002,
+      "total": 0.0204
+    }
+  },
+  "resource_usage": {
+    "samples": 788,
+    "peak_cpu_pct": 200.1,
+    "mean_cpu_pct_active": 11.8,
+    "baseline_rss_mib": 269.7,
+    "peak_rss_mib": 890.3,
+    "rss_growth_mib": 620.6
+  },
+  "outcomes_by_db_status": {
+    "COMPLETE": 100
+  },
+  "failed_files": [],
+  "failed_files_total": 0,
+  "queries": [
+    {
+      "i": 0,
+      "t_offset": 0.751,
+      "query": "summary",
+      "latency_ms": 23.9,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 1,
+      "t_offset": 2.251,
+      "query": "log",
+      "latency_ms": 1.8,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 2,
+      "t_offset": 3.751,
+      "query": "music",
+      "latency_ms": 1.4,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 3,
+      "t_offset": 5.251,
+      "query": "archive",
+      "latency_ms": 1.9,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 4,
+      "t_offset": 6.751,
+      "query": "document",
+      "latency_ms": 1.3,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 5,
+      "t_offset": 8.251,
+      "query": "data",
+      "latency_ms": 1.6,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 6,
+      "t_offset": 9.751,
+      "query": "spreadsheet",
+      "latency_ms": 1.6,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 7,
+      "t_offset": 11.251,
+      "query": "presentation",
+      "latency_ms": 1.9,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 8,
+      "t_offset": 12.751,
+      "query": "invoice",
+      "latency_ms": 1.5,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    },
+    {
+      "i": 9,
+      "t_offset": 14.251,
+      "query": "image",
+      "latency_ms": 4.1,
+      "results": 0,
+      "preempted": true,
+      "ok": true
+    }
+  ],
+  "query_summary": {
+    "total": 10,
+    "ok": 10,
+    "failed": 0,
+    "latency_ms": {
+      "n": 10,
+      "min": 1.3,
+      "p50": 1.7,
+      "p99": 4.1,
+      "max": 23.9,
+      "mean": 4.1,
+      "total": 41.0
+    }
+  }
+}
