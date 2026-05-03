@@ -29,7 +29,7 @@ from .app import App as App, create_app as create_app, run as run
 #   4. Cut a coordinated frontend+backend release with matching __version__.
 #   5. (Optional) leave __min_frontend_api_version__ at the previous value
 #      for one release if you want to give users a soft transition.
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 __api_version__ = 1
 __min_frontend_api_version__ = 1
 
@@ -94,11 +94,17 @@ def serve():
         # ~200 lines/min of pure noise. Quart's own before/after_request
         # hooks already log at DEBUG when needed.
         access_log=False,
-        # I can't find a way to gracefully shut down SSE connections,
-        # so this bullshit will have to do for now
-        # 10 s is comfortable now that after_serving signals SSE streams to
-        # return immediately and teardown runs in parallel. Must stay <= the
-        # Swift CosmaManager's SIGTERM→SIGKILL window (~12 s) so we exit
-        # cleanly instead of getting force-killed.
-        timeout_graceful_shutdown=10,
+        # 3 s is enough now that:
+        #   * after_serving sets app.shutdown_event immediately, so all
+        #     SSE handlers (api/updates.py, api/bootstrap.py) bail out of
+        #     their queue.get() loop on the next tick instead of blocking
+        #     uvicorn's graceful window.
+        #   * Independent teardown (model_lifecycle, scheduler, indexing
+        #     queue) runs in parallel via asyncio.gather.
+        #   * Heavy unloads (summarizer, whisper) carry their own bounded
+        #     wait_for so they can't blow the budget.
+        # The frontend's CosmaManager.stopServer waits 5 s before SIGKILL,
+        # so 3 s here leaves 2 s of headroom for any teardown step that
+        # runs after uvicorn returns control.
+        timeout_graceful_shutdown=3,
     )

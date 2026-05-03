@@ -1,6 +1,6 @@
 [project]
 name = "cosma-client"
-version = "1.0.4"
+version = "1.0.5"
 description = "Cosma API client library"
 requires-python = ">=3.12"
 dependencies = ["niquests>=3.15.2"]
