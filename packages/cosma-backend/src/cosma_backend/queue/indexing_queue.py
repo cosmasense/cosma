@@ -145,7 +145,13 @@ class IndexingQueue:
         self._in_flight_tasks: dict[str, asyncio.Task] = {}
 
         self._processing_task: Optional[asyncio.Task] = None
-        self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
+        # Sized off `effective_max_concurrency` (parse + summarize + embed)
+        # so the global semaphore is never the binding constraint — the
+        # per-stage caps already serialize what needs serializing. The
+        # legacy `max_concurrency` field is kept on QueueConfig for TOML
+        # compatibility but no longer consulted at runtime; see
+        # settings.QueueConfig.effective_max_concurrency.
+        self._semaphore = asyncio.Semaphore(self._config.effective_max_concurrency)
 
         # Optional hook invoked right before each batch of ready items is
         # dispatched. The scheduler installs this so rule evaluation happens
@@ -765,7 +771,7 @@ class IndexingQueue:
                     # the semaphore — starving the event loop and making
                     # status=PROCESSING lie about how many were truly running.
                     ready_items = []
-                    cap = self._config.max_concurrency
+                    cap = self._config.effective_max_concurrency
                     for i in self._items.values():
                         if i.status == QueueItemStatus.WAITING:
                             ready_items.append(i)

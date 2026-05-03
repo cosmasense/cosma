@@ -39,8 +39,19 @@ def mock_hub():
 
 @pytest.fixture
 def queue_config():
-    """Short cooldown for fast tests."""
-    return QueueConfig(cooldown_seconds=0.1, max_concurrency=2, max_retries=3)
+    """Short cooldown for fast tests. Stage caps add up to 2 (parse=2,
+    summarize=0, embed=0) so `effective_max_concurrency` resolves to 2,
+    matching the previous `max_concurrency=2` behavior the tests rely
+    on. The legacy `max_concurrency` field is no longer consulted at
+    runtime — see settings.QueueConfig.effective_max_concurrency.
+    """
+    return QueueConfig(
+        cooldown_seconds=0.1,
+        parse_concurrency=2,
+        summarize_concurrency=0,
+        embed_concurrency=0,
+        max_retries=3,
+    )
 
 
 @pytest.fixture
@@ -385,15 +396,25 @@ class TestIndexingQueueRaceCondition:
         mock_pipeline.process_file.assert_not_called()
 
     async def test_no_item_loss_with_semaphore_contention(self, queue_config, mock_pipeline, mock_hub):
-        """With max_concurrency=1, an enqueue during the active item's run should not lose items.
+        """With effective_max_concurrency=1, an enqueue during the active item's run should not lose items.
 
-        Contract: the queue loop now only claims up to ``max_concurrency`` items
-        per iteration (instead of marking every WAITING item PROCESSING
+        Contract: the queue loop only claims up to ``effective_max_concurrency``
+        items per iteration (instead of marking every WAITING item PROCESSING
         upfront), so at any instant ``status=PROCESSING`` accurately reflects
         what's truly running. A re-enqueue against the PROCESSING item must
         still be deferred to ``_pending_reenqueue`` and not lost.
+
+        Cap is set via per-stage knobs (parse=1, summarize=0, embed=0) so
+        the derived effective_max_concurrency is 1 — matching the previous
+        max_concurrency=1 semantic.
         """
-        config = QueueConfig(cooldown_seconds=0.05, max_concurrency=1, max_retries=3)
+        config = QueueConfig(
+            cooldown_seconds=0.05,
+            parse_concurrency=1,
+            summarize_concurrency=0,
+            embed_concurrency=0,
+            max_retries=3,
+        )
         queue = IndexingQueue(pipeline=mock_pipeline, updates_hub=mock_hub, config=config)
 
         # Enqueue two items; only one will be claimed per iteration.

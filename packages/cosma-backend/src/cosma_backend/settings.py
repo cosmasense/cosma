@@ -287,10 +287,16 @@ SCHEDULER_RULE_TYPES: dict[str, dict[str, Any]] = {
 class QueueConfig:
     cooldown_seconds: int = 60
     initial_cooldown_seconds: int = 5
-    # Total in-flight files across the pipeline. With per-stage limits
-    # below set to 4/1/1, the natural ceiling is 4 + 1 + 1 = 6, so
-    # max_concurrency below that just throttles parse. Default raised
-    # to 6 to take advantage of stage parallelism.
+    # Legacy global cap on total in-flight files. Kept for backward
+    # compatibility with existing settings.toml files but NO LONGER
+    # CONSULTED at runtime — the effective ceiling is derived from
+    # the per-stage caps via `effective_max_concurrency` below. The
+    # old behavior was a footgun: shipping `max_concurrency = 2` (an
+    # early conservative default) silently throttled parse even
+    # though the per-stage `parse_concurrency = 4` looked like it
+    # should overlap. New code always uses
+    # `parse + summarize + embed` so users only have ONE knob to
+    # think about (parse_concurrency).
     max_concurrency: int = 6
     max_retries: int = 3
     file_processing_timeout: int = 300  # seconds per file (5 min default)
@@ -313,6 +319,17 @@ class QueueConfig:
     # so the embedder/LLM can serve the query immediately. New searches
     # within the window extend the pause. See queue/indexing_queue.py.
     search_preempt_seconds: float = 10.0
+
+    @property
+    def effective_max_concurrency(self) -> int:
+        """The actual ceiling on total files in-flight across the
+        pipeline. Derived from the per-stage caps so users don't need
+        to keep two settings consistent — the single knob that
+        actually matters for throughput is `parse_concurrency`
+        (summarize and embed are hardware-locked at 1 by Metal /
+        single-MPS-device constraints).
+        """
+        return self.parse_concurrency + self.summarize_concurrency + self.embed_concurrency
 
 
 @dataclass
