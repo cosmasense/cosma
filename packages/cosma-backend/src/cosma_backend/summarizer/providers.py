@@ -105,7 +105,10 @@ class OllamaSummarizer(BaseSummarizer):
         raw_response = await self.client.chat(
             model=self.model,
             messages=[
-                {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
+                {"role": "system", "content": self._get_system_prompt(
+                    include_title=(chunk_num == 0),
+                    is_visual=bool(images),
+                )},
                 user_message,
             ],
             think=False,
@@ -179,7 +182,10 @@ class OnlineSummarizer(BaseSummarizer):
         response = await litellm.acompletion(
             model=self.model,
             messages=[
-                {"role": "system", "content": self._get_system_prompt(include_title=(chunk_num == 0))},
+                {"role": "system", "content": self._get_system_prompt(
+                    include_title=(chunk_num == 0),
+                    is_visual=bool(images),
+                )},
                 user_message,
             ],
             temperature=0.1,
@@ -288,9 +294,24 @@ class LlamaCppSummarizer(BaseSummarizer):
         location and lets the bootstrap API report them consistently.
         """
         if self.clip_model_path:
+            logger.info(
+                "Vision: using explicit clip_model_path from config",
+                clip_model_path=self.clip_model_path,
+            )
             return self.clip_model_path
 
         if not (self.clip_repo_id and self.clip_filename):
+            # Hard-disable vision if the user blanked these out. Loud
+            # because it's almost always a misconfiguration: an image-
+            # capable model with no clip projector means every image
+            # gets summarized text-only.
+            logger.error(
+                "Vision DISABLED: clip_repo_id or clip_filename is empty in "
+                "settings.toml. Image files will be summarized text-only "
+                "(usually just the parser metadata placeholder).",
+                clip_repo_id=self.clip_repo_id,
+                clip_filename=self.clip_filename,
+            )
             return None
 
         try:
@@ -302,9 +323,29 @@ class LlamaCppSummarizer(BaseSummarizer):
                 subdir="mmproj",
                 stage_label="mmproj",
             )
+            logger.info(
+                "Vision: clip (mmproj) projector resolved",
+                clip_repo_id=self.clip_repo_id,
+                clip_filename=self.clip_filename,
+                clip_path=str(result.path),
+            )
             return str(result.path)
         except Exception as e:
-            logger.warning("Failed to download clip model, vision will be unavailable", error=str(e))
+            # Promoted warning → error. This is the single most common
+            # reason image hits look broken (offline at first install,
+            # mmproj-F16.gguf never landed) and it used to show up at
+            # warning level which the user could easily miss.
+            logger.error(
+                "Vision DISABLED: failed to download clip (mmproj) model. "
+                "Image files will be summarized text-only — usually just "
+                "the parser metadata placeholder. Re-run when online or "
+                "manually drop the file at "
+                "~/Library/Application Support/cosma/models/llama/mmproj/.",
+                clip_repo_id=self.clip_repo_id,
+                clip_filename=self.clip_filename,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
             return None
 
     def _create_chat_handler(self, clip_path: str) -> Any:
@@ -313,12 +354,23 @@ class LlamaCppSummarizer(BaseSummarizer):
 
         class_name = self._CHAT_HANDLERS.get(self.chat_handler_name)
         if not class_name:
-            logger.warning("Unknown chat handler, falling back to no handler", handler=self.chat_handler_name)
+            logger.error(
+                "Vision DISABLED: unknown chat_handler in settings — won't "
+                "be able to attach images to the LLM call.",
+                handler=self.chat_handler_name,
+                known_handlers=list(self._CHAT_HANDLERS.keys()),
+            )
             return None
 
         handler_cls = getattr(llama_chat_format, class_name, None)
         if handler_cls is None:
-            logger.warning("Chat handler class not found in llama_cpp", class_name=class_name)
+            logger.error(
+                "Vision DISABLED: chat handler class not found in this "
+                "llama-cpp-python build. Upgrade llama-cpp-python or pick "
+                "a handler your build supports.",
+                handler=self.chat_handler_name,
+                class_name=class_name,
+            )
             return None
 
         kwargs: dict[str, Any] = {"clip_model_path": clip_path}
@@ -328,7 +380,28 @@ class LlamaCppSummarizer(BaseSummarizer):
             kwargs["image_min_tokens"] = self.config.llamacpp.image_min_tokens
         kwargs["verbose"] = self.config.llamacpp.verbose
 
-        return handler_cls(**kwargs)
+        try:
+            handler = handler_cls(**kwargs)
+        except Exception as e:
+            logger.error(
+                "Vision DISABLED: chat handler constructor raised. The "
+                "clip path is on disk but llama-cpp-python rejected it "
+                "(usually mmproj/model architecture mismatch).",
+                handler=self.chat_handler_name,
+                class_name=class_name,
+                clip_path=clip_path,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return None
+        logger.info(
+            "Vision ENABLED: chat handler created",
+            handler=self.chat_handler_name,
+            class_name=class_name,
+            clip_path=clip_path,
+            image_min_tokens=self.config.llamacpp.image_min_tokens,
+        )
+        return handler
 
     def _ensure_loaded(self) -> None:
         """Load the model if not already loaded (lazy loading)."""
@@ -344,8 +417,15 @@ class LlamaCppSummarizer(BaseSummarizer):
         clip_path = self._resolve_clip_model_path()
         if clip_path:
             self.chat_handler = self._create_chat_handler(clip_path)
-            if self.chat_handler:
-                logger.info("Vision chat handler created", handler=self.chat_handler_name)
+        if self.chat_handler is None:
+            # Final summary line so the operator sees ONE definitive
+            # statement of the vision state in the log instead of having
+            # to assemble it from two warnings + a guess.
+            logger.error(
+                "Vision DISABLED for this LlamaCppSummarizer instance. "
+                "Image summaries will fall back to text-only inference "
+                "against the parser placeholder — expect garbage on photos."
+            )
 
         try:
             llama_kwargs: dict[str, Any] = {
@@ -462,9 +542,23 @@ class LlamaCppSummarizer(BaseSummarizer):
         """Check if llama.cpp is available (doesn't load model)."""
         return self.llamacpp_available
 
-    def _build_user_content(self, text: str, images: list[str]) -> str | list[dict[str, Any]]:
+    def _build_user_content(self, text: str, images: list[str], filename: str = "") -> str | list[dict[str, Any]]:
         """Build user message content, using OpenAI multimodal format for images."""
-        if not images or not self.chat_handler:
+        if not images:
+            return text
+        if not self.chat_handler:
+            # Caller had images to attach but vision is dead — most
+            # common cause of "image summary is just the file metadata
+            # placeholder". Loud per-call so the operator sees it
+            # alongside the actual offending filename.
+            logger.error(
+                "Image summarize call dropped vision: chat_handler is None "
+                "(see _ensure_loaded errors above for why). Calling LLM "
+                "text-only — expect a garbage summary that just echoes "
+                "the parser placeholder.",
+                filename=filename,
+                num_images=len(images),
+            )
             return text
 
         content: list[dict[str, Any]] = []
@@ -474,12 +568,27 @@ class LlamaCppSummarizer(BaseSummarizer):
                 "image_url": {"url": f"data:image/png;base64,{img_b64}"},
             })
         content.append({"type": "text", "text": text})
+        logger.debug(
+            "Image summarize call going out with vision",
+            filename=filename,
+            num_images=len(images),
+            text_len=len(text),
+        )
         return content
 
     async def _get_ai_response(self, chunk: str, chunk_num: int, total_chunks: int, images: list[str], filename: str) -> str | None:
         self._ensure_loaded()
         text = self._format_content_with_context(chunk, chunk_num, total_chunks, filename)
-        sys_prompt = self._get_system_prompt(include_title=(chunk_num == 0))
+        # is_visual = images actually reach the model. If chat_handler
+        # is None the multimodal payload gets stripped in
+        # _build_user_content and the model only sees text — using a
+        # visual prompt in that case would just waste prefill on
+        # instructions about pictures the model can't see.
+        is_visual = bool(images) and self.chat_handler is not None
+        sys_prompt = self._get_system_prompt(
+            include_title=(chunk_num == 0),
+            is_visual=is_visual,
+        )
 
         # Hard safety net against context-window overflow.
         #
@@ -537,7 +646,7 @@ class LlamaCppSummarizer(BaseSummarizer):
                 text = text[:approx_chars]
             text = text + "\n\n[content truncated to fit model context window]"
 
-        user_content = self._build_user_content(text, images)
+        user_content = self._build_user_content(text, images, filename=filename)
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_content},

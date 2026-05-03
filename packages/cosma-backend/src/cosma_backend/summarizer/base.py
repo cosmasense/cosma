@@ -320,62 +320,117 @@ class BaseSummarizer(ABC):
             logger.error("Failed to parse AI response as JSON and fallback failed", response=response_content[:200], error=str(e))
             raise ValueError(f"Invalid JSON response: {str(e)}")
 
-    def _get_system_prompt(self, include_title: bool = False) -> str:
+    # Shared prefix for ALL system-prompt variants. llama.cpp caches the
+    # KV state of the prompt prefix at token granularity — any future
+    # call whose system prompt starts with byte-identical tokens skips
+    # prefill on those tokens. Keeping the first N tokens identical
+    # across (text|image) × (chunk 0|chunk N+) means we cache-hit on
+    # this whole header regardless of which file just got summarized.
+    # Per-modality / per-chunk content is appended AFTER the header so
+    # only the divergent tail pays prefill cost.
+    #
+    # Don't edit this string lightly — every byte change invalidates
+    # every cached entry across every variant simultaneously.
+    _PROMPT_HEADER: str = (
+        "You index files for search retrieval. Output ONE JSON object — "
+        "no prose, no code fences, no 'Here is'. Optimize for words a "
+        "searcher would actually type. Do NOT echo metadata (filename, "
+        "dimensions, file size, modes) back into the summary.\n"
+    )
+
+    def _get_system_prompt(self, include_title: bool = False, is_visual: bool = False) -> str:
         # Prompt-engineering notes:
         #
-        # 1. The system prompt is prefilled on every chunk. Every token
-        #    here costs prefill time on every file. Stay terse.
+        # 1. CACHE-FRIENDLINESS IS THE CONSTRAINT. Every variant below
+        #    starts with `_PROMPT_HEADER` so the prefill cache hits the
+        #    full header even when indexing alternates between text and
+        #    image files. The per-modality tail can be as long and as
+        #    specific as we want — only the tail tokens cost prefill on
+        #    a modality switch.
         #
-        # 2. The model is being used as a *retrieval indexer* — its
-        #    summaries feed FTS5 and embedding-based search. Optimize
-        #    for "would the user search for these words?" not for
-        #    narrative quality. That's why the instructions say
-        #    "concrete nouns" and "what someone would type", not
-        #    "elegant prose".
+        # 2. Two `include_title` branches are unavoidable: chunk 0 needs
+        #    a title in the schema, chunk N+ doesn't.
         #
-        # 3. The 1-shot example shows the EXACT output shape we want.
-        #    Models follow shape examples more reliably than instructions.
-        #    The example is short (avoids prefill bloat) but realistic
-        #    (file-content-shaped).
+        # 3. Two `is_visual` branches let us teach the model with a
+        #    domain-appropriate example — Q3-earnings JSON for text,
+        #    "five hikers on a mountain" for an image. Models follow
+        #    shape-by-example more reliably than shape-by-instruction.
+        #    Without the image example, an image got the Q3 example as
+        #    its 1-shot and the model just echoed back the parser's
+        #    metadata placeholder.
         #
-        # 4. Hard "ONLY JSON, no prose" line — open-ended models love
-        #    to say "Here is the summary:" before the JSON. Specific
-        #    forbidden phrases save retry rounds.
+        # 4. Hard "ONLY JSON, no prose" lives in the header — open-ended
+        #    models love to say "Here is the summary:" otherwise.
         #
-        # 5. No `{{ }}` Jinja escapes — those weren't being templated,
-        #    they were rendered literally to the model and confused it.
+        # 5. No `{{ }}` Jinja escapes — those rendered literally to the
+        #    model and confused it.
         if include_title:
-            return (
-                "You index file content for search. Output ONE JSON object, "
-                "nothing else — no prose, no code fences, no 'Here is'.\n"
+            if is_visual:
+                return self._PROMPT_HEADER + (
+                    "This call has an attached image. Look at it and describe "
+                    "what is visible: concrete objects, people, places, "
+                    "scenes, actions, and any legible text. Treat any text "
+                    "in the user message (filename, dimensions, etc.) as "
+                    "context only — describe the picture, not the metadata.\n"
+                    "Schema:\n"
+                    '  {"title": "<1-5 word title naming the main subject>",\n'
+                    '   "summary": "<1-2 sentences naming concrete visible '
+                    'objects, people, scenes, and any legible text>",\n'
+                    '   "keywords": ["<5-12 distinctive visual nouns or '
+                    'noun-phrases, lowercase>"]}\n'
+                    "Example (a hiking photo):\n"
+                    '  {"title": "Group hike at sunset",\n'
+                    '   "summary": "Five hikers with backpacks on a mountain '
+                    'ridge under an orange sky; pine trees in the foreground.",\n'
+                    '   "keywords": ["hiking", "sunset", "mountain ridge", '
+                    '"backpacks", "pine trees", "group photo"]}'
+                )
+            return self._PROMPT_HEADER + (
                 "Schema:\n"
                 '  {"title": "<1-5 word title>",\n'
                 '   "summary": "<1-2 sentences naming the topic and key '
                 'concrete nouns a searcher would type>",\n'
                 '   "keywords": ["<5-12 distinctive nouns or noun-phrases, '
                 'lowercase>"]}\n'
-                "Example for a Q3 financial report:\n"
+                "Example (a Q3 financial report):\n"
                 '  {"title": "Q3 Earnings Report",\n'
                 '   "summary": "Q3 2025 earnings: revenue up 12%, AWS '
                 'driving cloud growth, margins steady.",\n'
                 '   "keywords": ["q3 earnings", "revenue growth", "aws", '
                 '"cloud", "margins"]}'
             )
-        else:
-            return (
-                "You index file content for search. Output ONE JSON object, "
-                "nothing else — no prose, no code fences, no 'Here is'.\n"
+
+        # Continuation chunks (chunk N+) — same modality split, no title.
+        if is_visual:
+            return self._PROMPT_HEADER + (
+                "This is a continuation: another image / video frame from "
+                "the same clip. Same rules — describe what is visible, do "
+                "not echo metadata.\n"
                 "Schema:\n"
-                '  {"summary": "<1-2 sentences naming the topic and key '
-                'concrete nouns a searcher would type>",\n'
-                '   "keywords": ["<5-12 distinctive nouns or noun-phrases, '
-                'lowercase>"]}\n'
-                "Example for a Q3 earnings continuation chunk:\n"
-                '  {"summary": "Continued Q3 cloud-segment detail: AWS '
-                'revenue $26B, operating margin 36%.",\n'
-                '   "keywords": ["aws revenue", "cloud segment", '
-                '"operating margin"]}'
+                '  {"summary": "<1-2 sentences naming concrete visible '
+                'objects, scenes, actions, legible text>",\n'
+                '   "keywords": ["<5-12 distinctive visual nouns or '
+                'noun-phrases, lowercase>"]}\n'
+                "Example (the next frame of a hike video):\n"
+                '  {"summary": "Same hikers descending the ridge; trail '
+                'switchbacks below, mountains in background.",\n'
+                '   "keywords": ["hikers descending", "switchbacks", '
+                '"trail", "mountains"]}'
             )
+        return self._PROMPT_HEADER + (
+            "This is a continuation chunk — text from later in the same "
+            "file. Summarize the additional content.\n"
+            "Schema:\n"
+            '  {"summary": "<1-2 sentences naming the topic and key '
+            'concrete nouns a searcher would type>",\n'
+            '   "keywords": ["<5-12 distinctive nouns or noun-phrases, '
+            'lowercase>"]}\n'
+            "Example (a Q3 earnings continuation chunk):\n"
+            '  {"summary": "Continued Q3 cloud-segment detail: AWS '
+            'revenue $26B, operating margin 36%.",\n'
+            '   "keywords": ["aws revenue", "cloud segment", '
+            '"operating margin"]}'
+        )
 
     def _format_content_with_context(self, chunk: str, chunk_num: int, total_chunks: int, filename: str) -> str:
         """Format content with filename and chunk context for the first chunk."""
