@@ -127,6 +127,148 @@ class DeleteFileResponse:
 
 
 @dataclass
+class FileDetailsResponse:
+    """Everything we know about a single indexed file. Powers the
+    frontend's "Stats for Nerds" debug panel — surfaces what the LLM
+    actually wrote, whether the embedding even exists, and any failure
+    reason — so users can diagnose bad search hits (especially images,
+    where the vision summary is the only signal the embedder sees)
+    without needing to reach for sqlite."""
+    found: bool
+    file_path: str
+    file_id: int | None
+    filename: str | None
+    extension: str | None
+    file_size: int | None
+    created: int | None
+    modified: int | None
+    accessed: int | None
+    content_type: str | None
+    content_hash: str | None
+    parsed_at: int | None
+    title: str | None
+    summary: str | None
+    summarized_at: int | None
+    embedded_at: int | None
+    status: str | None
+    processing_error: str | None
+    owner: str | None
+    permissions: str | None
+    created_at: int | None
+    updated_at: int | None
+    keywords: list[str]
+    has_embedding: bool
+    embedding_model: str | None
+    embedding_dimensions: int | None
+
+
+@files_bp.get("/details")  # type: ignore[return-value]
+async def get_file_details() -> tuple[dict, int]:  # type: ignore[type-arg]
+    """Look up a single file by absolute path and return everything we
+    know about it: every column in `files`, its keywords, and whether
+    its embedding row exists in `file_embeddings` (with the model name
+    + dimension count). Designed for the Cosma Sense "Stats for Nerds"
+    debug panel — quickest way to see why a search result looks wrong
+    without dropping into sqlite.
+
+    GET /api/files/details/?path=<absolute_path>
+
+    Response is always 200 with `found=false` if the path isn't in the
+    index, so the frontend can render a uniform "not indexed" state
+    without parsing HTTP statuses.
+    """
+    from quart import request
+
+    raw_path = request.args.get("path", "").strip()
+    if not raw_path:
+        return {"error": "path query parameter required"}, 400  # type: ignore
+
+    async with current_app.db.acquire() as conn:
+        file_row = await conn.fetchone(
+            "SELECT * FROM files WHERE file_path = ?;",
+            (raw_path,),
+        )
+
+        if not file_row:
+            empty = FileDetailsResponse(
+                found=False,
+                file_path=raw_path,
+                file_id=None,
+                filename=None,
+                extension=None,
+                file_size=None,
+                created=None,
+                modified=None,
+                accessed=None,
+                content_type=None,
+                content_hash=None,
+                parsed_at=None,
+                title=None,
+                summary=None,
+                summarized_at=None,
+                embedded_at=None,
+                status=None,
+                processing_error=None,
+                owner=None,
+                permissions=None,
+                created_at=None,
+                updated_at=None,
+                keywords=[],
+                has_embedding=False,
+                embedding_model=None,
+                embedding_dimensions=None,
+            )
+            return empty.__dict__, 200
+
+        file_id = file_row["id"]
+
+        keyword_rows = await conn.fetchall(
+            "SELECT keyword FROM file_keywords WHERE file_id = ? ORDER BY keyword;",
+            (file_id,),
+        )
+        keywords = [r["keyword"] for r in keyword_rows]
+
+        # file_embeddings is a vec0 virtual table — we just need to
+        # know whether the row exists and which model wrote it. The
+        # actual embedding blob is huge and useless to the UI.
+        embedding_row = await conn.fetchone(
+            "SELECT embedding_model, embedding_dimensions "
+            "FROM file_embeddings WHERE file_id = ?;",
+            (file_id,),
+        )
+
+    details = FileDetailsResponse(
+        found=True,
+        file_path=file_row["file_path"],
+        file_id=file_id,
+        filename=file_row["filename"],
+        extension=file_row["extension"],
+        file_size=file_row["file_size"],
+        created=file_row["created"],
+        modified=file_row["modified"],
+        accessed=file_row["accessed"],
+        content_type=file_row["content_type"],
+        content_hash=file_row["content_hash"],
+        parsed_at=file_row["parsed_at"],
+        title=file_row["title"],
+        summary=file_row["summary"],
+        summarized_at=file_row["summarized_at"],
+        embedded_at=file_row["embedded_at"],
+        status=file_row["status"],
+        processing_error=file_row["processing_error"],
+        owner=file_row["owner"],
+        permissions=file_row["permissions"],
+        created_at=file_row["created_at"],
+        updated_at=file_row["updated_at"],
+        keywords=keywords,
+        has_embedding=embedding_row is not None,
+        embedding_model=embedding_row["embedding_model"] if embedding_row else None,
+        embedding_dimensions=embedding_row["embedding_dimensions"] if embedding_row else None,
+    )
+    return details.__dict__, 200
+
+
+@dataclass
 class FileStatsResponse:
     """Response for file statistics"""
     total_files: int
