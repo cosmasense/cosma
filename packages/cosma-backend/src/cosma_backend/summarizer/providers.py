@@ -5,6 +5,7 @@ Summarizer provider implementations: Ollama, Online (LiteLLM), and LlamaCpp.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import threading
 import time
@@ -348,98 +349,74 @@ class LlamaCppSummarizer(BaseSummarizer):
             )
             return None
 
-    # Fallback order when the configured handler isn't present in the
-    # installed llama-cpp-python build. Tries the user's preferred
-    # handler first, then walks through other handlers from the same
-    # family (any *VL handler can drive a multimodal call). Stops on
-    # the first one that exists. The Qwen3VLChatHandler ONLY exists in
-    # the cosmasense fork's v0.3.32-metal build; users who installed
-    # via `uv tool install cosma` get upstream PyPI's llama-cpp-python
-    # which has Qwen2.5-VL but not Qwen3-VL — without a fallback they
-    # silently lose vision.
-    _HANDLER_FALLBACK_ORDER: list[str] = [
-        "Qwen3VLChatHandler",
-        "Qwen25VLChatHandler",
-        "MiniCPMv26ChatHandler",
-        "Gemma3ChatHandler",
-    ]
+    # The required chat handler class. Qwen3VLChatHandler ONLY exists in
+    # the cosmasense fork's llama-cpp-python (v0.3.32-metal) — upstream
+    # PyPI's llama-cpp-python has Qwen2.5-VL but not Qwen3-VL. We don't
+    # fall back to other handlers: the rest are either model-mismatched
+    # for our Qwen3-VL gguf or have signature drift that silently breaks
+    # vision (stock Qwen25VLChatHandler inherits Llava15ChatHandler and
+    # rejects image_min_tokens with TypeError). If the required handler
+    # isn't there, vision is off and we say so loudly with the install
+    # command.
+    _REQUIRED_HANDLER_CLASS: str = "Qwen3VLChatHandler"
+    _FORK_INSTALL_HINT: str = (
+        "Reinstall cosma with the cosmasense Metal fork wheel: "
+        "`uv tool install --reinstall cosma --with "
+        "https://github.com/cosmasense/llama-cpp-python/releases/download/"
+        "v0.3.32-metal/llama_cpp_python-0.3.32-cp313-cp313-"
+        "macosx_11_0_arm64.whl` (swap cp313 for your Python minor "
+        "version, e.g. cp312)."
+    )
 
     def _resolve_handler_class(self) -> tuple[str | None, Any | None]:
-        """Pick the best chat handler class available in this
-        llama-cpp-python build. Returns (class_name, handler_class) or
-        (None, None) if nothing usable exists. Logs the fallback so the
-        user can see when they're running on a non-preferred handler.
+        """Look up the required Qwen3-VL chat handler class. Returns
+        (class_name, handler_class) on success, or (None, None) with a
+        loud actionable error if it's missing from this llama-cpp-python
+        build (which means the user is on stock PyPI rather than the
+        cosmasense fork).
         """
         from llama_cpp import llama_chat_format
 
-        preferred_name = self._CHAT_HANDLERS.get(self.chat_handler_name)
-        if preferred_name is None:
-            logger.warning(
-                "Unknown chat_handler in settings; will pick first "
-                "available from fallback order.",
-                handler=self.chat_handler_name,
-                known_handlers=list(self._CHAT_HANDLERS.keys()),
+        cls = getattr(llama_chat_format, self._REQUIRED_HANDLER_CLASS, None)
+        if cls is None:
+            logger.error(
+                "Vision DISABLED: required chat handler class is not "
+                "present in this llama-cpp-python build. This means you "
+                "are on the stock PyPI llama-cpp-python, not the "
+                "cosmasense fork that ships Qwen3-VL support. " +
+                self._FORK_INSTALL_HINT,
+                required_class=self._REQUIRED_HANDLER_CLASS,
             )
-
-        # Try preferred first, then walk the fallback list.
-        candidates = [preferred_name] if preferred_name else []
-        for name in self._HANDLER_FALLBACK_ORDER:
-            if name not in candidates:
-                candidates.append(name)
-
-        tried: list[str] = []
-        for class_name in candidates:
-            if class_name is None:
-                continue
-            cls = getattr(llama_chat_format, class_name, None)
-            if cls is not None:
-                if preferred_name and class_name != preferred_name:
-                    logger.warning(
-                        "Preferred chat handler not in this llama-cpp-python "
-                        "build — falling back. Vision will work but with the "
-                        "fallback model. To get the preferred handler, "
-                        "install the cosmasense Metal fork: "
-                        "`uv tool install --reinstall cosma --with "
-                        "https://github.com/cosmasense/llama-cpp-python/"
-                        "releases/download/v0.3.32-metal/"
-                        "llama_cpp_python-0.3.32-cp313-cp313-"
-                        "macosx_11_0_arm64.whl` (swap cp313 for your Python "
-                        "minor version).",
-                        preferred=preferred_name,
-                        fell_back_to=class_name,
-                    )
-                return class_name, cls
-            tried.append(class_name)
-
-        logger.error(
-            "Vision DISABLED: NONE of the chat handler classes are present "
-            "in this llama-cpp-python build. Reinstall llama-cpp-python "
-            "(stock PyPI build has at least Qwen25VLChatHandler since "
-            "0.3.16): `uv tool install --reinstall --upgrade cosma`. "
-            "For Qwen3-VL specifically, install the cosmasense Metal fork.",
-            tried=tried,
-        )
-        return None, None
+            return None, None
+        return self._REQUIRED_HANDLER_CLASS, cls
 
     def _create_chat_handler(self, clip_path: str) -> Any:
-        """Create the appropriate chat handler for the configured model.
-
-        Falls back to the next available handler in
-        `_HANDLER_FALLBACK_ORDER` if the preferred handler class isn't
-        present in this llama-cpp-python build — common for users who
-        install via PyPI rather than the cosmasense fork.
+        """Construct the Qwen3-VL chat handler. Logs an actionable error
+        and returns None on any failure so the caller can degrade to
+        text-only summarization without crashing.
         """
         class_name, handler_cls = self._resolve_handler_class()
         if handler_cls is None:
             return None
 
+        # Walk the MRO so we see the kwargs accepted by parent classes
+        # too. Qwen3VLChatHandler.__init__ has only `force_reasoning,
+        # add_vision_id, **kwargs`; the real payload (clip_model_path,
+        # image_min_tokens, verbose) lives on its parent MTMDChatHandler.
+        # Looking at the leaf signature alone would incorrectly drop
+        # those.
+        accepted: set[str] = set()
+        for parent_cls in inspect.getmro(handler_cls):
+            try:
+                accepted.update(inspect.signature(parent_cls.__init__).parameters.keys())
+            except (TypeError, ValueError):
+                continue
+
         kwargs: dict[str, Any] = {"clip_model_path": clip_path}
-        # `enable_thinking` is only a kwarg on Qwen3.5's handler.
-        if class_name == "Qwen35ChatHandler":
-            kwargs["enable_thinking"] = self.enable_thinking
-        if self.config.llamacpp.image_min_tokens > 0:
+        if "image_min_tokens" in accepted and self.config.llamacpp.image_min_tokens > 0:
             kwargs["image_min_tokens"] = self.config.llamacpp.image_min_tokens
-        kwargs["verbose"] = self.config.llamacpp.verbose
+        if "verbose" in accepted:
+            kwargs["verbose"] = self.config.llamacpp.verbose
 
         try:
             handler = handler_cls(**kwargs)
@@ -447,7 +424,9 @@ class LlamaCppSummarizer(BaseSummarizer):
             logger.error(
                 "Vision DISABLED: chat handler constructor raised. The "
                 "clip path is on disk but llama-cpp-python rejected it "
-                "(usually mmproj/model architecture mismatch).",
+                "(usually mmproj/model architecture mismatch, or you are "
+                "on a llama-cpp-python build whose Qwen3VLChatHandler "
+                "signature drifted). " + self._FORK_INSTALL_HINT,
                 handler=self.chat_handler_name,
                 class_name=class_name,
                 clip_path=clip_path,
@@ -457,8 +436,7 @@ class LlamaCppSummarizer(BaseSummarizer):
             return None
         logger.info(
             "Vision ENABLED: chat handler created",
-            requested_handler=self.chat_handler_name,
-            actual_class_name=class_name,
+            class_name=class_name,
             clip_path=clip_path,
             image_min_tokens=self.config.llamacpp.image_min_tokens,
         )

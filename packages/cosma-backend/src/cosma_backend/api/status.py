@@ -56,3 +56,45 @@ async def version():
         "api_version": __api_version__,
         "min_frontend_api_version": __min_frontend_api_version__,
     }
+
+
+@status_bp.get("/vision")  # type: ignore[return-value]
+async def vision():
+    """Vision capability probe.
+
+    Reports whether the LlamaCpp summarizer's chat handler loaded —
+    i.e. whether image files can be summarized from pixels rather than
+    just from the parser-metadata placeholder. The frontend uses this
+    after the first launch with a new release to decide whether to
+    self-heal a stock-PyPI install (no `Qwen3VLChatHandler` in the
+    venv) by reinstalling cosma with the cosmasense fork wheel via
+    `uv tool install --reinstall cosma --with <wheel-url>`.
+
+    Returns:
+        - `vision_available`: bool — True iff the chat handler is loaded
+        - `required_handler`: str — class name we look for
+        - `handler_loaded`: bool — same as `vision_available` (alias for clarity)
+        - `provider`: str — the configured summarizer provider
+    """
+    pipeline = getattr(current_app, "pipeline", None)
+    summarizer = getattr(pipeline, "summarizer", None) if pipeline else None
+    provider = getattr(summarizer, "preferred_provider", None) or "unknown"
+
+    handler_loaded = False
+    if summarizer is not None and hasattr(summarizer, "_get_llamacpp_summarizer"):
+        try:
+            llamacpp = await summarizer._get_llamacpp_summarizer()
+        except Exception:
+            llamacpp = None
+        if llamacpp is not None:
+            # `chat_handler` is set during `_ensure_loaded`. None means
+            # the handler class was missing or the constructor raised.
+            handler_loaded = getattr(llamacpp, "chat_handler", None) is not None
+
+    from cosma_backend.summarizer.providers import LlamaCppSummarizer
+    return {
+        "vision_available": handler_loaded,
+        "handler_loaded": handler_loaded,
+        "required_handler": LlamaCppSummarizer._REQUIRED_HANDLER_CLASS,
+        "provider": provider,
+    }

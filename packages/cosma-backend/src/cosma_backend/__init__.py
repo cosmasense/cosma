@@ -29,7 +29,7 @@ from .app import App as App, create_app as create_app, run as run
 #   4. Cut a coordinated frontend+backend release with matching __version__.
 #   5. (Optional) leave __min_frontend_api_version__ at the previous value
 #      for one release if you want to give users a soft transition.
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __api_version__ = 1
 __min_frontend_api_version__ = 1
 
