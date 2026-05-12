@@ -617,6 +617,18 @@ class LlamaCppSummarizer(BaseSummarizer):
 
     async def _get_ai_response(self, chunk: str, chunk_num: int, total_chunks: int, images: list[str], filename: str) -> str | None:
         self._ensure_loaded()
+        # Capture a local handle to the loaded model. The idle-unload
+        # monitor (model_lifecycle._monitor_loop) runs on the same event
+        # loop and can call unload() — which sets self.llm = None and
+        # release_memory()s — *while this coroutine is parked on the
+        # `await asyncio.to_thread(_run_inference)` below*, because that
+        # await yields control. Reading `self.llm` inside _run_inference
+        # then raced and produced "'NoneType' object has no attribute
+        # 'create_chat_completion'" (one such FAILED file in the
+        # 2026-05-12 report). A captured local keeps the Llama object
+        # alive for the in-flight call; the next chunk's _ensure_loaded()
+        # transparently reloads it if the monitor unloaded it.
+        llm = self.llm
         text = self._format_content_with_context(chunk, chunk_num, total_chunks, filename)
         # is_visual = images actually reach the model. If chat_handler
         # is None the multimodal payload gets stripped in
@@ -647,7 +659,7 @@ class LlamaCppSummarizer(BaseSummarizer):
         generation_budget = 500
         chat_template_overhead = 200  # role markers, BOS/EOS, format tokens
         try:
-            sys_token_count = len(self.llm.tokenize(sys_prompt.encode("utf-8"), add_bos=False, special=True))
+            sys_token_count = len(llm.tokenize(sys_prompt.encode("utf-8"), add_bos=False, special=True))
         except Exception:
             sys_token_count = max(1, len(sys_prompt) // 3)
         image_tokens = self.config.llamacpp.image_min_tokens if (images and self.chat_handler) else 0
@@ -662,7 +674,7 @@ class LlamaCppSummarizer(BaseSummarizer):
         available_for_user = max(256, available_for_user)
 
         try:
-            text_tokens = self.llm.tokenize(text.encode("utf-8"), add_bos=False, special=False)
+            text_tokens = llm.tokenize(text.encode("utf-8"), add_bos=False, special=False)
         except Exception:
             text_tokens = None
 
@@ -677,7 +689,7 @@ class LlamaCppSummarizer(BaseSummarizer):
                 generation_budget=generation_budget,
             )
             try:
-                text = self.llm.detokenize(text_tokens[:available_for_user]).decode("utf-8", errors="ignore")
+                text = llm.detokenize(text_tokens[:available_for_user]).decode("utf-8", errors="ignore")
             except Exception:
                 # detokenize() can fail on partial multi-byte sequences; fall
                 # back to a character-based trim with the same total budget.
@@ -698,7 +710,7 @@ class LlamaCppSummarizer(BaseSummarizer):
         # C boundary, not the asyncio one.
         def _run_inference() -> Any:
             with self._inference_lock:
-                return self.llm.create_chat_completion(
+                return llm.create_chat_completion(
                     messages=messages,
                     max_tokens=generation_budget,
                     temperature=0.1,

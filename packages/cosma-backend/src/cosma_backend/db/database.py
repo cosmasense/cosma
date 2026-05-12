@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-from sqlite3 import Row
+from sqlite3 import OperationalError, Row
 import struct
 from types import TracebackType
 from typing import TYPE_CHECKING, Optional, Self, Type
@@ -568,17 +568,26 @@ class Database:
 
     async def delete_file(self, file_path: str) -> File | None:
         """
-        Delete a file.
+        Delete a file row, returning the deleted record (or None if absent).
 
-        Args:
-            file_path: Path of the file to delete
-
-        Returns:
-            True if deleted, False if not found
+        This is best-effort: callers like the /api/queue/reindex endpoint
+        only delete the old row so the file gets fully reprocessed — if the
+        delete itself trips on a transient SQLite error (a "no such table:
+        files" was observed once right after startup, and "database is
+        locked" can show up when the Retry-All button fires dozens of
+        deletes at once), we'd rather log it and let the re-enqueue proceed
+        than surface an Internal Server Error to a user who clicked Retry.
         """
-        async with self.acquire() as conn:
-            # Delete file record
-            row = await conn.fetchone("DELETE FROM files WHERE file_path = ? RETURNING *", (file_path,))
+        try:
+            async with self.acquire() as conn:
+                # Delete file record
+                row = await conn.fetchone("DELETE FROM files WHERE file_path = ? RETURNING *", (file_path,))
+        except OperationalError as e:
+            logger.warning(
+                "delete_file: SQLite error; skipping row delete and continuing",
+                file_path=file_path, error=str(e),
+            )
+            return None
 
         if not row:
             return None

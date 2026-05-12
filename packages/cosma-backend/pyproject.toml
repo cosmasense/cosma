@@ -1,6 +1,6 @@
 [project]
 name = "cosma-backend"
-version = "1.0.7"
+version = "1.0.8"
 description = "Cosma backend"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,8 +16,23 @@ dependencies = [
     "litellm>=1.77.5",
     "llama-cpp-python>=0.3.0",
     "markitdown[docx,pdf,pptx]>=0.1.4",
+    # Pure-Python tag reader for audio files (ID3 for mp3, MP4 atoms for
+    # m4a/aac, Vorbis for flac/ogg). When whisper finds no speech in a
+    # music track, the file's embedded artist/title/album tags are still
+    # the right thing to index — gives the user a useful search hit
+    # without uploading audio anywhere.
+    "mutagen>=1.47.0",
     "ollama>=0.6.0",
+    # HEIF/HEIC decoder for Pillow. Without this, every iPhone screenshot
+    # and photo (.heic/.HEIC) fails the parser ("cannot identify image
+    # file") because Pillow ships without HEIF support.
+    "pillow-heif>=0.18.0",
     "platformdirs>=4.5.0",
+    # Complementary PDF text scraper — different parser internals than
+    # MarkItDown's pdfminer path, so it occasionally salvages PDFs that
+    # come back empty from MarkItDown (encrypted-with-empty-password,
+    # unusual font encodings, malformed xref tables).
+    "pypdf>=5.0.0",
     # macOS-only OCR for scanned PDFs via Vision framework.
     # Marker ensures pip skips these on non-Darwin dev machines.
     "pyobjc-framework-Quartz>=10.3; sys_platform == 'darwin'",

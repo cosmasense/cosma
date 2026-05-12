@@ -28,10 +28,21 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import struct
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional, Dict, TYPE_CHECKING
+
+# Register HEIF/HEIC opener with Pillow process-wide. Anything that calls
+# `PIL.Image.open` after this import — including llama-cpp-python's vision
+# handler when it base64-decodes an image — sees HEIC support. Without
+# this, every .heic / .HEIC file failed with "cannot identify image file".
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
 
 from ..logging import get_logger
 from .ffmpeg_runtime import ffmpeg_path, ffprobe_path, have_system_ffmpeg
@@ -45,6 +56,10 @@ logger = get_logger(__name__)
 # Timeout settings (seconds)
 WHISPER_TIMEOUT_SECONDS = 30  # Max time for transcription
 FFMPEG_EXTRACT_TIMEOUT_SECONDS = 60  # Max time for audio extraction from video
+# Decode/resample any audio file to whisper's PCM format. Generous —
+# this is a decode pass (no video re-encode) so it runs at many×
+# realtime; even a multi-hour podcast finishes well inside this.
+AUDIO_NORMALIZE_TIMEOUT_SECONDS = 120
 FRAME_EXTRACT_TIMEOUT_SECONDS = 30  # Max time for frame extraction
 # Transcode-to-proxy: cap on time spent reencoding a stubborn video
 # into a clean H.264/AAC mp4 before retrying extraction. Generous to
@@ -64,6 +79,64 @@ MAX_FRAME_DIMENSION = 512  # Max width/height for extracted frames (saves memory
 _whisper_model: Any = None
 _whisper_model_name: str | None = None
 _whisper_last_used_at: float | None = None
+
+
+def extract_audio_tags(path: Path) -> str | None:
+    """Read embedded ID3 / MP4 / Vorbis tags from an audio file via
+    mutagen and format them as searchable text.
+
+    Used as the fallback content for music files where whisper produces
+    no transcript: most downloaded music carries artist/title/album tags,
+    and that's exactly what a user wants to search by — far more useful
+    than the "no usable speech transcript" placeholder we used to write.
+
+    Returns None when the file is untagged, mutagen can't open the
+    container, or no recognizable fields are present. The caller then
+    falls through to the metadata-only placeholder path.
+    """
+    try:
+        from mutagen import File as MutagenFile
+    except ImportError:
+        return None
+
+    try:
+        # easy=True normalizes per-format tag keys (ID3 vs MP4 atoms vs
+        # Vorbis) into a common vocabulary, so we don't have to special-
+        # case mp3/aac/flac. Returns None for unsupported containers.
+        m = MutagenFile(path, easy=True)
+    except Exception as e:
+        logger.debug("mutagen could not open audio file",
+                     path=str(path), error=str(e))
+        return None
+    if m is None:
+        return None
+
+    fields = (
+        "title", "artist", "album", "albumartist",
+        "date", "originaldate", "genre", "tracknumber",
+        "discnumber", "composer", "performer",
+    )
+    parts: list[str] = []
+    for key in fields:
+        try:
+            vals = m.get(key)
+        except Exception:
+            continue
+        if not vals:
+            continue
+        text = ", ".join(str(v) for v in vals if v).strip()
+        if text:
+            parts.append(f"{key}: {text}")
+
+    if not parts:
+        return None
+
+    head = (
+        f"Audio file: {path.name}\n"
+        f"Type: {path.suffix.lower().lstrip('.')} audio.\n"
+        f"Embedded tags:\n"
+    )
+    return head + "\n".join(parts)
 
 
 async def extract_audio_transcript(path: Path, config: ParserConfig | None = None, backend: str | None = None) -> str | None:
@@ -126,7 +199,7 @@ async def extract_audio_transcript(path: Path, config: ParserConfig | None = Non
                     logger.warning("Local whisper unavailable, will try fallback",
                                    path=str(path), reason=last_error)
                     continue
-                result = await _transcribe_with_local_whisper(path)
+                result = await _transcribe_with_local_whisper(path, model_name=cfg.whisper.local_model)
             else:
                 logger.error("Unknown Whisper backend", backend=attempt_backend)
                 continue
@@ -680,28 +753,47 @@ async def _transcribe_with_openai(audio_path: Path, config: Optional[Dict[str, A
 # Local Model Implementations
 # =============================================================================
 
-async def _transcribe_with_local_whisper(audio_path: Path) -> str | None:
-    """Transcribe audio using local Whisper model.
+async def _transcribe_with_local_whisper(audio_path: Path, model_name: str | None = None) -> str | None:
+    """Transcribe audio using a local Whisper backend.
 
-    Preference order:
-      1. whisper.cpp via pywhispercpp — fastest, no subprocess, bundled binary.
-      2. openai-whisper (PyTorch) — slower but supports more model variants.
+    Step 0 — normalize the input to a 16 kHz mono 16-bit PCM WAV via
+    ffmpeg. whisper.cpp only ingests PCM, so this single step is what
+    makes *every* container/codec transcribable (mp3, m4a/aac, flac,
+    ogg/opus, wma, alac, aiff, odd-sample-rate or float wav, ...). Skipped
+    when the file is already in that exact shape (e.g. the WAV the video
+    audio extractor produces).
+    Step 1 — whisper.cpp via pywhispercpp (fastest, bundled binary).
+    Step 2 — openai-whisper (PyTorch) as a fallback; its own loader also
+    shells ffmpeg, so it can take the original path if decoding failed.
 
-    The previous implementation shelled out to a `whisper` binary that was
-    ambiguous across installs (see whisper_local.py for the rationale).
+    The previous implementation handed the raw file straight to
+    pywhispercpp, which silently returned nothing for anything that
+    wasn't already a canonical WAV — the cause of the "no usable speech
+    transcript" wall on downloaded music and .aac livestream rips.
     """
+    pcm_path, pcm_is_temp = await _to_whisper_pcm(audio_path)
     try:
         from cosma_backend.parser import whisper_local
-        if whisper_local.is_available():
-            result = await whisper_local.transcribe(audio_path)
+        if pcm_path is not None and whisper_local.is_available():
+            result = await whisper_local.transcribe(pcm_path, model_name=model_name)
             if result:
                 return result
             # Fall through to python whisper on transcription failure.
-            logger.info("pywhispercpp returned no text; trying whisper python fallback")
-        return await _transcribe_with_whisper_python(audio_path)
+            logger.info("pywhispercpp returned no text; trying whisper python fallback",
+                        path=str(audio_path))
+        elif pcm_path is None:
+            logger.warning("audio could not be decoded to PCM; trying PyTorch whisper directly",
+                           path=str(audio_path))
+        # PyTorch whisper: feed it the decoded WAV when we have one; its
+        # load_audio shells ffmpeg with its own args, so the original
+        # path also works as a last resort.
+        return await _transcribe_with_whisper_python(pcm_path or audio_path)
     except Exception as e:
-        logger.exception("Local Whisper transcription error", error=str(e))
+        logger.exception("Local Whisper transcription error", path=str(audio_path), error=str(e))
         return None
+    finally:
+        if pcm_is_temp and pcm_path is not None:
+            pcm_path.unlink(missing_ok=True)
 
 
 async def _transcribe_with_whisper_cpp(audio_path: Path) -> str | None:
@@ -977,6 +1069,96 @@ async def _extract_audio_from_video(video_path: Path) -> Path | None:
         return None
 
 
+def _is_canonical_whisper_wav(path: Path) -> bool:
+    """True iff `path` is a 16 kHz mono 16-bit PCM WAV — the exact shape
+    whisper.cpp ingests. Lets us skip a redundant ffmpeg pass when we're
+    handed a WAV that's already in that form (e.g. the one produced by
+    ``_extract_audio_from_video``). Cheap header sniff; no ffprobe.
+    """
+    if path.suffix.lower() != ".wav":
+        return False
+    try:
+        with open(path, "rb") as f:
+            head = f.read(44)
+    except OSError:
+        return False
+    if (len(head) < 36 or head[0:4] != b"RIFF" or head[8:12] != b"WAVE"
+            or head[12:16] != b"fmt "):
+        return False
+    try:
+        audio_format, channels = struct.unpack_from("<HH", head, 20)
+        sample_rate = struct.unpack_from("<I", head, 24)[0]
+        bits_per_sample = struct.unpack_from("<H", head, 34)[0]
+    except struct.error:
+        return False
+    return (audio_format == 1 and channels == 1
+            and sample_rate == 16000 and bits_per_sample == 16)
+
+
+async def _to_whisper_pcm(path: Path) -> tuple[Path | None, bool]:
+    """Decode any audio file to a 16 kHz mono 16-bit PCM WAV via ffmpeg —
+    the one format whisper.cpp ingests directly. This is what makes
+    *every* container/codec transcribable: mp3, m4a/aac, flac, ogg/opus,
+    wma, alac, aiff, odd-sample-rate or float wav, ...
+
+    Returns ``(wav_path, is_temp)``. ``is_temp=True`` ⇒ the caller must
+    unlink ``wav_path`` when done. On failure returns ``(None, False)``
+    so the caller can fall back to the PyTorch whisper path (whose own
+    loader also shells ffmpeg, with different args).
+    """
+    # Already exactly what whisper wants — don't burn an ffmpeg pass.
+    if _is_canonical_whisper_wav(path):
+        return path, False
+
+    out = Path(tempfile.mktemp(suffix=".wav"))
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path(),
+            "-y",
+            "-i", str(path),
+            "-vn",                    # drop any embedded cover art / video stream
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            str(out),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=AUDIO_NORMALIZE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.warning("audio->PCM normalization timed out",
+                           path=str(path), timeout=AUDIO_NORMALIZE_TIMEOUT_SECONDS)
+            out.unlink(missing_ok=True)
+            return None, False
+
+        # 44 bytes = an empty WAV header; anything at/below that means
+        # ffmpeg produced no real audio.
+        if process.returncode == 0 and out.exists() and out.stat().st_size > 44:
+            logger.debug("audio normalized to 16k mono PCM for whisper",
+                         source=str(path), pcm=str(out), size=out.stat().st_size)
+            return out, True
+
+        logger.warning("audio->PCM normalization failed",
+                       path=str(path),
+                       returncode=process.returncode,
+                       stderr=stderr.decode(errors="replace")[:400])
+        out.unlink(missing_ok=True)
+        return None, False
+    except FileNotFoundError:
+        logger.error("no ffmpeg available for audio->PCM normalization", path=str(path))
+        out.unlink(missing_ok=True)
+        return None, False
+    except Exception as e:
+        logger.exception("audio->PCM normalization error", path=str(path), error=str(e))
+        out.unlink(missing_ok=True)
+        return None, False
+
+
 async def _check_whisper_cpp_available() -> bool:
     """Availability probe for whisper.cpp.
 
@@ -997,7 +1179,13 @@ async def get_supported_media_extensions() -> dict[str, list[str]]:
         Dictionary mapping categories to extension lists
     """
     return {
-        "audio": [".mp3", ".wav", ".aac", ".m4a", ".flac", ".ogg"],
+        # Everything ffmpeg can decode + that whisper can usefully
+        # transcribe. We normalize to 16 kHz mono PCM before whisper, so
+        # the container/codec only has to be something ffmpeg understands.
+        "audio": [
+            ".mp3", ".wav", ".aac", ".m4a", ".m4b", ".flac", ".ogg",
+            ".opus", ".wma", ".aiff", ".aif", ".alac", ".amr", ".ac3",
+        ],
         "video": [".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"],
         "image": [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".heic", ".gif", ".webp"]
     }

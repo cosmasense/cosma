@@ -10,9 +10,13 @@ from typing import TYPE_CHECKING, Any, Optional
 from quart import Blueprint, current_app, request
 from quart_schema import validate_response
 
+from cosma_backend.logging import get_logger
+
 if TYPE_CHECKING:
     from cosma_backend.app import App
     current_app: App
+
+logger = get_logger(__name__)
 
 queue_bp = Blueprint("queue", __name__)
 
@@ -361,36 +365,61 @@ async def queue_reindex_file() -> tuple[ReindexResponse, int]:
     if not file_path:
         return ReindexResponse(success=False, message="file_path is required"), 400
 
-    # Delete the existing file record so it gets fully reprocessed
-    await current_app.db.delete_file(file_path)
-
-    # Enqueue for re-indexing
-    await current_app.indexing_queue.enqueue(file_path, QueueAction.INDEX)
+    # Never let a hiccup here become a 500 — the frontend's per-file
+    # retry buttons (and the Retry-All fan-out) surface a 500 as a scary
+    # "internal server error" toast. Return success=False instead; the UI
+    # already renders that as a retryable "Reindex failed: …".
+    try:
+        # Delete the existing file record so it gets fully reprocessed.
+        # delete_file is best-effort and swallows transient SQLite errors.
+        await current_app.db.delete_file(file_path)
+        # Enqueue for re-indexing
+        await current_app.indexing_queue.enqueue(file_path, QueueAction.INDEX)
+    except Exception as e:
+        logger.warning("reindex enqueue failed", file_path=file_path, error=str(e))
+        return ReindexResponse(success=False, message=f"Could not re-queue {file_path}: {e}"), 200
 
     return ReindexResponse(success=True, message=f"File enqueued for reindexing: {file_path}"), 200
 
 
 # ------------------------------------------------------------------
-# Dev-only: retry all FAILED files in one call (for fix→retry→observe loop)
+# Retry all FAILED files in one call.
+#
+# The frontend's "Retry All Failed" button used to fan out one
+# POST /api/queue/reindex per failed file — dozens of concurrent
+# delete+enqueue round-trips, where a single transient DB error in any
+# one of them bubbled up as an Internal Server Error and left the rest
+# unretried. This single bulk call does the loop server-side, skipping
+# (and logging) any individual file that errors, and returns the count
+# that actually got re-queued. Also doubles as the COSMA_DEV
+# fix→retry→observe loop endpoint: when COSMA_DEV=1 it additionally
+# truncates the failed-items log (no-op otherwise).
 # ------------------------------------------------------------------
 
 @queue_bp.post("/retry_all_failed")
 async def queue_retry_all_failed() -> tuple[dict, int]:
-    """Re-enqueue every file currently in FAILED state and truncate the
-    dev failed-items log so the next pass writes a fresh record.
-
-    Gated on COSMA_DEV=1 so production builds can't accidentally blow up
-    their queue with a single call.
-    """
-    from cosma_backend.dev_logging import is_enabled, reset_log
+    from cosma_backend.dev_logging import reset_log  # no-op unless COSMA_DEV=1
     from cosma_backend.queue import QueueAction
 
-    if not is_enabled():
-        return {"success": False, "message": "COSMA_DEV=1 required"}, 403
+    try:
+        files, total = await current_app.db.get_files_by_status("FAILED", limit=100000, offset=0)
+    except Exception as e:
+        logger.warning("retry_all_failed: could not list FAILED files", error=str(e))
+        return {"success": False, "message": f"Could not list failed files: {e}", "count": 0}, 200
 
-    files, total = await current_app.db.get_files_by_status("FAILED", limit=100000, offset=0)
     reset_log()
+    requeued = 0
+    skipped = 0
     for f in files:
-        await current_app.db.delete_file(f.file_path)
-        await current_app.indexing_queue.enqueue(f.file_path, QueueAction.INDEX)
-    return {"success": True, "message": f"Re-enqueued {total} FAILED files", "count": total}, 200
+        try:
+            await current_app.db.delete_file(f.file_path)
+            await current_app.indexing_queue.enqueue(f.file_path, QueueAction.INDEX)
+            requeued += 1
+        except Exception as e:
+            skipped += 1
+            logger.warning("retry_all_failed: skipping file", file_path=f.file_path, error=str(e))
+
+    msg = f"Re-queued {requeued} of {total} failed files"
+    if skipped:
+        msg += f" ({skipped} skipped — see logs)"
+    return {"success": True, "message": msg, "count": requeued, "skipped": skipped}, 200

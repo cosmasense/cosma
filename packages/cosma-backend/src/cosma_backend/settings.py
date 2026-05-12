@@ -149,9 +149,12 @@ class WhisperConfig:
     # key — hence the new local-first default.
     provider: str = "local"
     online_model: str = "whisper-1"
-    # base.en keeps first-run download to ~140 MB. Users wanting higher
-    # accuracy can switch to "large-v3-turbo" (~1.5 GB) via settings.
-    local_model: str = "base.en"
+    # "base" = multilingual whisper, ~140 MB first-run download. Multilingual
+    # by default because a real Downloads folder has plenty of non-English
+    # audio; "base.en" would transcribe that to garbage. Switch to "base.en"
+    # for English-only precision, or "small"/"large-v3-turbo" for higher
+    # accuracy (turbo is a ~1.5 GB download).
+    local_model: str = "base"
 
 
 @dataclass

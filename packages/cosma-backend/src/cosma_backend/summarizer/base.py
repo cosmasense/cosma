@@ -5,11 +5,21 @@ Base summarizer class and exceptions.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+# Register HEIF/HEIC opener with Pillow. Same call as in parser/media.py;
+# safe to invoke twice. We register here too so the summarizer's own
+# Pillow path works even when media.py hasn't been imported yet.
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
 
 from cosma_backend.logging import get_logger
 from cosma_backend.models import ProcessingStatus
@@ -74,20 +84,49 @@ class BaseSummarizer(ABC):
         """Prepare images for vision analysis.
 
         Includes the file itself (if an image) plus any extra_images (e.g., video frames).
+        HEIC/HEIF files are transcoded to JPEG before base64-encoding so the
+        vision model never sees a format it can't decode — even if the
+        downstream library (llama-cpp-python's mtmd handler) didn't
+        register pillow-heif in its own process.
         """
         images = []
 
-        # Add the file itself if it's an image
         if file_metadata.content_type and file_metadata.content_type.startswith("image"):
-            with open(file_metadata.path, 'rb') as f:
-                images.append(base64.b64encode(f.read()).decode('utf-8'))
+            ext = file_metadata.path.suffix.lower()
+            if ext in (".heic", ".heif"):
+                jpeg_b64 = self._transcode_heic_to_jpeg_b64(file_metadata.path)
+                if jpeg_b64:
+                    images.append(jpeg_b64)
+            else:
+                with open(file_metadata.path, 'rb') as f:
+                    images.append(base64.b64encode(f.read()).decode('utf-8'))
 
-        # Add any extra images (e.g., video frames)
         if file_metadata.extra_images:
             for frame_bytes in file_metadata.extra_images:
                 images.append(base64.b64encode(frame_bytes).decode('utf-8'))
 
         return images
+
+    @staticmethod
+    def _transcode_heic_to_jpeg_b64(path) -> str | None:
+        """Decode a HEIC/HEIF file via Pillow (with pillow-heif registered)
+        and re-encode as JPEG, returning a base64 string. Returns None if
+        decoding fails — the caller treats that as "no image attached" so
+        the summarizer falls back to a text-only pass instead of erroring.
+        """
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+                buf = io.BytesIO()
+                rgb.save(buf, format="JPEG", quality=85)
+                return base64.b64encode(buf.getvalue()).decode("utf-8")
+        except Exception as e:
+            logger.warning(
+                "HEIC transcode to JPEG failed; vision skipped",
+                path=str(path), error=str(e),
+            )
+            return None
 
     async def _prepare_content(self, content: str) -> List[str]:
         """

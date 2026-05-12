@@ -32,12 +32,16 @@ from cosma_backend.paths import ensure_models_dir
 
 logger = get_logger(__name__)
 
-# Default model — small, English-only, ~140 MB. Users can override via
-# LOCAL_WHISPER_MODEL env var or the parser.whisper.local_model setting.
-# We intentionally avoid "turbo" as the default because pywhispercpp's
-# model registry name is "large-v3-turbo" (not "turbo"), and downloading
-# ~1.5 GB on first use blocks setup for many minutes.
-DEFAULT_MODEL = "base.en"
+# Default model — "base" (multilingual), ~140 MB. Multilingual rather
+# than "base.en" because a typical Downloads folder is full of non-English
+# audio (music, podcasts, livestream rips) and base.en transcribes those
+# to garbage. The accuracy cost on English is small and worth it for
+# "transcribes everything" out of the box. Override via LOCAL_WHISPER_MODEL
+# env var or the parser.whisper.local_model setting (e.g. "base.en" for
+# English-only precision, "small"/"medium" for higher accuracy,
+# "large-v3-turbo" for best). We avoid the turbo/large models as the
+# *default* because that's a ~1.5 GB first-run download.
+DEFAULT_MODEL = "base"
 
 # Map names that were historically used in settings.toml to names
 # pywhispercpp actually understands. Keeps users' existing config working.

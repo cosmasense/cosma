@@ -4,15 +4,18 @@ import asyncio
 import hashlib
 import mimetypes
 import os
+import zipfile
 from pathlib import Path
 from typing import Optional, Dict, Any, TYPE_CHECKING
 
 from markitdown import MarkItDown
 
+from cosma_backend.dev_logging import log_failed_file
 from cosma_backend.logging import get_logger
 from cosma_backend.models import File, ProcessingStatus
 from cosma_backend.parser.spotlight import spotlight_to_text
 from cosma_backend.parser.media import (
+    extract_audio_tags,
     extract_audio_transcript,
     extract_video_content,
     extract_video_transcript,
@@ -34,7 +37,9 @@ class FileParser:
     Uses Microsoft's MarkItDown library to support 20+ file formats including:
     - Documents: PDF, DOCX, PPTX, XLSX
     - Images: PNG, JPG, JPEG, TIFF, BMP, HEIC (with OCR)
-    - Audio: MP3, WAV, AAC (with transcription)
+    - Audio: MP3, WAV, AAC, M4A, FLAC, OGG/Opus, WMA, AIFF, ... (transcribed
+      via whisper after an ffmpeg normalize-to-PCM pass)
+    - Video: MP4, MOV, MKV, AVI, WEBM, ... (frames + transcript)
     - Web: HTML pages
     - Text: CSV, JSON, XML, TXT
     - Archives: ZIP (processes contents)
@@ -47,8 +52,14 @@ class FileParser:
         ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
         # Images
         ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".heic", ".gif", ".webp",
-        # Audio/Video
-        ".mp3", ".wav", ".aac", ".mp4", ".avi", ".mov", ".mkv",
+        # Audio — anything ffmpeg can decode; we normalize to 16 kHz mono
+        # PCM before whisper, so the container/codec just has to be
+        # ffmpeg-readable. Keep this in sync with
+        # media.get_supported_media_extensions()["audio"].
+        ".mp3", ".wav", ".aac", ".m4a", ".m4b", ".flac", ".ogg",
+        ".opus", ".wma", ".aiff", ".aif", ".alac", ".amr", ".ac3",
+        # Video
+        ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm",
         # Web & Text
         ".html", ".htm", ".txt", ".csv", ".json", ".xml", ".md",
         # Archives
@@ -154,9 +165,34 @@ class FileParser:
             
         max_file_size = self.config.max_file_size_mb * 1024 * 1024
         if file.file_size > max_file_size:
-            error_msg = f"File size too large (over {self.config.max_file_size_mb}MB)"
-            logger.error(error_msg, size=file.file_size, max=max_file_size)
-            raise ValueError(error_msg)
+            # Don't hard-fail: route through the metadata-only path so the
+            # file is still findable by name (a 60-GB movie remux the user
+            # searches for by title should turn up, even though we won't
+            # transcode or OCR it). It still ends in status=FAILED and
+            # shows in the Failed tab — the user asked us to keep surfacing
+            # these — but now with a useful "indexed by filename only"
+            # reason instead of vanishing.
+            error_msg = (
+                f"File exceeds the {self.config.max_file_size_mb}MB parse "
+                f"limit; indexed by filename only"
+            )
+            logger.warning(error_msg, file_path=str(path),
+                           size=file.file_size, max=max_file_size)
+            file.content_type = self._detect_mime_type(path)
+            file.content = _generic_metadata_placeholder(
+                path, f"exceeds the {self.config.max_file_size_mb}MB parse limit"
+            )
+            file.metadata_only = True
+            if file.partial_kind is None:
+                file.partial_kind = "parser_failed"
+            file.metadata_only_reason = error_msg
+            log_failed_file(
+                file_path=str(path),
+                extension=path.suffix.lower(),
+                error=error_msg,
+                phase="parse",
+            )
+            return file
 
 
         try:
@@ -240,10 +276,38 @@ class FileParser:
                                     filename=path.name,
                                     content_length=len(ocr_text))
 
+            # Strategy 5: PDF text via pypdf — MarkItDown sometimes returns
+            # empty for PDFs whose text layer is unusual (encrypted, weird
+            # encodings) but pypdf can still scrape something. Cheap and
+            # already pulled in by MarkItDown[pdf], so no new dep.
+            if not extracted_content and path.suffix.lower() == ".pdf":
+                pypdf_text = await self._try_pypdf_extraction(path)
+                if pypdf_text:
+                    extracted_content = pypdf_text
+                    extraction_method = "pypdf"
+                    logger.info("EXTRACTION: pypdf fallback successful",
+                                filename=path.name,
+                                content_length=len(pypdf_text))
+
+            # Strategy 6: ZIP listing — when MarkItDown can't text-extract
+            # an archive (binary app/font bundles), enumerate entry names
+            # and pull readable text from any inner README/.txt/.md/.json.
+            # The entry list itself is meaningful searchable text — a user
+            # looking for "VSCode" should find VSCode-darwin-universal.zip
+            # by its inner Code Helper paths.
+            if not extracted_content and path.suffix.lower() == ".zip":
+                zip_text = await self._try_zip_listing_extraction(path)
+                if zip_text:
+                    extracted_content = zip_text
+                    extraction_method = "zip_listing"
+                    logger.info("EXTRACTION: ZIP listing successful",
+                                filename=path.name,
+                                content_length=len(zip_text))
+
             # Process results
             if extracted_content and len(extracted_content.strip()) > 10:
                 file.content = extracted_content
-                
+
                 # Calculate content hash for deduplication
                 content_hash = self._calculate_content_hash(extracted_content)
                 file.content_hash = content_hash
@@ -259,11 +323,32 @@ class FileParser:
 
                 return file
             else:
-                error_msg = f"All extraction methods failed or returned empty content"
+                # Every parser came back empty. Don't raise — instead route
+                # through the existing metadata-only path so the file:
+                #   * still ends in status=FAILED (visible in Failed tab,
+                #     so the user — and we — see the failure),
+                #   * is still embedded by filename + path + size, so it
+                #     remains searchable by name,
+                #   * carries a structured error message for telemetry.
+                # The pipeline (pipeline.py:443) handles the FAILED+embed
+                # routing once metadata_only=True is set.
+                error_msg = "All extraction methods failed or returned empty content"
                 logger.warning(error_msg, file_path=str(path))
-                file.status = ProcessingStatus.FAILED
-                file.processing_error = error_msg
-                raise ValueError(error_msg)
+                file.content = _generic_metadata_placeholder(path, error_msg)
+                file.metadata_only = True
+                if file.partial_kind is None:
+                    file.partial_kind = "parser_failed"
+                file.metadata_only_reason = error_msg
+                # Local failure telemetry — no-op outside COSMA_DEV. Once
+                # we have a remote endpoint, this is the single chokepoint
+                # to add the network call on top of.
+                log_failed_file(
+                    file_path=str(path),
+                    extension=path.suffix.lower(),
+                    error=error_msg,
+                    phase="parse",
+                )
+                return file
 
         except Exception as e:
             error_msg = f"Failed to parse file: {e!s}"
@@ -316,25 +401,37 @@ class FileParser:
         try:
             if media_type == "audio":
                 content = await extract_audio_transcript(path, self.config)
-                # Audio with no decodable speech (silent track, broken codec,
-                # whisper produced empty segments) — flag as metadata-only
-                # so the pipeline routes it to FAILED + embed (it's still
-                # findable by filename in semantic search; just no LLM
-                # summary, and the user can see it in the Failed tab).
+                # No decodable speech — try embedded tags before giving up.
+                # Most downloaded music has artist/title/album baked into
+                # ID3/MP4 atoms, which is the actual signal a user wants
+                # to search by. When tags are present we treat the file as
+                # PARSED (not metadata-only): the search hit on "Charlie
+                # Clouser Dead Silence" is real, not a fallback.
                 if not content or len(content.strip()) <= 10:
-                    content = _audio_metadata_placeholder(path)
-                    if file is not None:
-                        file.metadata_only = True
-                        # Don't overwrite a user_elected classification —
-                        # the discoverer may have already flagged this
-                        # file as partial-on-purpose. Parser-failure only
-                        # claims partial_kind when nothing else has.
-                        if file.partial_kind is None:
-                            file.partial_kind = "parser_failed"
-                        file.metadata_only_reason = (
-                            "Audio: no usable speech transcript "
-                            "(silent track, codec issue, or whisper unavailable)"
-                        )
+                    tag_text = extract_audio_tags(path)
+                    if tag_text:
+                        content = tag_text
+                        logger.info("Audio: using embedded tags as content",
+                                    filename=path.name,
+                                    tag_length=len(tag_text))
+                    else:
+                        # Truly nothing — silent/untagged track. Fall through
+                        # to the metadata-only placeholder so the pipeline
+                        # routes it to FAILED + embed (still findable by
+                        # filename, no LLM summary, visible in Failed tab).
+                        content = _audio_metadata_placeholder(path)
+                        if file is not None:
+                            file.metadata_only = True
+                            # Don't overwrite a user_elected classification —
+                            # parser-failure only claims partial_kind when
+                            # nothing else has.
+                            if file.partial_kind is None:
+                                file.partial_kind = "parser_failed"
+                            file.metadata_only_reason = (
+                                "Audio: no usable speech transcript and no "
+                                "embedded tags (silent/untagged track, codec "
+                                "issue, or whisper unavailable)"
+                            )
             elif media_type == "video":
                 # Extract both transcript and frames for vision analysis
                 video_content = await extract_video_content(path)
@@ -445,6 +542,112 @@ class FileParser:
                             error=str(e))
             return None
 
+    async def _try_pypdf_extraction(self, path: Path) -> str | None:
+        """Last-resort PDF text scrape via pypdf. MarkItDown's pdfminer
+        path silently returns empty for some PDFs (encrypted with empty
+        password, unusual encodings); pypdf occasionally salvages those.
+        Returns None on any failure — caller decides what to do next.
+        pypdf comes in via MarkItDown[pdf], no new dep.
+        """
+        try:
+            from pypdf import PdfReader
+            from cosma_backend.pipeline_executor import run_in_pipeline
+
+            def _read() -> str:
+                reader = PdfReader(str(path))
+                if reader.is_encrypted:
+                    try:
+                        reader.decrypt("")
+                    except Exception:
+                        return ""
+                parts: list[str] = []
+                for page in reader.pages:
+                    try:
+                        parts.append(page.extract_text() or "")
+                    except Exception:
+                        continue
+                return "\n".join(p for p in parts if p)
+
+            text = await asyncio.wait_for(run_in_pipeline(_read), timeout=60)
+            text = (text or "").strip()
+            return text if len(text) > 10 else None
+        except asyncio.TimeoutError:
+            logger.warning("pypdf extraction timed out", path=str(path))
+            return None
+        except Exception as e:
+            logger.debug("pypdf extraction failed", path=str(path), error=str(e))
+            return None
+
+    async def _try_zip_listing_extraction(self, path: Path) -> str | None:
+        """Build a searchable text body for a ZIP from its entry list,
+        plus the contents of any small text-like inner files (README,
+        .md, .txt, .json, .yaml, manifests, plists). The entry list
+        alone is meaningful: `VSCode-darwin-universal.zip` indexed as
+        "VSCode.app/Contents/MacOS/Code Helper..." actually surfaces
+        the right file when the user searches for "VSCode".
+        """
+        try:
+            from cosma_backend.pipeline_executor import run_in_pipeline
+
+            text_exts = {
+                ".txt", ".md", ".markdown", ".rst", ".json", ".yaml",
+                ".yml", ".xml", ".plist", ".cfg", ".ini", ".toml",
+                ".html", ".htm", ".csv",
+            }
+            readme_names = {"readme", "license", "notice", "changelog"}
+            # Cap how much we scrape so a giant archive doesn't bloat
+            # the embedding input. ~120 KB of text ≈ 30k tokens, well
+            # under the summarizer's per-chunk budget.
+            max_inner_bytes = 120 * 1024
+            max_entries_listed = 800
+
+            def _walk() -> str:
+                with zipfile.ZipFile(path) as zf:
+                    names = zf.namelist()
+                    listing = "\n".join(names[:max_entries_listed])
+                    if len(names) > max_entries_listed:
+                        listing += f"\n... and {len(names) - max_entries_listed} more entries"
+
+                    inner_chunks: list[str] = []
+                    remaining = max_inner_bytes
+                    for info in zf.infolist():
+                        if remaining <= 0 or info.is_dir():
+                            continue
+                        name = info.filename
+                        ext = Path(name).suffix.lower()
+                        stem = Path(name).stem.lower()
+                        if not (ext in text_exts or stem in readme_names):
+                            continue
+                        if info.file_size > remaining:
+                            continue
+                        try:
+                            with zf.open(info) as f:
+                                raw = f.read(remaining)
+                            chunk = raw.decode("utf-8", errors="replace")
+                            inner_chunks.append(f"--- {name} ---\n{chunk}")
+                            remaining -= len(raw)
+                        except Exception:
+                            continue
+                    body = (
+                        f"Archive: {path.name}\n"
+                        f"Entries ({len(names)}):\n{listing}\n"
+                    )
+                    if inner_chunks:
+                        body += "\nInner text files:\n" + "\n".join(inner_chunks)
+                    return body
+
+            text = await asyncio.wait_for(run_in_pipeline(_walk), timeout=30)
+            return text if text and len(text.strip()) > 10 else None
+        except asyncio.TimeoutError:
+            logger.warning("ZIP listing timed out", path=str(path))
+            return None
+        except zipfile.BadZipFile:
+            logger.debug("ZIP is malformed; listing skipped", path=str(path))
+            return None
+        except Exception as e:
+            logger.debug("ZIP listing failed", path=str(path), error=str(e))
+            return None
+
     def set_extraction_strategy(self, strategy: str) -> None:
         """
         Set extraction strategy.
@@ -514,6 +717,24 @@ def _audio_metadata_placeholder(path: Path) -> str:
         f"Audio file: {path.name}\n"
         f"Type: {path.suffix.lower().lstrip('.')} audio, {size_str}.\n"
         f"No speech transcript could be extracted ({reason})."
+    )
+
+
+def _generic_metadata_placeholder(path: Path, reason: str) -> str:
+    """Build a minimal text body for a file when every parser came back
+    empty. Indexes the file by name, extension, and size so it remains
+    findable in semantic search even though we have no real content.
+    Mirrors the audio/video placeholders so the metadata-only path is
+    consistent across formats.
+    """
+    try:
+        size_str = _human_size(path.stat().st_size)
+    except OSError:
+        size_str = "unknown size"
+    return (
+        f"File: {path.name}\n"
+        f"Type: {path.suffix.lower().lstrip('.') or 'unknown'}, {size_str}.\n"
+        f"No textual content could be extracted ({reason})."
     )
 
 
