@@ -39,6 +39,17 @@ class OllamaConfig:
 class OnlineConfig:
     model: str = "openai/gpt-4.1-nano-2025-04-14"
     context_length: int = 128000
+    # OpenAI-compatible API endpoint. Default points at OpenAI's hosted
+    # API; override to https://api.together.ai/v1, https://api.groq.com/openai/v1,
+    # http://localhost:1234/v1 (LM Studio), etc. for compatible providers.
+    # Empty string means "use litellm's default for the model's prefix"
+    # (e.g. "openai/..." → api.openai.com).
+    base_url: str = ""
+    # API key for the configured base_url. When set, we install it into
+    # OPENAI_API_KEY at summarizer init so litellm picks it up.
+    # Empty string means "fall back to whatever's in the environment"
+    # (the historical behavior — OPENAI_API_KEY exported before launch).
+    api_key: str = ""
 
 
 @dataclass

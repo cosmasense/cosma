@@ -1,6 +1,6 @@
 [project]
 name = "cosma-tui"
-version = "1.0.8"
+version = "1.1.0"
 description = "Cosma TUI"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -155,15 +155,31 @@ class OnlineSummarizer(BaseSummarizer):
             self.litellm_available = False
             raise ImportError("litellm package is not installed")
 
-        # Set API key if provided
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
+        # API key precedence: explicit ctor arg > config.online.api_key
+        # > pre-existing env. We export to OPENAI_API_KEY because that's
+        # the env litellm checks for OpenAI-style routes; for other
+        # providers (anthropic/, gemini/) the original env vars still
+        # win when no override is supplied.
+        resolved_key = api_key or self.config.online.api_key
+        if resolved_key:
+            os.environ["OPENAI_API_KEY"] = resolved_key
 
-        logger.info("Online summarizer initialized", model=self.model, max_tokens=self.max_tokens)
+        # Custom OpenAI-compatible endpoint (Together/Groq/LM Studio/etc.).
+        # Stored on self so _get_ai_response can pass it as api_base to
+        # the litellm call. Empty string → use the provider default for
+        # the model's prefix.
+        self.base_url = self.config.online.base_url
+
+        logger.info("Online summarizer initialized", model=self.model, max_tokens=self.max_tokens, base_url=self.base_url or "(default)")
 
     async def is_available(self) -> bool:
         """Check if online models are available."""
-        # Check for required API keys based on model
+        # Custom OpenAI-compatible endpoint configured: only require an
+        # API key (the model name is provider-specific so we can't infer
+        # which env var to check).
+        if self.base_url:
+            return bool(os.getenv("OPENAI_API_KEY") or self.config.online.api_key)
+        # Check for required API keys based on model prefix.
         if self.model.startswith("gpt-") or self.model.startswith("o1-"):
             return bool(os.getenv("OPENAI_API_KEY"))
         elif self.model.startswith("claude-"):
@@ -180,7 +196,11 @@ class OnlineSummarizer(BaseSummarizer):
         if images:
             user_message["images"] = images
 
-        response = await litellm.acompletion(
+        # Build kwargs once so we can conditionally inject api_base for
+        # OpenAI-compatible custom endpoints (Together, Groq, LM Studio,
+        # vLLM, etc.). Passing api_base="" would cause litellm to try
+        # connecting to the empty URL, so only include it when set.
+        completion_kwargs: dict = dict(
             model=self.model,
             messages=[
                 {"role": "system", "content": self._get_system_prompt(
@@ -198,6 +218,9 @@ class OnlineSummarizer(BaseSummarizer):
             timeout=120,
             max_retries=2,
         )
+        if self.base_url:
+            completion_kwargs["api_base"] = self.base_url
+        response = await litellm.acompletion(**completion_kwargs)
 
         return response.choices[0].message.content
 
