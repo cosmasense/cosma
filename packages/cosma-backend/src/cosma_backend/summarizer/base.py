@@ -84,22 +84,21 @@ class BaseSummarizer(ABC):
         """Prepare images for vision analysis.
 
         Includes the file itself (if an image) plus any extra_images (e.g., video frames).
-        HEIC/HEIF files are transcoded to JPEG before base64-encoding so the
-        vision model never sees a format it can't decode — even if the
-        downstream library (llama-cpp-python's mtmd handler) didn't
-        register pillow-heif in its own process.
+        Every image — not just HEIC — round-trips through Pillow before
+        base64-encoding. Why: llama-cpp-python's mtmd handler also calls
+        PIL.Image.open() on the bytes, and dies with
+        `cannot identify image file <BytesIO ...>` for truncated/scraped
+        JPEGs (real failures we hit on manga page scans). Pre-validating
+        with LOAD_TRUNCATED_IMAGES=True lets us either re-encode a clean
+        JPEG, or return None (skip vision, text-only summary) — same
+        graceful-degrade shape as the HEIC path.
         """
         images = []
 
         if file_metadata.content_type and file_metadata.content_type.startswith("image"):
-            ext = file_metadata.path.suffix.lower()
-            if ext in (".heic", ".heif"):
-                jpeg_b64 = self._transcode_heic_to_jpeg_b64(file_metadata.path)
-                if jpeg_b64:
-                    images.append(jpeg_b64)
-            else:
-                with open(file_metadata.path, 'rb') as f:
-                    images.append(base64.b64encode(f.read()).decode('utf-8'))
+            jpeg_b64 = self._transcode_to_jpeg_b64(file_metadata.path)
+            if jpeg_b64:
+                images.append(jpeg_b64)
 
         if file_metadata.extra_images:
             for frame_bytes in file_metadata.extra_images:
@@ -108,22 +107,32 @@ class BaseSummarizer(ABC):
         return images
 
     @staticmethod
-    def _transcode_heic_to_jpeg_b64(path) -> str | None:
-        """Decode a HEIC/HEIF file via Pillow (with pillow-heif registered)
-        and re-encode as JPEG, returning a base64 string. Returns None if
-        decoding fails — the caller treats that as "no image attached" so
-        the summarizer falls back to a text-only pass instead of erroring.
+    def _transcode_to_jpeg_b64(path) -> str | None:
+        """Decode any image format Pillow understands and re-encode as
+        JPEG, returning a base64 string. Returns None if decoding fails
+        — the caller treats that as "no image attached" so the summarizer
+        falls back to a text-only pass instead of erroring.
+
+        LOAD_TRUNCATED_IMAGES is enabled so a partially-downloaded JPEG
+        still yields whatever pixels are present (the failing manga
+        scans look exactly like this — truncated by an interrupted
+        scraper). MAX_IMAGE_PIXELS=None disables Pillow's decompression
+        bomb guard because user-owned files are trusted; we'd rather
+        process a giant scan than skip it.
         """
         try:
-            from PIL import Image
+            from PIL import Image, ImageFile
+            ImageFile.LOAD_TRUNCATED_IMAGES = True
+            Image.MAX_IMAGE_PIXELS = None
             with Image.open(path) as img:
+                # JPEG can't store alpha or palette; convert blindly to RGB.
                 rgb = img.convert("RGB")
                 buf = io.BytesIO()
                 rgb.save(buf, format="JPEG", quality=85)
                 return base64.b64encode(buf.getvalue()).decode("utf-8")
         except Exception as e:
             logger.warning(
-                "HEIC transcode to JPEG failed; vision skipped",
+                "Image decode to JPEG failed; vision skipped",
                 path=str(path), error=str(e),
             )
             return None
