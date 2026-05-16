@@ -428,7 +428,7 @@ class Pipeline:
                             file=file.file_path,
                             saved_status=resume_status.name)
 
-            # Metadata-only after a parse attempt. Two sub-cases:
+            # Metadata-only after a parse attempt. Four sub-cases:
             #   * partial_kind="parser_failed" (codec issue, no
             #     transcript, ffmpeg missing): final status = FAILED.
             #     The Failed tab is the right place — the user can
@@ -437,7 +437,14 @@ class Pipeline:
             #     because we short-circuited before parse, but if a
             #     parser somehow set metadata_only on a user-elected
             #     file, honor the user's choice (status=INDEXED_PARTIAL).
-            # In both sub-cases, embed the available metadata so the
+            #   * partial_kind="oversize": file beyond the parse limit.
+            #     Status=INDEXED_PARTIAL — by-design, not a failure;
+            #     the user shouldn't see a 60 GB Blu-ray remux in the
+            #     Failed tab.
+            #   * partial_kind="no_content": every extractor returned
+            #     empty (blank PDF, etc.). Status=INDEXED_PARTIAL —
+            #     the parser succeeded, the document was just empty.
+            # In all sub-cases, embed the available metadata so the
             # file is searchable by name; skip the LLM summary so we
             # don't generate fake "summaries" of placeholder text.
             if file.metadata_only:
@@ -469,7 +476,12 @@ class Pipeline:
                         "Metadata-only embed failed; persisting without vectors",
                         file=file.file_path, error=str(embed_err),
                     )
-                if file.partial_kind == "user_elected":
+                # By-design partial outcomes get INDEXED_PARTIAL so they
+                # don't pollute the Failed tab. Only genuine failures
+                # (parser_failed: codec issue, no transcript) remain
+                # FAILED.
+                _BY_DESIGN_PARTIAL = {"user_elected", "oversize", "no_content"}
+                if file.partial_kind in _BY_DESIGN_PARTIAL:
                     file.status = ProcessingStatus.INDEXED_PARTIAL
                     file.processing_error = file.metadata_only_reason
                     await self._save_to_db(file)

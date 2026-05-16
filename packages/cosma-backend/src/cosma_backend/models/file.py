@@ -78,25 +78,34 @@ class File:
     # Used to pass video frames to the summarizer for vision analysis
     extra_images: Optional[List[bytes]] = None  # JPEG-encoded frames
     # True when the file is taking the embed-only path (no LLM
-    # summary). Two distinct reasons trigger this — distinguished by
+    # summary). Four distinct reasons trigger this — distinguished by
     # `partial_kind` below:
-    #   * "parser_failed": the parser could only build a synthetic
-    #     metadata placeholder (codec unsupported, no transcript,
-    #     ffmpeg missing). Final status = FAILED, surfaces in Failed
-    #     tab so the user can debug.
+    #   * "parser_failed": the parser actually failed (codec
+    #     unsupported even after H.264 transcode, no transcript and
+    #     no frames, ffmpeg missing). Final status = FAILED,
+    #     surfaces in Failed tab so the user can debug.
     #   * "user_elected": the user-configured filter classified this
     #     file as metadata-only. Final status = INDEXED_PARTIAL —
-    #     this is intentional, not a failure. Surfaces in its own
-    #     count, never in Failed.
-    # In both cases the file gets an embedding (filename + available
-    # metadata) so semantic search can still surface it.
+    #     this is intentional, not a failure.
+    #   * "oversize": file exceeds parser.max_file_size_mb. We
+    #     deliberately don't transcode/OCR a 60 GB Blu-ray remux;
+    #     name + metadata is all the user can ever search by anyway.
+    #     Final status = INDEXED_PARTIAL — by-design partial, not a
+    #     failure.
+    #   * "no_content": every extractor returned empty content (truly
+    #     blank PDF, password-only DOCX with no body text, etc.).
+    #     The parser ran cleanly — there just wasn't anything to
+    #     extract. Final status = INDEXED_PARTIAL — by-design partial,
+    #     not a failure.
+    # In all four cases the file gets an embedding (filename +
+    # available metadata) so semantic search can still surface it.
     metadata_only: bool = False
     # Human-readable explanation. Surfaced as processing_error on the
     # row so the user can see *why* a file is partial.
     metadata_only_reason: Optional[str] = None
     # Distinguishes which final status the pipeline should write. See
     # the docstring on `metadata_only` for what each value means.
-    # Values: "parser_failed" | "user_elected" | None.
+    # Values: "parser_failed" | "user_elected" | "oversize" | "no_content" | None.
     partial_kind: Optional[str] = None
     
     @classmethod

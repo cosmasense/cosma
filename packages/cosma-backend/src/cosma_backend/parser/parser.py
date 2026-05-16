@@ -184,7 +184,7 @@ class FileParser:
             )
             file.metadata_only = True
             if file.partial_kind is None:
-                file.partial_kind = "parser_failed"
+                file.partial_kind = "oversize"
             file.metadata_only_reason = error_msg
             log_failed_file(
                 file_path=str(path),
@@ -362,7 +362,7 @@ class FileParser:
                 file.content = _generic_metadata_placeholder(path, error_msg)
                 file.metadata_only = True
                 if file.partial_kind is None:
-                    file.partial_kind = "parser_failed"
+                    file.partial_kind = "no_content"
                 file.metadata_only_reason = error_msg
                 # Local failure telemetry — no-op outside COSMA_DEV. Once
                 # we have a remote endpoint, this is the single chokepoint
