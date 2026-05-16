@@ -347,7 +347,17 @@ class FileParser:
                 #   * carries a structured error message for telemetry.
                 # The pipeline (pipeline.py:443) handles the FAILED+embed
                 # routing once metadata_only=True is set.
-                error_msg = "All extraction methods failed or returned empty content"
+                #
+                # The reason string is honest about which case this is:
+                # blank documents ("Blank 3.pdf") aren't really failures
+                # — the extraction succeeded, the document just had no
+                # content. The user sees these in the Failed tab today
+                # alongside genuine crashes, which is misleading.
+                error_msg = (
+                    "No extractable text or images "
+                    "(document appears empty or unreadable); "
+                    "indexed by filename only"
+                )
                 logger.warning(error_msg, file_path=str(path))
                 file.content = _generic_metadata_placeholder(path, error_msg)
                 file.metadata_only = True

@@ -3,7 +3,7 @@
 Two real failures motivated this:
   * `markitdown[docx,pdf,pptx]` was missing the `xlsx,xls` extras, so
     every Excel workbook came back empty from MarkItDown and got logged
-    as "All extraction methods failed or returned empty content".
+    as "No extractable text or images (document appears empty)".
   * Even with the extras in place, some workbooks return empty from
     MarkItDown's converter (formula-only sheets with no cached values,
     legacy encodings). A lightweight openpyxl fallback is the safety net.
