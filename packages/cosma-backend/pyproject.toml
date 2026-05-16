@@ -15,7 +15,11 @@ dependencies = [
     "imageio-ffmpeg>=0.5.0",
     "litellm>=1.77.5",
     "llama-cpp-python>=0.3.0",
-    "markitdown[docx,pdf,pptx]>=0.1.4",
+    # xlsx/xls extras pull in openpyxl + xlrd so MarkItDown can read
+    # Excel workbooks. Without these, every .xlsx silently came back
+    # empty and ended up in the Failed tab as "All extraction methods
+    # failed or returned empty content".
+    "markitdown[docx,pdf,pptx,xlsx,xls]>=0.1.4",
     # Pure-Python tag reader for audio files (ID3 for mp3, MP4 atoms for
     # m4a/aac, Vorbis for flac/ogg). When whisper finds no speech in a
     # music track, the file's embedded artist/title/album tags are still

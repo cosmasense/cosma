@@ -289,6 +289,21 @@ class FileParser:
                                 filename=path.name,
                                 content_length=len(pypdf_text))
 
+            # Strategy 5b: XLSX fallback via openpyxl. Some workbooks return
+            # empty from MarkItDown's converter (legacy encodings, malformed
+            # shared-strings table, password-locked-but-readable, sheets that
+            # are 100% formulas with no cached values). Lists sheet names +
+            # any non-empty cell text — at minimum the file becomes findable
+            # by sheet titles. openpyxl ships with markitdown[xlsx].
+            if not extracted_content and path.suffix.lower() in (".xlsx", ".xlsm"):
+                xlsx_text = await self._try_xlsx_extraction(path)
+                if xlsx_text:
+                    extracted_content = xlsx_text
+                    extraction_method = "openpyxl"
+                    logger.info("EXTRACTION: openpyxl fallback successful",
+                                filename=path.name,
+                                content_length=len(xlsx_text))
+
             # Strategy 6: ZIP listing — when MarkItDown can't text-extract
             # an archive (binary app/font bundles), enumerate entry names
             # and pull readable text from any inner README/.txt/.md/.json.
@@ -576,6 +591,72 @@ class FileParser:
             return None
         except Exception as e:
             logger.debug("pypdf extraction failed", path=str(path), error=str(e))
+            return None
+
+    async def _try_xlsx_extraction(self, path: Path) -> str | None:
+        """Last-resort XLSX text scrape via openpyxl. MarkItDown's xlsx
+        converter sometimes returns empty (formula-only sheets with no
+        cached values, malformed shared-strings tables, encoding quirks);
+        openpyxl can usually still list sheet names and read cell text.
+        Returns None on any failure — caller falls through to metadata-only.
+        openpyxl comes in via MarkItDown[xlsx], no new dep.
+
+        Output is structured per sheet so a user searching for a sheet
+        name like "Midterm" matches even when the cells themselves are
+        all numbers.
+        """
+        try:
+            from openpyxl import load_workbook
+            from cosma_backend.pipeline_executor import run_in_pipeline
+
+            # Per-cell text cap keeps a single pathological cell from
+            # eating the entire token budget; per-sheet cap keeps a
+            # 1000-row data sheet from drowning everything else.
+            MAX_CELL_CHARS = 500
+            MAX_SHEET_CHARS = 50_000
+
+            def _read() -> str:
+                # data_only=True returns cached formula results instead of
+                # the formula expression itself — usually what the user
+                # wants to search by. read_only streams rows, so we don't
+                # load a 100MB workbook into memory.
+                wb = load_workbook(
+                    str(path), data_only=True, read_only=True
+                )
+                parts: list[str] = []
+                for sheet_name in wb.sheetnames:
+                    parts.append(f"# Sheet: {sheet_name}")
+                    ws = wb[sheet_name]
+                    sheet_chars = 0
+                    for row in ws.iter_rows(values_only=True):
+                        cells = []
+                        for value in row:
+                            if value is None:
+                                continue
+                            text = str(value).strip()
+                            if not text:
+                                continue
+                            if len(text) > MAX_CELL_CHARS:
+                                text = text[:MAX_CELL_CHARS] + "…"
+                            cells.append(text)
+                        if cells:
+                            line = "\t".join(cells)
+                            parts.append(line)
+                            sheet_chars += len(line)
+                            if sheet_chars > MAX_SHEET_CHARS:
+                                parts.append("…(sheet truncated)")
+                                break
+                wb.close()
+                return "\n".join(parts)
+
+            text = await asyncio.wait_for(run_in_pipeline(_read), timeout=60)
+            text = (text or "").strip()
+            return text if len(text) > 10 else None
+        except asyncio.TimeoutError:
+            logger.warning("openpyxl extraction timed out", path=str(path))
+            return None
+        except Exception as e:
+            logger.debug("openpyxl extraction failed", path=str(path), error=str(e))
             return None
 
     async def _try_zip_listing_extraction(self, path: Path) -> str | None:
