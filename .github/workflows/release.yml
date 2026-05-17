@@ -101,21 +101,26 @@ jobs:
               "$1"
           }
 
-          # Sign every Mach-O file inside the bundle (dylibs + .so first,
-          # then everything else identified by `file`). Innermost-first
-          # is what `codesign` expects.
-          while IFS= read -r -d '' f; do
-            if file "$f" | grep -q "Mach-O"; then
-              sign "$f"
-            fi
-          done < <(find dist/cosma -type f \
-                     \( -name "*.dylib" -o -name "*.so" \) -print0)
-
-          while IFS= read -r -d '' f; do
-            if file "$f" | grep -q "Mach-O" && ! codesign -d "$f" >/dev/null 2>&1; then
-              sign "$f"
-            fi
-          done < <(find dist/cosma -type f -perm +111 -print0)
+          # Find every Mach-O file in the bundle and sign it with our
+          # Developer ID — regardless of extension, executable bit, or any
+          # pre-existing upstream signature (imageio-ffmpeg, torch protoc,
+          # Python.framework's inner dylib all come pre-signed by their
+          # original packager, which Apple's notary rejects). `--force`
+          # overwrites those signatures.
+          #
+          # Sort deepest-first so inner dylibs are signed before any
+          # container that references them.
+          while IFS= read -r f; do
+            sign "$f"
+          done < <(
+            find dist/cosma -type f -print0 \
+              | xargs -0 file \
+              | grep -E "Mach-O (64-bit )?(executable|bundle|dynamically linked shared library)" \
+              | cut -d: -f1 \
+              | awk '{print gsub("/","/",$0), $0}' \
+              | sort -rn -k1,1 \
+              | cut -d' ' -f2-
+          )
 
           # Sign the outer executable last.
           sign dist/cosma/cosma
