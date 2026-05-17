@@ -410,7 +410,7 @@ wheels = [
 
 [[package]]
 name = "cosma"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "click-help-colors" },
@@ -450,7 +450,7 @@ dev = [
 
 [[package]]
 name = "cosma-backend"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "packages/cosma-backend" }
 dependencies = [
     { name = "asqlite" },
@@ -554,7 +554,7 @@ test = [
 
 [[package]]
 name = "cosma-client"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "packages/cosma-client" }
 dependencies = [
     { name = "niquests" },
@@ -565,7 +565,7 @@ requires-dist = [{ name = "niquests", specifier = ">=3.15.2" }]
 
 [[package]]
 name = "cosma-tui"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "packages/cosma-tui" }
 dependencies = [
     { name = "cosma-client" },

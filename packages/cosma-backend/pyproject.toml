@@ -1,6 +1,6 @@
 [project]
 name = "cosma-backend"
-version = "1.1.0"
+version = "1.1.1"
 description = "Cosma backend"
 readme = "README.md"
 requires-python = ">=3.12"
