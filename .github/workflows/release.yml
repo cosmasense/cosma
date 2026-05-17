@@ -10,19 +10,171 @@ permissions:
   contents: write
 
 jobs:
-  build-python-packages:
-    runs-on: ubuntu-latest
+  build-macos-binary:
+    # macos-latest currently == Apple Silicon (arm64). This produces
+    # `cosma-macos-arm64.tar.gz`. If we ever ship x86_64, add a matrix.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
-      
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install CMake (needed by C-extension wheels)
+        run: brew install cmake
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Build binary with PyInstaller
+        run: uv run pyinstaller --noconfirm cosma.spec
+
+      # ----- Signing + notarization -----
+      #
+      # Required GitHub Actions secrets:
+      #   MACOS_CERT_P12_BASE64    base64 of the Developer ID Application .p12
+      #   MACOS_CERT_PASSWORD      password used when exporting that .p12
+      #   MACOS_KEYCHAIN_PASSWORD  any string — used for the ephemeral keychain
+      #   MACOS_SIGNING_IDENTITY   e.g. "Developer ID Application: Caleb Hamilton (TEAMID)"
+      #   APPLE_ID                 Apple ID email used for notarization
+      #   APPLE_TEAM_ID            10-char team ID
+      #   APPLE_APP_PASSWORD       app-specific password for notarytool
+      - name: Import signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$MACOS_CERT_P12_BASE64" | base64 -d > /tmp/cert.p12
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import /tmp/cert.p12 -k build.keychain \
+            -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s build.keychain login.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          rm /tmp/cert.p12
+
+      - name: Sign Mach-O binaries with hardened runtime
+        env:
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+
+          # Entitlements needed for a PyInstaller-bundled Python stack:
+          # - allow-jit + allow-unsigned-executable-memory: torch / llama.cpp
+          # - disable-library-validation: we load dylibs not signed by us
+          # - allow-dyld-environment-variables: PyInstaller's bootloader uses
+          #   DYLD_LIBRARY_PATH-style env vars to find bundled libs.
+          cat > /tmp/entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          sign() {
+            codesign --force --timestamp --options runtime \
+              --entitlements /tmp/entitlements.plist \
+              --sign "$SIGNING_IDENTITY" \
+              "$1"
+          }
+
+          # Sign every Mach-O file inside the bundle (dylibs + .so first,
+          # then everything else identified by `file`). Innermost-first
+          # is what `codesign` expects.
+          while IFS= read -r -d '' f; do
+            if file "$f" | grep -q "Mach-O"; then
+              sign "$f"
+            fi
+          done < <(find dist/cosma -type f \
+                     \( -name "*.dylib" -o -name "*.so" \) -print0)
+
+          while IFS= read -r -d '' f; do
+            if file "$f" | grep -q "Mach-O" && ! codesign -d "$f" >/dev/null 2>&1; then
+              sign "$f"
+            fi
+          done < <(find dist/cosma -type f -perm +111 -print0)
+
+          # Sign the outer executable last.
+          sign dist/cosma/cosma
+
+          codesign --verify --strict --verbose=2 dist/cosma/cosma
+
+      - name: Notarize bundle
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd dist
+          # notarytool wants a ditto zip for directory bundles.
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent cosma cosma-notarize.zip
+
+          # Capture the submission ID so we can fetch the log on failure.
+          submission_json=$(xcrun notarytool submit cosma-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --output-format json --wait)
+          echo "$submission_json"
+          status=$(echo "$submission_json" | python3 -c "import sys,json;print(json.load(sys.stdin)['status'])")
+          if [ "$status" != "Accepted" ]; then
+            sid=$(echo "$submission_json" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+            echo "Notarization failed, fetching log for $sid:"
+            xcrun notarytool log "$sid" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD"
+            exit 1
+          fi
+          rm cosma-notarize.zip
+
+      - name: Create distribution archive
+        run: |
+          cd dist
+          tar -czf cosma-macos-arm64.tar.gz cosma/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binary
+          path: dist/cosma-macos-arm64.tar.gz
+
+  build-python-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
       - name: Build all packages
         run: uv build --all-packages
-      
+
       - uses: actions/upload-artifact@v4
         with:
           name: python-packages
@@ -41,18 +193,21 @@ jobs:
         with:
           name: python-packages
           path: dist
-      
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
 
   create-release:
+    # Decoupled from the slow macOS build so the release page appears
+    # within ~3 min of pushing the tag. The signed binary is attached
+    # later by upload-macos-asset.
     runs-on: ubuntu-latest
     needs: publish-to-pypi
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -60,3 +215,25 @@ jobs:
           gh release create ${{ github.ref_name }} \
             --title "${{ github.ref_name }}" \
             --generate-notes
+
+  upload-macos-asset:
+    # Attaches the signed + notarized macOS binary to the release once
+    # both the release exists and the build has finished. Independent
+    # from create-release; if signing fails you can re-run just this
+    # job (and build-macos-binary) without touching the release page.
+    runs-on: ubuntu-latest
+    needs: [build-macos-binary, create-release]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-binary
+          path: artifacts
+
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            artifacts/cosma-macos-arm64.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
