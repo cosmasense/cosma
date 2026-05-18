@@ -800,6 +800,56 @@ class Database:
             logger.info("Keyword search completed", count=len(results))
             return results
 
+    async def applications_keyword_search(
+        self,
+        query: str,
+        limit: int = 20,
+        allow_operators: bool = False,
+    ) -> list[tuple["Application", float]]:
+        """FTS5 keyword search against the applications table.
+
+        Same shape as ``keyword_search`` but hits ``applications_fts``
+        (display_name, bundle_id, category, description, use_cases).
+        Returns positive relevance scores (abs of BM25) so the
+        downstream RRF merge treats higher = better consistently with
+        the files path.
+        """
+        from cosma_backend.models.application import Application
+        from cosma_backend.searcher.fts5_query import parse_fts5_query
+
+        sanitized_query = parse_fts5_query(query, allow_operators=allow_operators)
+        if not sanitized_query:
+            return []
+
+        SQL = """
+        SELECT
+            a.*,
+            bm25(applications_fts) AS relevance_score
+        FROM applications_fts fts
+        JOIN applications a ON a.id = fts.rowid
+        WHERE applications_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?;
+        """
+        params = (sanitized_query, limit)
+
+        async with self.acquire() as conn:
+            try:
+                async with conn.execute(SQL, params) as cursor:
+                    rows = await cursor.fetchall()
+            except Exception as e:
+                logger.error("Applications FTS query failed",
+                              error=str(e), query=sanitized_query)
+                raise
+
+            results: list[tuple[Application, float]] = []
+            for row in rows:
+                app = Application.from_row(row)
+                results.append((app, abs(row["relevance_score"])))
+            logger.info("Applications keyword search completed",
+                         count=len(results))
+            return results
+
     async def get_fts5_suggestions(self, prefix: str, limit: int = 10) -> list[str]:
         """
         Get autocomplete suggestions using FTS5 prefix matching.

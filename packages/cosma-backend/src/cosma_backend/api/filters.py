@@ -25,6 +25,17 @@ filters_bp = Blueprint('filters', __name__)
 # ============================================================================
 
 @dataclass
+class TierRuleDTO:
+    """One row in the tier table over the wire.
+
+    `tier` is the string value of `filter.tier_rules.Tier`:
+    "full" | "semantic_name" | "literal_name".
+    """
+    pattern: str
+    tier: str
+
+
+@dataclass
 class FilterConfigResponse:
     """Response containing filter configuration."""
     version: int
@@ -41,6 +52,14 @@ class FilterConfigResponse:
     # only (no LLM summary). Status = INDEXED_PARTIAL.
     metadata_only_patterns: list[str]
     config_path: str
+    # v5: declarative tier rules. Empty list means "use the curated
+    # defaults" (see filter.tier_rules.DEFAULT_TIER_RULES) — the UI
+    # surfaces a Reset button that saves []. The defaults themselves
+    # are exposed separately via `default_tier_rules` so the editor
+    # can preview them before the user picks a customization.
+    tier_rules: list[TierRuleDTO]
+    default_tier_rules: list[TierRuleDTO]
+    large_file_downgrade_mb: int
 
 
 @dataclass
@@ -57,6 +76,11 @@ class UpdateFilterConfigRequest:
     whitelist_exclude: Optional[list[str]] = None
     # v3: metadata-only patterns
     metadata_only_patterns: Optional[list[str]] = None
+    # v5: tier rules + size-downgrade cap. None means "no change";
+    # an explicit empty list means "use the defaults" — the
+    # round-trip is symmetric with the response semantics.
+    tier_rules: Optional[list[TierRuleDTO]] = None
+    large_file_downgrade_mb: Optional[int] = None
     # Control whether to apply changes immediately
     apply_immediately: bool = True  # If False, just update config without cleaning DB
 
@@ -122,6 +146,42 @@ class RemovePatternResponse:
 
 
 # ============================================================================
+# Helpers
+# ============================================================================
+
+
+def _tier_rules_dto(rules) -> list[TierRuleDTO]:
+    return [TierRuleDTO(pattern=r.pattern, tier=r.tier.value) for r in rules]
+
+
+def _config_to_response(config) -> FilterConfigResponse:
+    """Map a FilterConfig (the source of truth) to the API response.
+
+    Centralized because the same conversion happens in GET /config,
+    PUT /config (success path), and POST /reset. Surfacing the tier
+    defaults alongside the current rules lets the UI render a
+    "reset" affordance without a second round-trip.
+    """
+    from cosma_backend.filter import default_tier_rules
+
+    return FilterConfigResponse(
+        version=config.version,
+        mode=config.mode.value,
+        exclude=config.exclude,
+        include=config.include,
+        blacklist_exclude=config.blacklist_exclude,
+        blacklist_include=config.blacklist_include,
+        whitelist_include=config.whitelist_include,
+        whitelist_exclude=config.whitelist_exclude,
+        metadata_only_patterns=config.metadata_only_patterns,
+        config_path=str(config.config_path) if config.config_path else "",
+        tier_rules=_tier_rules_dto(config.tier_rules),
+        default_tier_rules=_tier_rules_dto(default_tier_rules()),
+        large_file_downgrade_mb=config.large_file_downgrade_mb,
+    )
+
+
+# ============================================================================
 # Endpoints
 # ============================================================================
 
@@ -137,21 +197,7 @@ async def get_filter_config() -> tuple[FilterConfigResponse, int]:
         200: Current filter configuration with mode-specific patterns
     """
     config = current_app.filter_manager.global_config
-
-    return FilterConfigResponse(
-        version=config.version,
-        mode=config.mode.value,
-        # Legacy fields for backward compatibility
-        exclude=config.exclude,
-        include=config.include,
-        # Mode-specific patterns
-        blacklist_exclude=config.blacklist_exclude,
-        blacklist_include=config.blacklist_include,
-        whitelist_include=config.whitelist_include,
-        whitelist_exclude=config.whitelist_exclude,
-        metadata_only_patterns=config.metadata_only_patterns,
-        config_path=str(config.config_path) if config.config_path else "",
-    ), 200
+    return _config_to_response(config), 200
 
 
 @filters_bp.put("/config")
@@ -184,20 +230,28 @@ async def update_filter_config(data: UpdateFilterConfigRequest) -> tuple[UpdateF
             return UpdateFilterConfigResponse(
                 success=False,
                 message=f"Invalid mode: {data.mode}. Must be 'blacklist' or 'whitelist'",
-                config=FilterConfigResponse(
-                    version=3,
-                    mode="blacklist",
-                    exclude=[],
-                    include=[],
-                    blacklist_exclude=[],
-                    blacklist_include=[],
-                    whitelist_include=[],
-                    whitelist_exclude=[],
-                    metadata_only_patterns=[],
-                    config_path="",
-                ),
+                config=_config_to_response(current_app.filter_manager.global_config),
                 removed_count=0,
             ), 400
+
+    # Translate inbound tier rules DTOs into TierRule dataclasses. A
+    # missing value preserves the existing rules; an explicit empty
+    # list resets to defaults.
+    tier_rules_arg = None
+    if data.tier_rules is not None:
+        from cosma_backend.filter import Tier, TierRule
+        tier_rules_arg = []
+        for r in data.tier_rules:
+            try:
+                tier_rules_arg.append(TierRule(pattern=r.pattern, tier=Tier(r.tier)))
+            except (KeyError, ValueError):
+                return UpdateFilterConfigResponse(
+                    success=False,
+                    message=f"Invalid tier '{r.tier}' for pattern '{r.pattern}'. "
+                            f"Must be 'full', 'semantic_name', or 'literal_name'.",
+                    config=_config_to_response(current_app.filter_manager.global_config),
+                    removed_count=0,
+                ), 400
 
     # Update configuration
     new_config = current_app.filter_manager.update_global_config(
@@ -209,6 +263,8 @@ async def update_filter_config(data: UpdateFilterConfigRequest) -> tuple[UpdateF
         whitelist_include=data.whitelist_include,
         whitelist_exclude=data.whitelist_exclude,
         metadata_only_patterns=data.metadata_only_patterns,
+        tier_rules=tier_rules_arg,
+        large_file_downgrade_mb=data.large_file_downgrade_mb,
     )
 
     # Clean up excluded files from database only if apply_immediately=True
@@ -219,18 +275,7 @@ async def update_filter_config(data: UpdateFilterConfigRequest) -> tuple[UpdateF
     return UpdateFilterConfigResponse(
         success=True,
         message="Filter configuration updated successfully",
-        config=FilterConfigResponse(
-            version=new_config.version,
-            mode=new_config.mode.value,
-            exclude=new_config.exclude,
-            include=new_config.include,
-            blacklist_exclude=new_config.blacklist_exclude,
-            blacklist_include=new_config.blacklist_include,
-            whitelist_include=new_config.whitelist_include,
-            whitelist_exclude=new_config.whitelist_exclude,
-            metadata_only_patterns=new_config.metadata_only_patterns,
-            config_path=str(new_config.config_path) if new_config.config_path else "",
-        ),
+        config=_config_to_response(new_config),
         removed_count=removed_count,
     ), 200
 
@@ -464,8 +509,12 @@ async def get_default_config() -> tuple[FilterConfigResponse, int]:
         "*.dwg", "*.dxf", "*.skp",
     ]
 
+    from cosma_backend.filter import (
+        DEFAULT_LARGE_FILE_DOWNGRADE_MB, default_tier_rules,
+    )
+    defaults = default_tier_rules()
     return FilterConfigResponse(
-        version=3,
+        version=5,
         mode="blacklist",
         exclude=DEFAULT_EXCLUDE_PATTERNS,
         include=DEFAULT_INCLUDE_PATTERNS,
@@ -475,6 +524,12 @@ async def get_default_config() -> tuple[FilterConfigResponse, int]:
         whitelist_exclude=[],
         metadata_only_patterns=[],
         config_path="",
+        # Empty user list signals "uses the defaults" — same encoding
+        # as the on-disk shape; the defaults list itself is surfaced
+        # separately so the editor can show them as suggestions.
+        tier_rules=[],
+        default_tier_rules=_tier_rules_dto(defaults),
+        large_file_downgrade_mb=DEFAULT_LARGE_FILE_DOWNGRADE_MB,
     ), 200
 
 
@@ -501,18 +556,7 @@ async def apply_filter_changes() -> tuple[UpdateFilterConfigResponse, int]:
     return UpdateFilterConfigResponse(
         success=True,
         message=f"Filter changes applied: {removed_count} files removed from index",
-        config=FilterConfigResponse(
-            version=config.version,
-            mode=config.mode.value,
-            exclude=config.exclude,
-            include=config.include,
-            blacklist_exclude=config.blacklist_exclude,
-            blacklist_include=config.blacklist_include,
-            whitelist_include=config.whitelist_include,
-            whitelist_exclude=config.whitelist_exclude,
-            metadata_only_patterns=config.metadata_only_patterns,
-            config_path=str(config.config_path) if config.config_path else "",
-        ),
+        config=_config_to_response(config),
         removed_count=removed_count,
     ), 200
 
@@ -545,18 +589,7 @@ async def reset_to_defaults() -> tuple[UpdateFilterConfigResponse, int]:
     return UpdateFilterConfigResponse(
         success=True,
         message="Filter configuration reset to defaults",
-        config=FilterConfigResponse(
-            version=new_config.version,
-            mode=new_config.mode.value,
-            exclude=new_config.exclude,
-            include=new_config.include,
-            blacklist_exclude=new_config.blacklist_exclude,
-            blacklist_include=new_config.blacklist_include,
-            whitelist_include=new_config.whitelist_include,
-            whitelist_exclude=new_config.whitelist_exclude,
-            metadata_only_patterns=new_config.metadata_only_patterns,
-            config_path=str(new_config.config_path) if new_config.config_path else "",
-        ),
+        config=_config_to_response(new_config),
         removed_count=removed_count,
     ), 200
 

@@ -114,16 +114,19 @@ class SummarizerConfig:
     chunk_overlap_tokens: int = 1000
     max_chunks: int = 10
     idle_unload_seconds: int = 60
-    # "Fast mode": cap every file at exactly one chunk's worth of
-    # summarize work. Trades coverage for throughput — useful for
-    # demos, large-corpus first passes, or low-end Macs where the
-    # full multi-chunk path is too slow. The first chunk usually
-    # carries the document's first ~6k tokens (with the configured
-    # n_ctx) which is enough to produce a reasonable title +
-    # summary + keywords for most files. Long docs end up with a
-    # head-only summary; the partial-coverage note from the budget
-    # logic still applies.
-    fast_mode: bool = False
+    # Fast mode caps every file at exactly one chunk's worth of
+    # summarize work — i.e., the document head (~6k tokens with the
+    # configured n_ctx, enough for a usable title + summary +
+    # keywords for the vast majority of real-world files). Defaulted
+    # on because end-to-end throughput on a typical Documents folder
+    # is several-x higher without a noticeable hit to search
+    # quality: most files are short enough that a "first chunk"
+    # summary IS the whole file. For the long-doc minority, the
+    # partial-coverage annotation already appended to the final
+    # summary keeps coverage honest (see base.py's
+    # `_truncated_chunks_total` branch). Users who want exhaustive
+    # multi-chunk coverage can set this to false in settings.toml.
+    fast_mode: bool = True
     # Per-file wall-clock budget for the summarize stage. Once we
     # exceed this, the summarizer stops dispatching new chunks and
     # finalizes with whatever chunk summaries it already has — the

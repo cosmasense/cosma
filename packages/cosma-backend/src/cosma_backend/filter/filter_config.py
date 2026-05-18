@@ -18,6 +18,12 @@ from typing import Optional, Protocol
 
 from platformdirs import PlatformDirs
 
+from cosma_backend.filter.tier_rules import (
+    DEFAULT_LARGE_FILE_DOWNGRADE_MB,
+    Tier,
+    TierRule,
+    default_tier_rules,
+)
 from cosma_backend.logging import get_logger
 
 logger = get_logger(__name__)
@@ -188,23 +194,48 @@ class FilterConfig:
     whitelist_include: list[str] = field(default_factory=list)
     whitelist_exclude: list[str] = field(default_factory=list)
 
-    # v3: third bucket — metadata-only patterns. Applied AFTER the
-    # exclude/include rules. A file matches this list iff it would
-    # otherwise be FULL-indexed (so excluded files stay excluded).
+    # v3: legacy metadata-only patterns. Kept for backward compatibility
+    # and migration only — new installs use `tier_rules` below. On load,
+    # any patterns here are folded into `tier_rules` as Tier.SEMANTIC_NAME
+    # rules so user-configured metadata-only intent is preserved.
     metadata_only_patterns: list[str] = field(default_factory=list)
+
+    # v4: structural rule — when True (default), discovery skips any
+    # directory that contains a `.git/` subfolder. Source repositories
+    # are typically code/build/checkpoint trees with thousands of
+    # generated files the user did not intend to index when they
+    # pointed cosma at their Documents/projects folder. Honored by
+    # the discoverer's directory walk, not by `classify()` — the
+    # filter pattern system has no way to express "drop the parent
+    # folder if any sibling matches X" without an O(n^2) scan.
+    skip_git_repos: bool = True
+
+    # v5: tier table. The authoritative classifier of how much pipeline
+    # work each file receives. Empty list means "use the defaults"
+    # (see DEFAULT_TIER_RULES in tier_rules.py) — that way a user who
+    # never opens the editor stays on a curated default, and resetting
+    # is just "save with []". Order matters: first matching pattern wins.
+    tier_rules: list[TierRule] = field(default_factory=list)
+    # FULL files larger than this are auto-downgraded to SEMANTIC_NAME.
+    # Lets the tier_rules stay extension-only (one entry per type)
+    # while still expressing the "short clip = transcribe, long movie =
+    # name-only" intuition.
+    large_file_downgrade_mb: int = DEFAULT_LARGE_FILE_DOWNGRADE_MB
 
     # Legacy fields for backward compatibility (deprecated)
     # These are auto-populated based on current mode
     exclude: list[str] = field(default_factory=list)
     include: list[str] = field(default_factory=list)
 
-    version: int = 3  # Bumped to v3 for metadata_only_patterns
+    version: int = 5  # Bumped to v5 for tier_rules
     config_path: Optional[Path] = None
 
     # Cached compiled patterns for performance
     _exclude_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
     _include_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
     _metadata_only_regex: Optional[re.Pattern] = field(default=None, repr=False, compare=False)
+    # Compiled (regex, Tier) list; rebuilt whenever tier_rules changes.
+    _compiled_tier_rules: list[tuple[re.Pattern, Tier]] = field(default_factory=list, repr=False, compare=False)
 
     def __post_init__(self):
         """Compile patterns after initialization."""
@@ -237,6 +268,16 @@ class FilterConfig:
             self._metadata_only_regex = self._patterns_to_regex(self.metadata_only_patterns)
         else:
             self._metadata_only_regex = None
+
+        # Compile the per-rule regexes once so classify_tier is a
+        # constant-time loop over compiled patterns. Empty tier_rules
+        # means "use defaults" — the resolved list comes from
+        # effective_tier_rules() so classify_tier() works on a fresh
+        # FilterConfig() with no on-disk customization.
+        self._compiled_tier_rules = [
+            (re.compile(self._pattern_to_regex(r.pattern), re.IGNORECASE), r.tier)
+            for r in self.effective_tier_rules()
+        ]
 
     @staticmethod
     def _pattern_to_regex(pattern: str) -> str:
@@ -340,6 +381,55 @@ class FilterConfig:
         if regex is None:
             return False
         return regex.search(relative_path) is not None
+
+    def effective_tier_rules(self) -> list[TierRule]:
+        """Return the active tier rules. An empty user list means
+        "fall back to the curated defaults" — that way users on the
+        defaults stay on the defaults across upgrades (when the
+        default list grows, they pick up the new extensions
+        automatically) and "reset to defaults" is just saving []."""
+        return list(self.tier_rules) if self.tier_rules else default_tier_rules()
+
+    def classify_tier(
+        self,
+        file_path: Path,
+        base_path: Path,
+        *,
+        file_size_bytes: Optional[int] = None,
+    ) -> Tier:
+        """Map a file to its indexing tier.
+
+        Matches the filename against the compiled tier_rules in order;
+        first hit wins. Files matched to FULL whose size exceeds
+        `large_file_downgrade_mb` are auto-downgraded to SEMANTIC_NAME
+        (so we don't whisper-transcribe a 3-hour video just because
+        the .mp4 rule said FULL).
+
+        Returns Tier.LITERAL_NAME if nothing matched — defensive
+        floor; the default rule table ends with `*` so this only
+        triggers when the user has deleted every rule.
+        """
+        try:
+            relative_path = str(file_path.relative_to(base_path))
+        except ValueError:
+            relative_path = file_path.name
+        filename = file_path.name
+
+        chosen: Optional[Tier] = None
+        for regex, tier in self._compiled_tier_rules:
+            if regex.search(relative_path) or regex.search(filename):
+                chosen = tier
+                break
+
+        if chosen is None:
+            return Tier.LITERAL_NAME
+
+        if chosen is Tier.FULL and file_size_bytes is not None:
+            limit = self.large_file_downgrade_mb * 1024 * 1024
+            if file_size_bytes > limit:
+                return Tier.SEMANTIC_NAME
+
+        return chosen
 
     def classify(self, file_path: Path, base_path: Path) -> FilterDecision:
         """
@@ -448,8 +538,20 @@ class FilterConfig:
             "blacklist_include": self.blacklist_include,
             "whitelist_include": self.whitelist_include,
             "whitelist_exclude": self.whitelist_exclude,
-            # v3: metadata-only patterns
+            # v3: metadata-only patterns (kept around for downgrade
+            # safety — an older backend reading this file will still
+            # honor them).
             "metadata_only_patterns": self.metadata_only_patterns,
+            # v4: structural toggles
+            "skip_git_repos": self.skip_git_repos,
+            # v5: tier table. Empty list means "use defaults" and is
+            # the most common state — surface it as such so the editor
+            # can show "Defaults" rather than re-listing 70 rules.
+            "tier_rules": [
+                {"pattern": r.pattern, "tier": r.tier.value}
+                for r in self.tier_rules
+            ],
+            "large_file_downgrade_mb": self.large_file_downgrade_mb,
             # Legacy fields for backward compatibility
             "exclude": self.exclude,
             "include": self.include,
@@ -514,13 +616,15 @@ class FilterConfig:
                 blacklist_include = DEFAULT_INCLUDE_PATTERNS.copy()
 
             return cls(
-                version=3,  # Upgrade to current
+                version=5,  # Upgrade straight to current schema
                 mode=mode,
                 blacklist_exclude=blacklist_exclude,
                 blacklist_include=blacklist_include,
                 whitelist_include=whitelist_include,
                 whitelist_exclude=whitelist_exclude,
                 metadata_only_patterns=[],
+                # No tier_rules — first launch uses the curated defaults.
+                tier_rules=[],
                 config_path=config_path,
             )
 
@@ -532,15 +636,50 @@ class FilterConfig:
             logger.info("Migrating filter config from v2 to v3 (added metadata_only_patterns)",
                         path=str(config_path) if config_path else "unknown")
 
-        # Version 2+ format
+        # v4 → v5: metadata_only_patterns becomes Tier B (SEMANTIC_NAME)
+        # rules in the new tier table. The legacy field is preserved
+        # on the way out for downgrade safety.
+        legacy_metadata_only = data.get("metadata_only_patterns", []) or []
+        raw_tier_rules = data.get("tier_rules") or []
+        tier_rules: list[TierRule] = []
+        if raw_tier_rules:
+            for entry in raw_tier_rules:
+                try:
+                    tier_rules.append(TierRule(
+                        pattern=entry["pattern"],
+                        tier=Tier(entry["tier"]),
+                    ))
+                except (KeyError, ValueError) as exc:
+                    logger.warning("Dropping malformed tier rule",
+                                   entry=entry, error=str(exc))
+        elif version <= 4 and legacy_metadata_only:
+            # First migration from a v3/v4 config that had explicit
+            # metadata-only patterns. Fold them in as SEMANTIC_NAME
+            # rules; subsequent saves persist them via tier_rules and
+            # the legacy field becomes informational only.
+            logger.info("Migrating metadata_only_patterns → tier_rules (SEMANTIC_NAME)",
+                        path=str(config_path) if config_path else "unknown",
+                        count=len(legacy_metadata_only))
+            tier_rules = [
+                TierRule(p, Tier.SEMANTIC_NAME) for p in legacy_metadata_only
+            ]
+
+        # Version 2+ format. New keys (added in later versions) fall
+        # back to their dataclass defaults when absent from an older
+        # on-disk config, so the migration is a no-op for existing files.
         return cls(
-            version=max(version, 3),
+            version=max(version, 5),
             mode=mode,
             blacklist_exclude=data.get("blacklist_exclude", []),
             blacklist_include=data.get("blacklist_include", []),
             whitelist_include=data.get("whitelist_include", []),
             whitelist_exclude=data.get("whitelist_exclude", []),
-            metadata_only_patterns=data.get("metadata_only_patterns", []),
+            metadata_only_patterns=legacy_metadata_only,
+            skip_git_repos=data.get("skip_git_repos", True),
+            tier_rules=tier_rules,
+            large_file_downgrade_mb=int(data.get(
+                "large_file_downgrade_mb", DEFAULT_LARGE_FILE_DOWNGRADE_MB
+            )),
             config_path=config_path,
         )
 
@@ -886,6 +1025,11 @@ class FilterConfigManager:
         whitelist_exclude: Optional[list[str]] = None,
         # v3: metadata-only patterns
         metadata_only_patterns: Optional[list[str]] = None,
+        # v5: tier rules + size-downgrade cap. Passing None keeps the
+        # existing value; passing [] (for tier_rules) means "use the
+        # curated defaults" — same semantic as the on-disk encoding.
+        tier_rules: Optional[list[TierRule]] = None,
+        large_file_downgrade_mb: Optional[int] = None,
     ) -> FilterConfig:
         """
         Update the global config.
@@ -915,6 +1059,18 @@ class FilterConfigManager:
             if metadata_only_patterns is not None
             else config.metadata_only_patterns
         )
+        # Same semantic for tier_rules and large_file_downgrade_mb.
+        # Passing an explicit [] for tier_rules means "back to
+        # defaults" (effective_tier_rules() reads from
+        # DEFAULT_TIER_RULES when the field is empty).
+        new_tier_rules = (
+            tier_rules if tier_rules is not None else config.tier_rules
+        )
+        new_downgrade_mb = (
+            int(large_file_downgrade_mb)
+            if large_file_downgrade_mb is not None
+            else config.large_file_downgrade_mb
+        )
 
         # Handle mode-specific updates
         if blacklist_exclude is not None or blacklist_include is not None or \
@@ -927,6 +1083,8 @@ class FilterConfigManager:
                 whitelist_include=whitelist_include if whitelist_include is not None else config.whitelist_include,
                 whitelist_exclude=whitelist_exclude if whitelist_exclude is not None else config.whitelist_exclude,
                 metadata_only_patterns=new_metadata_only,
+                tier_rules=new_tier_rules,
+                large_file_downgrade_mb=new_downgrade_mb,
                 config_path=config.config_path,
             )
         else:
@@ -951,6 +1109,8 @@ class FilterConfigManager:
                 whitelist_include=new_whitelist_include,
                 whitelist_exclude=new_whitelist_exclude,
                 metadata_only_patterns=new_metadata_only,
+                tier_rules=new_tier_rules,
+                large_file_downgrade_mb=new_downgrade_mb,
                 config_path=config.config_path,
             )
 

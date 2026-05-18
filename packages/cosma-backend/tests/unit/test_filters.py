@@ -169,8 +169,9 @@ class TestThreeTierClassification:
         assert config.classify(Path("/tmp/notes.txt"), Path("/tmp")) == FilterDecision.EXCLUDED
 
     def test_v2_to_v3_migration_preserves_data(self):
-        """Loading a v2 dict into v3 keeps all existing patterns and
-        initializes metadata_only_patterns to []."""
+        """Loading a v2 dict into v4 keeps all existing patterns and
+        initializes the newer keys (metadata_only_patterns,
+        skip_git_repos) to their dataclass defaults."""
         v2_data = {
             "version": 2,
             "mode": "blacklist",
@@ -180,9 +181,15 @@ class TestThreeTierClassification:
             "whitelist_exclude": [],
         }
         config = FilterConfig.from_dict(v2_data)
-        assert config.version == 3
+        # v2 hops straight to current schema (v5). The test name
+        # predates the v4/v5 bumps (which added structural toggles
+        # and the tier table without touching the patterns).
+        assert config.version == 5
         assert config.blacklist_exclude == ["*.log"]
         assert config.metadata_only_patterns == []
+        assert config.skip_git_repos is True
+        # No tier_rules in the source → empty user list, defaults apply.
+        assert config.tier_rules == []
 
     def test_to_dict_round_trip_preserves_metadata_only(self):
         config = FilterConfig(

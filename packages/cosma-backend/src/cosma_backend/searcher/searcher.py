@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from cosma_backend.db.database import Database
 from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.logging import get_logger
-from cosma_backend.models import File
+from cosma_backend.models import Application, File
 from cosma_backend.searcher.rrf import merge_with_rrf
 
 # Configure logger
@@ -57,6 +57,34 @@ class SearchResult:
             "semantic_rank": self.semantic_rank,
             "keyword_rank": self.keyword_rank,
         }
+
+
+@dataclass
+class ApplicationResult:
+    """A single application search hit.
+
+    Apps don't get RRF-fused with files — they live in their own
+    visual group in the UI (a divider between the two lists), so a
+    raw BM25-relevance score is enough. We don't have semantic
+    embeddings for apps yet; if the LLM enrichment in Step 4 adds
+    them, this struct can grow a `semantic_rank` like SearchResult.
+    """
+    application: Application
+    relevance_score: float = 0.0
+
+
+@dataclass
+class SearchBundle:
+    """Result aggregate from a hybrid search.
+
+    Separate file and application lists so the frontend can render
+    the two groups distinctly without re-classifying or re-sorting.
+    `apps` may be empty even when files matched (and vice versa);
+    callers should not assume one implies the other.
+    """
+    files: list["SearchResult"]
+    apps: list[ApplicationResult]
+    total_ms: float = 0.0
 
 
 class HybridSearcher:
@@ -124,15 +152,34 @@ class HybridSearcher:
         semantic_list: list[tuple[int, File, float]] = []
         keyword_list: list[tuple[int, File, float]] = []
 
-        # 1. Semantic + 2. Keyword run in parallel — they're independent
-        # work and there's no reason to serialize them on the event loop.
-        # (The semantic side was previously also synchronous, which made
-        # the parallelism academic; with embed_text_async it's real.)
+        # 1. Semantic + 2. Keyword + 3. Apps-keyword run in parallel.
+        # All three are independent work and there's no reason to
+        # serialize them on the event loop. Apps go in the same gather
+        # call so the slowest branch sets the floor; previously the
+        # apps query would have added a serial 5-20 ms tax. The apps
+        # task is computed unconditionally — the cost of an empty
+        # FTS5 query against an empty table is sub-millisecond, so we
+        # don't gate it on "do we have any apps."
         t_lookup = time.perf_counter()
         sem_task = asyncio.create_task(self._semantic_search(query, fetch_limit, semantic_threshold, directory))
         kw_task = asyncio.create_task(self._keyword_search(query, fetch_limit, directory))
-        sem_result, kw_result = await asyncio.gather(sem_task, kw_task, return_exceptions=True)
+        apps_task = asyncio.create_task(self._apps_search(query, fetch_limit))
+        sem_result, kw_result, apps_result = await asyncio.gather(
+            sem_task, kw_task, apps_task, return_exceptions=True,
+        )
         lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
+        # Stash for search_with_apps; the legacy `search()` return
+        # ignores apps so callers that don't know about the bundle
+        # still get a plain list[SearchResult] back.
+        self._last_apps: list[ApplicationResult] = []
+        if isinstance(apps_result, Exception):
+            logger.warning("Applications keyword search failed",
+                            error=str(apps_result))
+        else:
+            for app, score in apps_result:
+                self._last_apps.append(
+                    ApplicationResult(application=app, relevance_score=score)
+                )
 
         if isinstance(sem_result, Exception):
             logger.warning("Semantic search failed", error=str(sem_result))
@@ -225,7 +272,7 @@ class HybridSearcher:
         try:
             # Use database FTS5 for efficient keyword search
             results = await self.db.keyword_search(query, limit * 2, directory)
-            
+
             # Results are already in (file_metadata, score) format
             # FTS5 returns relevance scores that work well for ranking
             return results
@@ -233,6 +280,48 @@ class HybridSearcher:
         except Exception as e:
             logger.exception("Keyword search failed", error=str(e))
             return []
+
+    async def _apps_search(self, query: str, limit: int) -> list[tuple[Application, float]]:
+        """FTS5 keyword search against the applications table.
+
+        Returns [] cleanly when there are no apps indexed yet — the
+        Step 6 wiring lands before the Step 4 discoverer, so this is
+        an expected zero-result case rather than an error.
+        """
+        try:
+            # Apps are a small dataset (< 1000 typical), so a smaller
+            # limit is fine — we surface the top match-density per
+            # category, not exhaustive results.
+            return await self.db.applications_keyword_search(query, limit)
+        except Exception as e:
+            logger.exception("Applications keyword search failed", error=str(e))
+            return []
+
+    async def search_with_apps(
+        self,
+        query: str,
+        limit: int = 20,
+        *,
+        apps_limit: int = 8,
+        directory: str | None = None,
+    ) -> SearchBundle:
+        """Hybrid search that returns files AND matching applications
+        as separate groups.
+
+        Delegates the file half to ``search()`` (whose three-way fanout
+        already issued the apps query in parallel) and packages
+        whatever apps came back into the returned bundle. Apps are
+        capped separately from files — they're a side panel, not part
+        of the main result count, so a long list of apps shouldn't
+        crowd file hits out of the top of the result list.
+        """
+        t_start = time.perf_counter()
+        files = await self.search(query, limit=limit, directory=directory)
+        # `self._last_apps` is populated by the parallel apps task
+        # inside ``search()`` — same single round of FTS work.
+        apps = list(getattr(self, "_last_apps", []))[:apps_limit]
+        total_ms = (time.perf_counter() - t_start) * 1000.0
+        return SearchBundle(files=files, apps=apps, total_ms=total_ms)
 
     async def search_similar_to_file(self,
                                    file_id: int,

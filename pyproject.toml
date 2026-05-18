@@ -1,6 +1,6 @@
 [project]
 name = "cosma"
-version = "1.1.2"
+version = "1.2.0"
 requires-python = ">=3.12"
 description="Search engine for your files!"
 readme = "README.md"

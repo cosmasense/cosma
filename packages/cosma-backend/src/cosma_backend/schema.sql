@@ -64,8 +64,15 @@ CREATE TABLE IF NOT EXISTS files (
     -- Stage 3: Embedding (vector representation)
     embedded_at INTEGER,
     
-    -- Meta
-    status TEXT DEFAULT 'DISCOVERED' CHECK (status IN ('DISCOVERED', 'PARSED', 'SUMMARIZED', 'COMPLETE', 'FAILED')),
+    -- Meta. No CHECK on the status enum — Python's ProcessingStatus
+    -- (models/status.py) is the source of truth, and a CHECK here just
+    -- gets out of sync (the constraint missed INDEXED_PARTIAL when it
+    -- was added, which silently rejected fresh-install writes; an
+    -- enum living in two places is the kind of bug nobody finds until
+    -- they wipe their DB). Valid values today:
+    --   DISCOVERED | PARSED | SUMMARIZED | COMPLETE | FAILED
+    --   INDEXED_PARTIAL | INDEXED_NAME_ONLY
+    status TEXT DEFAULT 'DISCOVERED',
     processing_error TEXT,
     
     -- File owner and permissions (if available)
@@ -210,6 +217,95 @@ CREATE TRIGGER IF NOT EXISTS file_keywords_au AFTER UPDATE ON file_keywords BEGI
     LEFT JOIN file_keywords fk ON f.id = fk.file_id
     WHERE f.id = old.file_id
     GROUP BY f.id;
+END;
+
+-- =============================================================================
+-- Applications Table
+-- =============================================================================
+--
+-- Apps are a distinct source from files: the user's "where did I put
+-- my Logic Pro?" question wants a totally different surface than a
+-- doc search hit. Storing them in their own table (a) keeps the
+-- schema honest — apps don't have file_size in any meaningful sense,
+-- no content_hash, no parser status; and (b) lets the frontend
+-- group app results separately with a visual divider when both
+-- types match.
+--
+-- The same DB hosts both tables so search-time fusion is a UNION
+-- ALL, no second connection or two-phase commit.
+
+CREATE TABLE IF NOT EXISTS applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- /Applications/Safari.app — the on-disk bundle path. Unique so
+    -- a re-scan UPSERTs rather than duplicating.
+    app_path TEXT NOT NULL UNIQUE,
+    -- com.apple.Safari — from CFBundleIdentifier. Not all apps have
+    -- one (old / unsigned builds), so this is nullable. We never use
+    -- it as a foreign key.
+    bundle_id TEXT,
+    -- "Safari", from CFBundleDisplayName or CFBundleName, with the
+    -- .app suffix trimmed. The single most search-relevant column.
+    display_name TEXT NOT NULL,
+    -- Marketing version, e.g. "17.4".
+    short_version TEXT,
+    -- LSApplicationCategoryType, e.g. "public.app-category.productivity".
+    -- Useful for filtering ("show me my productivity apps").
+    category TEXT,
+    -- CFBundleGetInfoString or similar — short app description text
+    -- if present. Most apps don't ship one.
+    description TEXT,
+    -- Optional LLM-generated "what does this app do" string. Filled
+    -- by a future enrichment pass; nullable so first-pass indexing
+    -- doesn't block on the LLM.
+    use_cases TEXT,
+    -- /Applications/Safari.app/Contents/Resources/AppIcon.icns —
+    -- resolved during indexing so the UI can lazy-load.
+    icon_path TEXT,
+    indexed_at INTEGER DEFAULT (strftime('%s', 'now')) NOT NULL,
+    updated_at INTEGER DEFAULT (strftime('%s', 'now')) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_applications_bundle_id ON applications(bundle_id);
+CREATE INDEX IF NOT EXISTS idx_applications_display_name ON applications(display_name);
+CREATE INDEX IF NOT EXISTS idx_applications_category ON applications(category);
+
+CREATE TRIGGER IF NOT EXISTS update_applications_timestamp
+    AFTER UPDATE ON applications
+    FOR EACH ROW
+BEGIN
+    UPDATE applications SET updated_at = (strftime('%s', 'now')) WHERE id = NEW.id;
+END;
+
+-- Contentless FTS5 mirror, same shape as files_fts so the search
+-- fusion code stays symmetrical. Tokenizing display_name plus
+-- bundle_id plus category plus the two description fields makes the
+-- "I forgot what it's called but it's the one that does X" query
+-- work — a user typing "photo editor" hits an app whose category is
+-- public.app-category.photography or whose use_cases mentions
+-- editing.
+CREATE VIRTUAL TABLE IF NOT EXISTS applications_fts USING fts5(
+    display_name,
+    bundle_id,
+    category,
+    description,
+    use_cases,
+    content='',
+    contentless_delete=1
+);
+
+CREATE TRIGGER IF NOT EXISTS applications_ai AFTER INSERT ON applications BEGIN
+    INSERT INTO applications_fts(rowid, display_name, bundle_id, category, description, use_cases)
+    VALUES (new.id, new.display_name, new.bundle_id, new.category, new.description, new.use_cases);
+END;
+
+CREATE TRIGGER IF NOT EXISTS applications_ad AFTER DELETE ON applications BEGIN
+    DELETE FROM applications_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS applications_au AFTER UPDATE ON applications BEGIN
+    DELETE FROM applications_fts WHERE rowid = old.id;
+    INSERT INTO applications_fts(rowid, display_name, bundle_id, category, description, use_cases)
+    VALUES (new.id, new.display_name, new.bundle_id, new.category, new.description, new.use_cases);
 END;
 
 -- =============================================================================

@@ -105,7 +105,11 @@ class File:
     metadata_only_reason: Optional[str] = None
     # Distinguishes which final status the pipeline should write. See
     # the docstring on `metadata_only` for what each value means.
-    # Values: "parser_failed" | "user_elected" | "oversize" | "no_content" | None.
+    # Values: "parser_failed" | "user_elected" | "oversize" | "no_content"
+    #       | "filename_only" | None.
+    # "filename_only" is Tier C — the file received only an FTS entry on
+    # its filename; no parse, no summarize, no semantic embed. Final
+    # status = INDEXED_NAME_ONLY.
     partial_kind: Optional[str] = None
     
     @classmethod

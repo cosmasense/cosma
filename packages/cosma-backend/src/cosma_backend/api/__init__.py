@@ -20,6 +20,7 @@ Validation is handled by quart-schema decorators.
 
 from quart import Blueprint
 
+from .applications import applications_bp
 from .files import files_bp
 from .index import index_bp
 from .search import search_bp
@@ -45,6 +46,7 @@ api_blueprint.register_blueprint(filters_bp, url_prefix='/filters')
 api_blueprint.register_blueprint(settings_bp, url_prefix='/settings')
 api_blueprint.register_blueprint(queue_bp, url_prefix='/queue')
 api_blueprint.register_blueprint(bootstrap_bp, url_prefix='/bootstrap')
+api_blueprint.register_blueprint(applications_bp, url_prefix='/applications')
 
 
 __all__ = ['api_blueprint']

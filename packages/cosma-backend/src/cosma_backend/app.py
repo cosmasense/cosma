@@ -396,6 +396,20 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
         )
         app.searcher = HybridSearcher(db=app.db, embedder=embedder)
 
+        # Applications source — separate from files but lives in the
+        # same DB so search-time fusion is a UNION ALL, no second
+        # connection or two-phase commit. The indexer's background
+        # loop is started further down (Phase 2) so we don't run a
+        # plistlib walk during the API-readiness phase.
+        from cosma_backend.applications import (
+            ApplicationsDiscoverer, ApplicationsIndexer, ApplicationsRepository,
+        )
+        app.applications_repository = ApplicationsRepository(app.db)
+        app.applications_indexer = ApplicationsIndexer(
+            repository=app.applications_repository,
+            discoverer=ApplicationsDiscoverer(),
+        )
+
         app.indexing_queue = IndexingQueue(
             pipeline=app.pipeline, updates_hub=app.updates_hub,
             config=settings.queue, db=app.db,
@@ -423,6 +437,11 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
         app.indexing_queue.set_pre_task_hook(app.scheduler.evaluate_and_apply)
         app.scheduler.start()
         app.model_lifecycle.start()
+        # Apps indexer runs its own background loop (initial scan +
+        # 6 h re-scan). Scan cost on a typical Mac is well under
+        # 100 ms so we don't gate this on bootstrap; it competes
+        # only with itself.
+        app.applications_indexer.start_background_rescan()
 
         # If required models aren't on disk yet, gate the queue until the
         # bootstrap runner finishes. Watcher discovery runs normally so items
@@ -587,12 +606,15 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
             except Exception:
                 logger.exception(f"Error stopping {label}")
 
-        # Parallelize independent teardown: these three don't share state,
-        # so gather cuts wall-clock shutdown time roughly in thirds.
+        # Parallelize independent teardown: these don't share state,
+        # so gather cuts wall-clock shutdown time roughly evenly.
+        apps_indexer = getattr(app, "applications_indexer", None)
         await asyncio.gather(
-            _safe("model lifecycle", app.model_lifecycle.stop()),
-            _safe("scheduler",       app.scheduler.stop()),
-            _safe("indexing queue",  app.indexing_queue.stop()),
+            _safe("model lifecycle",   app.model_lifecycle.stop()),
+            _safe("scheduler",         app.scheduler.stop()),
+            _safe("indexing queue",    app.indexing_queue.stop()),
+            _safe("apps indexer",      apps_indexer.stop()) if apps_indexer
+                else _safe("apps indexer", asyncio.sleep(0)),
         )
 
         # Unload summarizer — important for Ollama (holds GPU until told to

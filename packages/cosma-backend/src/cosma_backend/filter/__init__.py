@@ -13,5 +13,22 @@ from .filter_config import (
     FilterDecision,
     FilterMode,
 )
+from .tier_rules import (
+    DEFAULT_LARGE_FILE_DOWNGRADE_MB,
+    DEFAULT_TIER_RULES,
+    Tier,
+    TierRule,
+    default_tier_rules,
+)
 
-__all__ = ['FilterConfig', 'FilterConfigManager', 'FilterDecision', 'FilterMode']
+__all__ = [
+    'DEFAULT_LARGE_FILE_DOWNGRADE_MB',
+    'DEFAULT_TIER_RULES',
+    'FilterConfig',
+    'FilterConfigManager',
+    'FilterDecision',
+    'FilterMode',
+    'Tier',
+    'TierRule',
+    'default_tier_rules',
+]

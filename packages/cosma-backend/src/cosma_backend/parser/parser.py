@@ -50,8 +50,19 @@ class FileParser:
     SUPPORTED_EXTENSIONS = {
         # Documents
         ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
+        # Rich text — RTF is handled by MarkItDown's plain-text path.
+        ".rtf",
+        # Email — .msg (Outlook) needs markitdown[outlook], .eml is RFC822
+        # which the plain-text converter reads natively.
+        ".msg", ".eml",
+        # Notebooks — MarkItDown's IpynbConverter parses the JSON, joins
+        # markdown + code cells. Very common in data-science folders.
+        ".ipynb",
         # Images
         ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".heic", ".gif", ".webp",
+        # SVG is XML text — MarkItDown's plain-text converter pulls the
+        # textual content (titles, labels) without needing rasterization.
+        ".svg",
         # Audio — anything ffmpeg can decode; we normalize to 16 kHz mono
         # PCM before whisper, so the container/codec just has to be
         # ffmpeg-readable. Keep this in sync with
@@ -62,6 +73,12 @@ class FileParser:
         ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm",
         # Web & Text
         ".html", ".htm", ".txt", ".csv", ".json", ".xml", ".md",
+        # Config / data text — common in Documents folders for project
+        # notes, environment manifests, etc. PlainTextConverter handles
+        # any UTF-8 text by extension.
+        ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log",
+        # Technical docs (LaTeX, reStructuredText, AsciiDoc).
+        ".tex", ".rst", ".adoc",
         # Archives
         ".zip", ".epub"
     }

@@ -8,6 +8,7 @@ Core domain models used throughout the application:
 - Update: Real-time event sent to frontend via SSE
 """
 
+from .application import Application as Application
 from .file import File as File
 from .status import ProcessingStatus as ProcessingStatus
 from .watch import WatchedDirectory as WatchedDirectory

@@ -75,10 +75,35 @@ class SearchResultItem:
 
 
 @dataclass
+class ApplicationResultItem:
+    """A single application search hit, returned alongside file
+    results so the frontend can render apps as a distinct section
+    (the divider between the two lists that lets the user see
+    'here's the app, here are the docs' at a glance)."""
+    id: int
+    app_path: str
+    display_name: str
+    bundle_id: str | None = None
+    short_version: str | None = None
+    category: str | None = None
+    description: str | None = None
+    use_cases: str | None = None
+    icon_path: str | None = None
+    relevance_score: float = 0.0
+
+
+@dataclass
 class SearchResponse:
-    """Response for search queries"""
+    """Response for search queries.
+
+    `apps` is a parallel list, not interleaved into `results`. It
+    stays empty until the apps table has rows (Step 4 populates it).
+    Clients that don't know about apps continue to read `results`
+    and `total_count` exactly as before.
+    """
     results: list[SearchResultItem]
     total_count: int = 0
+    apps: list[ApplicationResultItem] | None = None
 
 
 @search_bp.post("/")  # type: ignore[return-value]
@@ -98,9 +123,28 @@ async def search(data: SearchRequest) -> tuple[SearchResponse, int]:
         # persisted stage on the next dispatch pass.
         if hasattr(iq, "cancel_in_flight"):
             iq.cancel_in_flight()
-    results = await current_app.searcher.search(data.query, directory=data.directory)
+    bundle = await current_app.searcher.search_with_apps(
+        data.query, directory=data.directory,
+    )
+    results = bundle.files
     total_count = len(results)
     paginated = results[data.offset:data.offset + data.limit]
+
+    apps_items = [
+        ApplicationResultItem(
+            id=a.application.id or 0,
+            app_path=a.application.app_path,
+            display_name=a.application.display_name,
+            bundle_id=a.application.bundle_id,
+            short_version=a.application.short_version,
+            category=a.application.category,
+            description=a.application.description,
+            use_cases=a.application.use_cases,
+            icon_path=a.application.icon_path,
+            relevance_score=a.relevance_score,
+        )
+        for a in bundle.apps
+    ]
 
     return SearchResponse(
         results=[
@@ -109,6 +153,7 @@ async def search(data: SearchRequest) -> tuple[SearchResponse, int]:
             )
             for r in paginated],
         total_count=total_count,
+        apps=apps_items or None,
     ), 200
 
 

@@ -35,6 +35,11 @@ class ProcessingStatus(enum.Enum):
     COMPLETE = 3         # Embeddings generated, fully indexed
 
     FAILED = 4           # Processing failed (check processing_error field)
-    INDEXED_PARTIAL = 5  # User-elected metadata-only: embedded by filename
-                         # + metadata, no LLM summary. Surfaces in search;
-                         # surfaces in its own count in the UI.
+    INDEXED_PARTIAL = 5  # Filename + metadata got a SEMANTIC embedding
+                         # (Tier B), no LLM summary. The intent shows in
+                         # the per-file `partial_kind` column.
+    INDEXED_NAME_ONLY = 6  # Tier C floor: filename in FTS only, no
+                         # semantic vector. Cheap baseline so a literal-
+                         # string search never returns zero results, used
+                         # for code/build artifacts/anything we can't
+                         # meaningfully summarize. Surfaces in search.

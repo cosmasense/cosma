@@ -368,11 +368,23 @@ class Pipeline:
                 ))
                 return
 
-            # User-elected partial: filter classified this file as
-            # metadata-only. Skip the parser entirely (we'd be
-            # parsing just to throw the content away), build a
+            # Tier C (LITERAL_NAME): cheapest path of all. DB row +
+            # filename in FTS5, no parse, no embed. The file is
+            # discoverable by literal-string search (code files,
+            # build artifacts, anything not worth LLM time). The
+            # FTS5 sync triggers on the files table pick up the
+            # row automatically.
+            if file.metadata_only and file.partial_kind == "filename_only":
+                await self._run_filename_only(file, saved_file=saved_file)
+                return
+
+            # Tier B (SEMANTIC_NAME): skip the parser entirely (we'd
+            # be parsing just to throw the content away), build a
             # filename-and-metadata text body, embed it, and mark
-            # INDEXED_PARTIAL. Cheap path — no GPU, no LLM.
+            # INDEXED_PARTIAL. Cheap path — no GPU, no LLM. Used for
+            # files the user said "name only" about (long media,
+            # archives, .dmg etc.) plus the historical user-elected
+            # metadata-only filter patterns.
             if file.metadata_only and file.partial_kind == "user_elected":
                 await self._run_partial_only(file, saved_file=saved_file)
                 return
@@ -664,6 +676,53 @@ class Pipeline:
         # is done processing", not about which path it took.
         self._publish_update(Update.file_complete(file.file_path, file.filename))
 
+    async def _run_filename_only(
+        self,
+        file: File,
+        *,
+        saved_file: "File | None",
+    ) -> None:
+        """Tier C path: persist filename + path metadata, nothing more.
+
+        No parse, no summarize, no semantic embedding. The FTS5
+        triggers on the `files` table index `file_path`, `title`,
+        `summary`, `keywords` automatically on INSERT/UPDATE, so as
+        long as we set `title = filename stem` the file is reachable
+        by literal-string keyword search. That's the entire point of
+        Tier C — comprehensive coverage at the cost of zero LLM time.
+        """
+        self._publish_update(Update.file_parsing(file.file_path, file.filename))
+
+        from datetime import datetime, timezone
+
+        # Title = filename without extension. This is the field FTS5
+        # tokenizes for literal matches.
+        if not file.title:
+            file.title = file.path.stem
+        # Summary stays a thin filename-derived blurb so the FTS row
+        # isn't empty in the `summary` column. Honest signal — we did
+        # not summarize the content.
+        ext_clean = (file.extension or "").lstrip(".")
+        size_str = ""
+        try:
+            size_str = _human_size_compact(file.file_size)
+        except Exception:
+            size_str = ""
+        parts = [file.filename]
+        if ext_clean:
+            parts.append(ext_clean)
+        if size_str:
+            parts.append(size_str)
+        file.summary = " | ".join(parts)
+        file.content = None  # never stored — Tier C means "we didn't read it"
+        file.parsed_at = datetime.now(timezone.utc)
+        file.status = ProcessingStatus.INDEXED_NAME_ONLY
+        file.processing_error = file.metadata_only_reason
+
+        await self._save_to_db(file)
+
+        self._publish_update(Update.file_complete(file.file_path, file.filename))
+
     async def _run_parse_stage(self, file: File) -> None:
         """Parse the file, set status=PARSED, persist."""
         async with self._parse_sem:
@@ -733,14 +792,16 @@ class Pipeline:
         saved_file = await self.db.get_file_by_path(file.file_path)
 
         # File not in DB or not yet fully processed - don't skip.
-        # INDEXED_PARTIAL counts as "fully processed" for skip
-        # purposes — its row is final, and unless the user changes
-        # the filter rules (which invalidates everything anyway) we
-        # don't want to re-embed it on every restart.
+        # INDEXED_PARTIAL and INDEXED_NAME_ONLY both count as
+        # "fully processed" for skip purposes — their rows are
+        # final, and unless the user changes the tier rules (which
+        # invalidates everything anyway) we don't want to redo work
+        # on every restart.
         terminal_statuses = (
             ProcessingStatus.COMPLETE,
             ProcessingStatus.FAILED,
             ProcessingStatus.INDEXED_PARTIAL,
+            ProcessingStatus.INDEXED_NAME_ONLY,
         )
         if not saved_file or saved_file.status not in terminal_statuses:
             logger.debug("File needs processing", file=file.file_path, status=saved_file.status if saved_file else "not in DB")
