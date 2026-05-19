@@ -261,6 +261,11 @@ CREATE TABLE IF NOT EXISTS applications (
     -- /Applications/Safari.app/Contents/Resources/AppIcon.icns —
     -- resolved during indexing so the UI can lazy-load.
     icon_path TEXT,
+    -- SHA-256 of the text body that produced the current embedding
+    -- (display_name + description + category + use_cases). Lets the
+    -- indexer skip the embedder round-trip when nothing about the
+    -- app changed across a re-scan. NULL means "never embedded".
+    embedding_text_hash TEXT,
     indexed_at INTEGER DEFAULT (strftime('%s', 'now')) NOT NULL,
     updated_at INTEGER DEFAULT (strftime('%s', 'now')) NOT NULL
 );
@@ -268,6 +273,25 @@ CREATE TABLE IF NOT EXISTS applications (
 CREATE INDEX IF NOT EXISTS idx_applications_bundle_id ON applications(bundle_id);
 CREATE INDEX IF NOT EXISTS idx_applications_display_name ON applications(display_name);
 CREATE INDEX IF NOT EXISTS idx_applications_category ON applications(category);
+
+-- Vector embeddings for semantic app search. Parallel to file_embeddings
+-- so the search-side code can union the two with the same RRF merge
+-- it uses for files+keyword. Apps don't need per-app embedding model
+-- tracking because we only run one embedder at a time — but we keep
+-- the model name column for parity with files (and so future
+-- multi-model setups don't need a schema migration).
+CREATE VIRTUAL TABLE IF NOT EXISTS application_embeddings USING vec0(
+    application_id INTEGER PRIMARY KEY,
+    embedding_model TEXT,
+    embedding_dimensions INTEGER,
+    embedding float[1536]
+);
+
+CREATE TRIGGER IF NOT EXISTS delete_application_embeddings
+AFTER DELETE ON applications
+BEGIN
+    DELETE FROM application_embeddings WHERE application_id = OLD.id;
+END;
 
 CREATE TRIGGER IF NOT EXISTS update_applications_timestamp
     AFTER UPDATE ON applications

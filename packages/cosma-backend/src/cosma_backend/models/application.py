@@ -30,6 +30,10 @@ class Application:
     # description + category.
     use_cases: Optional[str] = None
     icon_path: Optional[str] = None
+    # SHA-256 of the text body used to produce the current embedding.
+    # The indexer compares it before re-embedding so a routine re-scan
+    # of an unchanged app costs zero embedder calls.
+    embedding_text_hash: Optional[str] = None
     indexed_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -58,6 +62,7 @@ class Application:
             description=_at("description"),
             use_cases=_at("use_cases"),
             icon_path=_at("icon_path"),
+            embedding_text_hash=_at("embedding_text_hash"),
             indexed_at=_ts("indexed_at"),
             updated_at=_ts("updated_at"),
         )

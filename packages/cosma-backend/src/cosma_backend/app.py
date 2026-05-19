@@ -408,6 +408,10 @@ def create_app(dirs: Optional[AppDirs] = None) -> App:
         app.applications_indexer = ApplicationsIndexer(
             repository=app.applications_repository,
             discoverer=ApplicationsDiscoverer(),
+            # Same embedder as the file pipeline so apps + files share
+            # the SentenceTransformer warm-up cost and produce vectors
+            # in the same space for the search-time RRF merge.
+            embedder=embedder,
         )
 
         app.indexing_queue = IndexingQueue(

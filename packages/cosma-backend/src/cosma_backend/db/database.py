@@ -800,6 +800,53 @@ class Database:
             logger.info("Keyword search completed", count=len(results))
             return results
 
+    async def search_similar_applications(
+        self,
+        query_embedding: np.ndarray,
+        limit: int = 10,
+        threshold: float | None = None,
+    ) -> list[tuple["Application", float]]:
+        """Vector knn search against the applications source.
+
+        Mirrors ``search_similar_files`` but smaller — apps have no
+        directory scoping (there's only one /Applications surface)
+        and no keyword join (apps_fts is handled separately by
+        ``applications_keyword_search``). Returns (Application,
+        distance) tuples where smaller distance = better match.
+        """
+        from cosma_backend.models.application import Application
+
+        normalized = self._normalize_embedding_dimensions(query_embedding)
+        query_blob = self._serialize_vector(normalized)
+
+        SQL = """
+        SELECT
+            a.*,
+            distance
+        FROM application_embeddings
+        INNER JOIN applications a ON application_embeddings.application_id = a.id
+        WHERE embedding MATCH ? AND k = ?
+        ORDER BY distance
+        """
+        params: list = [query_blob, limit]
+        if threshold is not None:
+            SQL = SQL.replace("WHERE embedding MATCH ?", "WHERE embedding MATCH ? AND distance <= ?")
+            params = [query_blob, threshold, limit]
+
+        async with self.acquire() as conn:
+            try:
+                async with conn.execute(SQL, tuple(params)) as cursor:
+                    rows = await cursor.fetchall()
+            except Exception as e:
+                logger.error("Apps semantic search failed", error=str(e))
+                return []
+
+        results: list[tuple[Application, float]] = []
+        for row in rows:
+            app = Application.from_row(row)
+            results.append((app, float(row["distance"])))
+        return results
+
     async def applications_keyword_search(
         self,
         query: str,

@@ -11,7 +11,9 @@ triggers do their job.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+import numpy as np
 
 from cosma_backend.logging import get_logger
 from cosma_backend.models import Application
@@ -118,3 +120,59 @@ class ApplicationsRepository:
             async with conn.execute("SELECT count(*) FROM applications") as cur:
                 row = (await cur.fetchall())[0]
         return int(row[0])
+
+    async def get_by_app_path(self, app_path: str) -> Optional[Application]:
+        """Fetch a single row by bundle path. Used by the indexer to
+        re-read the post-UPSERT row so it knows the assigned id +
+        any preserved use_cases / embedding_text_hash before deciding
+        whether to re-embed."""
+        async with self._db.acquire() as conn:
+            async with conn.execute(
+                "SELECT * FROM applications WHERE app_path = ?", (app_path,)
+            ) as cur:
+                rows = await cur.fetchall()
+        if not rows:
+            return None
+        return Application.from_row(rows[0])
+
+    async def set_embedding(
+        self,
+        application_id: int,
+        embedding: np.ndarray,
+        *,
+        embedding_model: str,
+        text_hash: str,
+    ) -> None:
+        """Upsert the semantic vector for an app and persist the hash
+        of the source text. Mirrors `Database.upsert_file_embeddings`
+        but inline here because the apps source has no equivalent of
+        the file pipeline's "first_embed" optimization — apps are
+        re-embedded only on hash mismatch, which is rare, so always
+        DELETE-then-INSERT keeps the code simple.
+        """
+        # Reach into Database's helpers — both are module-internal but
+        # stable and exist precisely for this kind of parallel use.
+        normalized = self._db._normalize_embedding_dimensions(embedding)
+        blob = self._db._serialize_vector(normalized)
+        # vec0 reads the stored dimension from the table schema, so
+        # passing the storage dim here keeps it consistent with files.
+        from cosma_backend.db.database import EMBEDDING_STORAGE_DIMENSIONS
+
+        async with self._db.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM application_embeddings WHERE application_id = ?",
+                (application_id,),
+            )
+            await conn.execute(
+                """
+                INSERT INTO application_embeddings(
+                    application_id, embedding_model, embedding_dimensions, embedding
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (application_id, embedding_model, EMBEDDING_STORAGE_DIMENSIONS, blob),
+            )
+            await conn.execute(
+                "UPDATE applications SET embedding_text_hash = ? WHERE id = ?",
+                (text_hash, application_id),
+            )
+            await conn.commit()

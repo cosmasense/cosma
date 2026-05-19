@@ -282,19 +282,66 @@ class HybridSearcher:
             return []
 
     async def _apps_search(self, query: str, limit: int) -> list[tuple[Application, float]]:
-        """FTS5 keyword search against the applications table.
+        """Fused keyword + semantic search against the applications source.
 
-        Returns [] cleanly when there are no apps indexed yet — the
-        Step 6 wiring lands before the Step 4 discoverer, so this is
-        an expected zero-result case rather than an error.
+        Two queries fire in parallel:
+          * applications_fts BM25 (literal-token recall — "Logic Pro",
+            "Docker", bundle ids).
+          * application_embeddings knn vec search (intent recall —
+            "music production" finds Logic Pro even when its
+            description doesn't contain those tokens).
+        Results are RRF-merged the same way files are. Returned as
+        (Application, score) tuples where score is the RRF score
+        (higher = better, opposite of raw vec distance) so the
+        existing API/UI consumers can sort descending without
+        special-casing.
         """
         try:
             # Apps are a small dataset (< 1000 typical), so a smaller
             # limit is fine — we surface the top match-density per
             # category, not exhaustive results.
-            return await self.db.applications_keyword_search(query, limit)
+            kw_task = asyncio.create_task(
+                self.db.applications_keyword_search(query, limit)
+            )
+            # Semantic side: only meaningful when we have an embedder.
+            # Without one we'd be issuing zero-vector knn queries that
+            # return arbitrary near-zero matches.
+            sem_coro: asyncio.Future
+            if self.embedder is not None:
+                async def _sem() -> list[tuple[Application, float]]:
+                    vec = await self.embedder.embed_text_async(query, priority=True)
+                    return await self.db.search_similar_applications(vec, limit)
+                sem_task = asyncio.create_task(_sem())
+            else:
+                async def _empty() -> list[tuple[Application, float]]:
+                    return []
+                sem_task = asyncio.create_task(_empty())
+
+            kw_result, sem_result = await asyncio.gather(
+                kw_task, sem_task, return_exceptions=True,
+            )
+
+            kw_list: list[tuple[Application, float]] = (
+                kw_result if not isinstance(kw_result, Exception) else []
+            )
+            sem_list: list[tuple[Application, float]] = (
+                sem_result if not isinstance(sem_result, Exception) else []
+            )
+            if isinstance(kw_result, Exception):
+                logger.warning("Apps keyword search failed", error=str(kw_result))
+            if isinstance(sem_result, Exception):
+                logger.warning("Apps semantic search failed", error=str(sem_result))
+
+            # RRF wants (id, data, score) tuples in best-first order.
+            # Apps have unique ids — use them directly.
+            kw_tuples = [(a.id, a, s) for a, s in kw_list if a.id is not None]
+            sem_tuples = [(a.id, a, s) for a, s in sem_list if a.id is not None]
+            merged = merge_with_rrf(sem_tuples, kw_tuples)
+
+            # Re-shape into (Application, rrf_score) for the caller.
+            return [(data, rrf_score) for _id, data, rrf_score, *_ in merged][:limit]
         except Exception as e:
-            logger.exception("Applications keyword search failed", error=str(e))
+            logger.exception("Applications fused search failed", error=str(e))
             return []
 
     async def search_with_apps(
