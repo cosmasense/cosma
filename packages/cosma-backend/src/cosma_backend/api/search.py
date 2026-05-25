@@ -59,12 +59,23 @@ async def typing_nudge() -> tuple[TypingNudgeResponse, int]:
 
 @dataclass
 class SearchRequest:
-    """Request body for searching files"""
+    """Request body for searching files.
+
+    ``scope`` lets the frontend constrain a query to files only or
+    applications only (``@Applications`` token); ``"all"`` (the
+    default) ranks both in one cross-modal RRF.
+
+    ``path_pattern`` is a glob (``*.pdf``, ``*report*``) pushed down
+    to the SQL WHERE clause as a LIKE filter on file paths and app
+    paths. Frontend sets it from ``@*.pdf``-style tokens.
+    """
     query: str
     filters: dict[str, str] | None = None
     limit: int = 50
     directory: str | None = None
     offset: int = 0
+    scope: str | None = None
+    path_pattern: str | None = None
 
 
 @dataclass
@@ -123,8 +134,18 @@ async def search(data: SearchRequest) -> tuple[SearchResponse, int]:
         # persisted stage on the next dispatch pass.
         if hasattr(iq, "cancel_in_flight"):
             iq.cancel_in_flight()
+    # Normalize scope to the searcher's enum. Unknown values fall
+    # back to "all" so a frontend that sends a typo still gets
+    # results instead of an empty list.
+    scope_value = (data.scope or "all").lower()
+    if scope_value not in ("all", "files", "applications"):
+        scope_value = "all"
     bundle = await current_app.searcher.search_with_apps(
-        data.query, directory=data.directory,
+        data.query,
+        limit=max(data.limit, 1),
+        scope=scope_value,  # type: ignore[arg-type]
+        directory=data.directory,
+        path_pattern=data.path_pattern,
     )
     results = bundle.files
     total_count = len(results)

@@ -12,13 +12,17 @@
 import asyncio
 import time
 from dataclasses import dataclass
+from typing import Literal
 
 
 from cosma_backend.db.database import Database
 from cosma_backend.embedder import AutoEmbedder
 from cosma_backend.logging import get_logger
 from cosma_backend.models import Application, File
-from cosma_backend.searcher.rrf import merge_with_rrf
+from cosma_backend.searcher.rrf import compute_rrf_scores, merge_with_rrf
+
+
+SearchScope = Literal["all", "files", "applications"]
 
 # Configure logger
 logger = get_logger(__name__)
@@ -114,6 +118,7 @@ class HybridSearcher:
         include_metadata: bool = True,
         directory: str | None = None,
         rrf_k: int = 60,
+        path_pattern: str | None = None,
     ) -> list[SearchResult]:
         """
         Perform hybrid search combining semantic and keyword matching using RRF.
@@ -152,34 +157,18 @@ class HybridSearcher:
         semantic_list: list[tuple[int, File, float]] = []
         keyword_list: list[tuple[int, File, float]] = []
 
-        # 1. Semantic + 2. Keyword + 3. Apps-keyword run in parallel.
-        # All three are independent work and there's no reason to
-        # serialize them on the event loop. Apps go in the same gather
-        # call so the slowest branch sets the floor; previously the
-        # apps query would have added a serial 5-20 ms tax. The apps
-        # task is computed unconditionally — the cost of an empty
-        # FTS5 query against an empty table is sub-millisecond, so we
-        # don't gate it on "do we have any apps."
+        # Semantic + Keyword run in parallel — independent work, no
+        # reason to serialize on the event loop. The legacy search()
+        # returns files only, so the apps task that used to run here
+        # has moved to search_with_apps where it participates in the
+        # unified cross-modal RRF.
         t_lookup = time.perf_counter()
-        sem_task = asyncio.create_task(self._semantic_search(query, fetch_limit, semantic_threshold, directory))
-        kw_task = asyncio.create_task(self._keyword_search(query, fetch_limit, directory))
-        apps_task = asyncio.create_task(self._apps_search(query, fetch_limit))
-        sem_result, kw_result, apps_result = await asyncio.gather(
-            sem_task, kw_task, apps_task, return_exceptions=True,
+        sem_task = asyncio.create_task(self._semantic_search(query, fetch_limit, semantic_threshold, directory, path_pattern))
+        kw_task = asyncio.create_task(self._keyword_search(query, fetch_limit, directory, path_pattern))
+        sem_result, kw_result = await asyncio.gather(
+            sem_task, kw_task, return_exceptions=True,
         )
         lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
-        # Stash for search_with_apps; the legacy `search()` return
-        # ignores apps so callers that don't know about the bundle
-        # still get a plain list[SearchResult] back.
-        self._last_apps: list[ApplicationResult] = []
-        if isinstance(apps_result, Exception):
-            logger.warning("Applications keyword search failed",
-                            error=str(apps_result))
-        else:
-            for app, score in apps_result:
-                self._last_apps.append(
-                    ApplicationResult(application=app, relevance_score=score)
-                )
 
         if isinstance(sem_result, Exception):
             logger.warning("Semantic search failed", error=str(sem_result))
@@ -224,7 +213,7 @@ class HybridSearcher:
 
         return results
 
-    async def _semantic_search(self, query: str, limit: int, threshold: float, directory: str | None = None) -> list[tuple]:
+    async def _semantic_search(self, query: str, limit: int, threshold: float, directory: str | None = None, path_pattern: str | None = None) -> list[tuple]:
         """Perform semantic search using embeddings."""
         if not self.embedder:
             return []
@@ -253,7 +242,8 @@ class HybridSearcher:
                 query_embedding=query_embedding,
                 limit=limit,
                 threshold=threshold,
-                directory=directory
+                directory=directory,
+                path_pattern=path_pattern,
             )
             db_ms = (time.perf_counter() - db_start) * 1000.0
 
@@ -267,11 +257,11 @@ class HybridSearcher:
             logger.exception("Semantic search failed", error=str(e))
             return []
 
-    async def _keyword_search(self, query: str, limit: int, directory: str | None = None) -> list[tuple]:
+    async def _keyword_search(self, query: str, limit: int, directory: str | None = None, path_pattern: str | None = None) -> list[tuple]:
         """Perform keyword search using SQLite FTS5."""
         try:
             # Use database FTS5 for efficient keyword search
-            results = await self.db.keyword_search(query, limit * 2, directory)
+            results = await self.db.keyword_search(query, limit * 2, directory, path_pattern=path_pattern)
 
             # Results are already in (file_metadata, score) format
             # FTS5 returns relevance scores that work well for ranking
@@ -281,7 +271,7 @@ class HybridSearcher:
             logger.exception("Keyword search failed", error=str(e))
             return []
 
-    async def _apps_search(self, query: str, limit: int) -> list[tuple[Application, float]]:
+    async def _apps_search(self, query: str, limit: int, *, path_pattern: str | None = None) -> list[tuple[Application, float]]:
         """Fused keyword + semantic search against the applications source.
 
         Two queries fire in parallel:
@@ -301,7 +291,7 @@ class HybridSearcher:
             # limit is fine — we surface the top match-density per
             # category, not exhaustive results.
             kw_task = asyncio.create_task(
-                self.db.applications_keyword_search(query, limit)
+                self.db.applications_keyword_search(query, limit, path_pattern=path_pattern)
             )
             # Semantic side: only meaningful when we have an embedder.
             # Without one we'd be issuing zero-vector knn queries that
@@ -310,7 +300,7 @@ class HybridSearcher:
             if self.embedder is not None:
                 async def _sem() -> list[tuple[Application, float]]:
                     vec = await self.embedder.embed_text_async(query, priority=True)
-                    return await self.db.search_similar_applications(vec, limit)
+                    return await self.db.search_similar_applications(vec, limit, path_pattern=path_pattern)
                 sem_task = asyncio.create_task(_sem())
             else:
                 async def _empty() -> list[tuple[Application, float]]:
@@ -347,27 +337,174 @@ class HybridSearcher:
     async def search_with_apps(
         self,
         query: str,
-        limit: int = 20,
+        limit: int = 50,
         *,
-        apps_limit: int = 8,
+        scope: SearchScope = "all",
         directory: str | None = None,
+        path_pattern: str | None = None,
+        semantic_threshold: float = 2.0,
+        alpha_floor: float = 0.4,
+        rrf_k: int = 60,
     ) -> SearchBundle:
-        """Hybrid search that returns files AND matching applications
-        as separate groups.
+        """Unified hybrid search that ranks files AND applications in
+        the same RRF, then splits the top hits back into two groups
+        for the UI.
 
-        Delegates the file half to ``search()`` (whose three-way fanout
-        already issued the apps query in parallel) and packages
-        whatever apps came back into the returned bundle. Apps are
-        capped separately from files — they're a side panel, not part
-        of the main result count, so a long list of apps shouldn't
-        crowd file hits out of the top of the result list.
+        Behavior change vs the previous design: apps are no longer a
+        parallel sidecar that always populates. They compete with
+        files in one cross-modal ranking — irrelevant apps drop out
+        naturally, relevant ones can bubble to the top.
+
+        Args:
+            query: User search string.
+            limit: Hard cap on total returned hits (files + apps).
+            scope: ``"all"`` runs all four modality queries; ``"files"``
+                skips the apps branches; ``"applications"`` skips the
+                file branches. Set by the frontend via ``@Applications``
+                or other scope tokens.
+            directory: Optional folder scope for the file branches.
+            path_pattern: Optional glob (e.g. ``"*.pdf"``) pushed into
+                the SQL WHERE clause as a LIKE filter; applies to both
+                files (file_path) and apps (display_name/app_path).
+            semantic_threshold: Max vec0 distance for semantic hits.
+            alpha_floor: Relative-score cutoff. Items with RRF score
+                below ``alpha_floor * top_score`` are dropped — so a
+                weak tail can't pad a thin result list. Set to 0 to
+                disable.
+            rrf_k: RRF smoothing constant.
         """
         t_start = time.perf_counter()
-        files = await self.search(query, limit=limit, directory=directory)
-        # `self._last_apps` is populated by the parallel apps task
-        # inside ``search()`` — same single round of FTS work.
-        apps = list(getattr(self, "_last_apps", []))[:apps_limit]
+        fetch_limit = max(limit * 3, 30)
+        logger.info(
+            "Unified search received",
+            query=query,
+            limit=limit,
+            scope=scope,
+            directory=directory,
+            path_pattern=path_pattern,
+            alpha_floor=alpha_floor,
+        )
+
+        # Build the modality task set based on scope. Empty branches
+        # would be wasted work — scope="applications" should not run
+        # the file FTS at all, etc.
+        run_files = scope in ("all", "files")
+        run_apps = scope in ("all", "applications")
+
+        tasks: dict[str, asyncio.Task] = {}
+        if run_files:
+            tasks["file_sem"] = asyncio.create_task(
+                self._semantic_search(query, fetch_limit, semantic_threshold, directory, path_pattern)
+            )
+            tasks["file_kw"] = asyncio.create_task(
+                self._keyword_search(query, fetch_limit, directory, path_pattern)
+            )
+        if run_apps:
+            # Apps modalities are inlined here rather than via
+            # _apps_search so each (semantic, keyword) ranked list
+            # contributes to the cross-modal RRF independently. The
+            # legacy _apps_search performs its own internal RRF, which
+            # would double-fuse if we used it here.
+            tasks["app_kw"] = asyncio.create_task(
+                self.db.applications_keyword_search(query, fetch_limit, path_pattern=path_pattern)
+            )
+            if self.embedder is not None:
+                async def _app_sem() -> list[tuple[Application, float]]:
+                    vec = await self.embedder.embed_text_async(query, priority=True)
+                    return await self.db.search_similar_applications(vec, fetch_limit, path_pattern=path_pattern)
+                tasks["app_sem"] = asyncio.create_task(_app_sem())
+
+        t_lookup = time.perf_counter()
+        raw = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
+        by_key = dict(zip(tasks.keys(), raw, strict=False))
+
+        # Build namespaced ranked lists feeding the RRF. IDs are
+        # tagged ("file", id) / ("app", id) so collisions across the
+        # two sources can't happen.
+        ranked_lists: list[list[tuple[tuple[str, int], object]]] = []
+        file_data: dict[int, File] = {}
+        app_data: dict[int, Application] = {}
+        per_list_ranks: dict[str, dict[tuple[str, int], int]] = {}
+
+        def _ingest(list_name: str, items: list, kind: str, store: dict) -> None:
+            rl: list[tuple[tuple[str, int], object]] = []
+            ranks: dict[tuple[str, int], int] = {}
+            for rank, pair in enumerate(items):
+                obj, _score = pair
+                obj_id = getattr(obj, "id", None)
+                if obj_id is None:
+                    continue
+                key = (kind, obj_id)
+                rl.append((key, obj))
+                store[obj_id] = obj
+                ranks[key] = rank
+            if rl:
+                ranked_lists.append(rl)
+                per_list_ranks[list_name] = ranks
+
+        for key in ("file_sem", "file_kw", "app_sem", "app_kw"):
+            result = by_key.get(key)
+            if result is None:
+                continue
+            if isinstance(result, Exception):
+                logger.warning("Search branch failed", branch=key, error=str(result))
+                continue
+            kind = "file" if key.startswith("file_") else "app"
+            store = file_data if kind == "file" else app_data
+            _ingest(key, result, kind, store)
+
+        # One cross-modal RRF over up to 4 namespaced ranked lists.
+        rrf_scores = compute_rrf_scores(ranked_lists, k=rrf_k)
+
+        # Sort by RRF score desc, then apply relative threshold +
+        # hard cap. The relative threshold (alpha_floor * top) is
+        # what makes "always show 8 apps" go away — quiet apps with
+        # tiny RRF contributions get dropped instead of padding.
+        sorted_hits = sorted(rrf_scores.items(), key=lambda kv: kv[1], reverse=True)
+        if sorted_hits and alpha_floor > 0:
+            top_score = sorted_hits[0][1]
+            cutoff = top_score * alpha_floor
+            sorted_hits = [(k, s) for k, s in sorted_hits if s >= cutoff]
+        sorted_hits = sorted_hits[:limit]
+
+        files: list[SearchResult] = []
+        apps: list[ApplicationResult] = []
+        for (kind, obj_id), score in sorted_hits:
+            if kind == "file":
+                f = file_data.get(obj_id)
+                if f is None:
+                    continue
+                in_sem = (kind, obj_id) in per_list_ranks.get("file_sem", {})
+                in_kw = (kind, obj_id) in per_list_ranks.get("file_kw", {})
+                if in_sem and in_kw:
+                    mtype = "hybrid"
+                elif in_sem:
+                    mtype = "semantic"
+                else:
+                    mtype = "keyword"
+                files.append(SearchResult(
+                    file_metadata=f,
+                    combined_score=score,
+                    match_type=mtype,
+                    semantic_rank=per_list_ranks.get("file_sem", {}).get((kind, obj_id)),
+                    keyword_rank=per_list_ranks.get("file_kw", {}).get((kind, obj_id)),
+                ))
+            else:
+                a = app_data.get(obj_id)
+                if a is None:
+                    continue
+                apps.append(ApplicationResult(application=a, relevance_score=score))
+
         total_ms = (time.perf_counter() - t_start) * 1000.0
+        logger.info(
+            "Unified search completed",
+            query=query,
+            total_ms=round(total_ms, 1),
+            lookup_ms=round(lookup_ms, 1),
+            files=len(files),
+            apps=len(apps),
+        )
         return SearchBundle(files=files, apps=apps, total_ms=total_ms)
 
     async def search_similar_to_file(self,

@@ -68,15 +68,15 @@ async def _make_db():
 
             return _Ctx()
 
-        async def applications_keyword_search(_self, query, limit=20, allow_operators=False):
+        async def applications_keyword_search(_self, query, limit=20, allow_operators=False, path_pattern=None):
             from cosma_backend.db.database import Database
             real = Database.applications_keyword_search
-            return await real(_self, query, limit=limit, allow_operators=allow_operators)
+            return await real(_self, query, limit=limit, allow_operators=allow_operators, path_pattern=path_pattern)
 
-        async def search_similar_applications(_self, query_embedding, limit=10, threshold=None):
+        async def search_similar_applications(_self, query_embedding, limit=10, threshold=None, path_pattern=None):
             from cosma_backend.db.database import Database
             real = Database.search_similar_applications
-            return await real(_self, query_embedding, limit=limit, threshold=threshold)
+            return await real(_self, query_embedding, limit=limit, threshold=threshold, path_pattern=path_pattern)
 
         async def search_similar_files(self, *a, **kw):
             return []

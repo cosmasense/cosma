@@ -452,7 +452,7 @@ class Database:
 
             logger.info("Embedding inserted successfully", file_id=file.id)
             
-    async def search_similar_files(self, query_embedding: np.ndarray, limit: int = 10, threshold: float | None = None, directory: str | None = None) -> list[tuple[File, float]]:
+    async def search_similar_files(self, query_embedding: np.ndarray, limit: int = 10, threshold: float | None = None, directory: str | None = None, path_pattern: str | None = None) -> list[tuple[File, float]]:
         """
         Search for files similar to the query embedding.
 
@@ -461,11 +461,16 @@ class Database:
             limit: Maximum number of results
             threshold: Optional similarity threshold (lower is more similar)
             directory: Optional directory path to limit search scope
+            path_pattern: Optional glob pattern (e.g. "*.pdf") matched
+                against file_path. Pushed into SQL as a LIKE clause so
+                the candidate set shrinks before knn returns.
 
         Returns:
             List of tuples (FileMetadata, distance)
         """
-        logger.debug("Searching similar files", limit=limit, threshold=threshold, directory=directory)
+        from cosma_backend.utils.glob_sql import glob_to_like
+
+        logger.debug("Searching similar files", limit=limit, threshold=threshold, directory=directory, path_pattern=path_pattern)
 
         # Normalize and serialize query embedding
         normalized_embedding = self._normalize_embedding_dimensions(query_embedding)
@@ -489,6 +494,18 @@ class Database:
         if directory is not None:
             SQL += " AND (f.file_path LIKE ? || '/%' OR f.file_path = ?)"
 
+        # Glob filter is anchored to a substring of file_path so users
+        # can type `@*.pdf` (extension) or `@*report*` (substring). The
+        # LIKE pattern is wrapped with %...% for substring semantics
+        # unless the glob already starts/ends with *.
+        if path_pattern is not None:
+            like = glob_to_like(path_pattern)
+            if not like.startswith("%"):
+                like = "%" + like
+            if not like.endswith("%"):
+                like = like + "%"
+            SQL += " AND f.file_path LIKE ? ESCAPE '!'"
+
         SQL += """
         GROUP BY f.id
         ORDER BY distance
@@ -498,6 +515,8 @@ class Database:
         params = [query_blob, limit]
         if directory is not None:
             params.extend([directory, directory])
+        if path_pattern is not None:
+            params.append(like)
         params.append(limit)
 
         async with self.acquire() as conn:
@@ -734,7 +753,7 @@ class Database:
             
             return watched_dir
 
-    async def keyword_search(self, query: str, limit: int = 20, directory: str | None = None, allow_operators: bool = False) -> list[tuple[File, float]]:
+    async def keyword_search(self, query: str, limit: int = 20, directory: str | None = None, allow_operators: bool = False, path_pattern: str | None = None) -> list[tuple[File, float]]:
         """
         Perform keyword search using FTS5 with BM25 ranking.
 
@@ -743,24 +762,28 @@ class Database:
             limit: Maximum number of results
             directory: Optional directory path to limit search scope
             allow_operators: If True, preserve AND/OR/NOT operators
+            path_pattern: Optional glob (e.g. "*.pdf") applied to
+                file_path as a LIKE filter after the FTS match. Cheap
+                because the FTS join already produced a small row set.
 
         Returns:
             List of tuples (File, relevance_score)
         """
         # Import here to avoid circular import
         from cosma_backend.searcher.fts5_query import parse_fts5_query
+        from cosma_backend.utils.glob_sql import glob_to_like
 
         sanitized_query = parse_fts5_query(query, allow_operators=allow_operators)
         if not sanitized_query:
             return []
 
-        logger.debug("Performing keyword search", query=sanitized_query, limit=limit, directory=directory)
+        logger.debug("Performing keyword search", query=sanitized_query, limit=limit, directory=directory, path_pattern=path_pattern)
 
         # FTS5 query with BM25 ranking
         # You can use advanced syntax like: "housing AND (apartment OR lease)"
         # BM25 parameters: k1=1.2 (term frequency saturation), b=0.75 (length normalization)
         SQL = """
-        SELECT 
+        SELECT
             f.*,
             bm25(files_fts) AS relevance_score
         FROM files_fts fts
@@ -769,16 +792,25 @@ class Database:
         """
 
         params = [sanitized_query]
-        
+
         if directory is not None:
             SQL += " AND (f.file_path LIKE ? || '/%' OR f.file_path = ?)"
             params.extend([directory, directory])
+
+        if path_pattern is not None:
+            like = glob_to_like(path_pattern)
+            if not like.startswith("%"):
+                like = "%" + like
+            if not like.endswith("%"):
+                like = like + "%"
+            SQL += " AND f.file_path LIKE ? ESCAPE '!'"
+            params.append(like)
 
         SQL += """
         ORDER BY rank
         LIMIT ?;
         """
-        
+
         params.append(limit)
 
         async with self.acquire() as conn:
@@ -805,6 +837,7 @@ class Database:
         query_embedding: np.ndarray,
         limit: int = 10,
         threshold: float | None = None,
+        path_pattern: str | None = None,
     ) -> list[tuple["Application", float]]:
         """Vector knn search against the applications source.
 
@@ -813,8 +846,14 @@ class Database:
         and no keyword join (apps_fts is handled separately by
         ``applications_keyword_search``). Returns (Application,
         distance) tuples where smaller distance = better match.
+
+        ``path_pattern`` (e.g. "*.app", "*Photo*") is applied as a
+        LIKE filter against both ``display_name`` and ``app_path`` so
+        users can pre-filter the app pool with the same syntax used
+        for files.
         """
         from cosma_backend.models.application import Application
+        from cosma_backend.utils.glob_sql import glob_to_like
 
         normalized = self._normalize_embedding_dimensions(query_embedding)
         query_blob = self._serialize_vector(normalized)
@@ -826,12 +865,23 @@ class Database:
         FROM application_embeddings
         INNER JOIN applications a ON application_embeddings.application_id = a.id
         WHERE embedding MATCH ? AND k = ?
-        ORDER BY distance
         """
         params: list = [query_blob, limit]
         if threshold is not None:
-            SQL = SQL.replace("WHERE embedding MATCH ?", "WHERE embedding MATCH ? AND distance <= ?")
-            params = [query_blob, threshold, limit]
+            SQL = SQL.replace("WHERE embedding MATCH ? AND k = ?",
+                              "WHERE embedding MATCH ? AND k = ? AND distance <= ?")
+            params = [query_blob, limit, threshold]
+
+        if path_pattern is not None:
+            like = glob_to_like(path_pattern)
+            if not like.startswith("%"):
+                like = "%" + like
+            if not like.endswith("%"):
+                like = like + "%"
+            SQL += " AND (a.display_name LIKE ? ESCAPE '!' OR a.app_path LIKE ? ESCAPE '!')"
+            params.extend([like, like])
+
+        SQL += " ORDER BY distance"
 
         async with self.acquire() as conn:
             try:
@@ -852,6 +902,7 @@ class Database:
         query: str,
         limit: int = 20,
         allow_operators: bool = False,
+        path_pattern: str | None = None,
     ) -> list[tuple["Application", float]]:
         """FTS5 keyword search against the applications table.
 
@@ -860,9 +911,13 @@ class Database:
         Returns positive relevance scores (abs of BM25) so the
         downstream RRF merge treats higher = better consistently with
         the files path.
+
+        ``path_pattern`` filters the FTS hits by glob match on
+        display_name or app_path (e.g. "*Photo*" finds Photoshop).
         """
         from cosma_backend.models.application import Application
         from cosma_backend.searcher.fts5_query import parse_fts5_query
+        from cosma_backend.utils.glob_sql import glob_to_like
 
         sanitized_query = parse_fts5_query(query, allow_operators=allow_operators)
         if not sanitized_query:
@@ -875,10 +930,24 @@ class Database:
         FROM applications_fts fts
         JOIN applications a ON a.id = fts.rowid
         WHERE applications_fts MATCH ?
+        """
+        params_list: list = [sanitized_query]
+
+        if path_pattern is not None:
+            like = glob_to_like(path_pattern)
+            if not like.startswith("%"):
+                like = "%" + like
+            if not like.endswith("%"):
+                like = like + "%"
+            SQL += " AND (a.display_name LIKE ? ESCAPE '!' OR a.app_path LIKE ? ESCAPE '!')"
+            params_list.extend([like, like])
+
+        SQL += """
         ORDER BY rank
         LIMIT ?;
         """
-        params = (sanitized_query, limit)
+        params_list.append(limit)
+        params = tuple(params_list)
 
         async with self.acquire() as conn:
             try:
